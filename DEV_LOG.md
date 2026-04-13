@@ -2,6 +2,135 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-13 — [FUTURE] HIGH PRIORITY: real fal.ai video generation
+
+**Status:** Stub only. The CLI has zero working code that calls fal.ai. The
+audit of the video-production skill confirmed it was never implemented there
+either — only documented in `references/video-duplication.md`.
+
+**What needs to be built:**
+- New `parallax veo` subcommand that takes a brief + optional reference image
+  and generates a real AI video clip via `fal_client.subscribe(...)`.
+- Recommended model: `fal-ai/kling-video/v3/pro/image-to-video` (per the skill's
+  reference doc). Cost: ~$0.336/sec with audio, ~$0.392/sec with voice control.
+- Call signature: `arguments={image_url, prompt, duration: 3-15, generate_audio: True, aspect_ratio: "9:16"}`
+- Add `type: ai_video` scene support in compose so a generated clip can be
+  spliced into the manifest like any other video scene.
+- `parallax_veo` web tool + HoP prompt update so the agent can dispatch it.
+- `FAL_KEY` env var resolution already exists in `packs/video/scripts/api_config.py`,
+  no auth work needed.
+
+**Why deferred:** Both end-to-end tests passed without it (TST-A: video + still
++ vo + headline + captions; TST-B: stills only Ken Burns). The canonical pipeline
+is production-grade with the existing primitives. fal.ai unlocks a meaningfully
+new capability (true AI video gen with talking characters) but it's a clean
+add-on, not a blocker. Worth a focused session with a single committed model
+choice rather than rushed at 6 AM.
+
+**Reference:** `~/.claude/skills/video-production/references/video-duplication.md`
+has the exact endpoint contract.
+
+## 2026-04-13 — [DECISION] Manifest-first compose is the canonical pipeline architecture
+
+The Parallax pipeline must be manifest-driven. The flow is:
+
+1. **HoP agent** (creative collaborator) talks to the user, makes creative decisions,
+   confirms the brief. HoP does NOT know the manifest schema.
+2. **Editor agent** (manifest specialist) takes a creative brief or edit instruction
+   and produces or modifies `.parallax/manifest.yaml`. The schema lives in this
+   agent's prompt and tools, nowhere else.
+3. **Compose** is a deterministic Python step. `parallax compose` reads the manifest
+   and renders exactly what's specified — scene list, motion presets per scene,
+   voiceover text, captions, headline, transitions. No globbing. No "just grab
+   everything in stills/."
+
+Each stage is independently approvable: still gen → manifest draft → Ken Burns
+preview → voiceover → caption burn → final assembly. Approval gates between
+stages let the user catch problems before paying for the next step.
+
+**Why this matters:** the current `parallax animate` does a dumb glob of
+`stills/*.png` and ignores `.parallax/manifest.yaml` entirely. We've been
+patching around this in the parallax-web server (temp dirs with symlinks for
+specific stills) — those are workarounds for a missing primitive. The right
+fix is `parallax compose --from-manifest`, not more server-side hacks.
+
+**What was rejected:**
+- HoP editing the manifest directly. Leaks schema knowledge into the wrong
+  agent. Breaks every time the schema changes. HoP should never see YAML.
+- Natural-language dispatch driving rendering. The agent is good at creative
+  decisions, bad at deterministic file selection. Manifest is the contract.
+- `parallax animate` taking file path arguments. Same shape problem — the
+  manifest already exists for this purpose, don't bypass it.
+
+**Next steps (deferred until we commit to scoping this):**
+- Add `parallax compose` subcommand that reads `.parallax/manifest.yaml` and
+  drives ken-burns + voiceover + caption + assembly stages.
+- Define the editor agent prompt + tools. Probably a single `edit_manifest`
+  tool that accepts a JSON patch or a natural-language instruction.
+- Strip the temp-dir symlink hack from `parallax-web/server.py` once compose
+  exists — the editor agent will write the manifest, HoP will dispatch compose,
+  no specific-stills parameter needed.
+
+## 2026-04-12 — [CHANGED] CLI observability: --json NDJSON, --stdin, file logging
+
+Instrumented the CLI so other agents (Plexi app wrappers, orchestrators)
+can drive it over a JSON border and inspect runs via real log files —
+unblocks the Parallax Plexi app that wants to wrap the CLI conversationally.
+
+Three additions, all opt-in, all zero-impact when unused:
+
+1. **`--json` NDJSON output mode** on `run`, `create`, `animate`. New
+   `core/events.py` module-level `Emitter` singleton is a no-op by default.
+   `enable_json(run_id)` captures the real stdout, rebinds `sys.stdout` to
+   `sys.stderr` so every pre-existing `print()` in the pipeline harmlessly
+   routes to stderr, and writes newline-delimited JSON events to the
+   captured stdout with `flush()` after every emit. Event types:
+   `run_started`, `agent_call` (start/end pair — wrapped around
+   `core/llm.complete`), `still_generated`, `voiceover_generated`,
+   `assembly_started`, `assembly_complete`, `error`, `run_complete`.
+   Every event carries `type`, `ts` (ISO 8601 UTC), `run_id`.
+
+2. **`--stdin` JSON job spec** on `run` and `create`. When set, the CLI
+   reads one JSON object from stdin — `{brief, mode?, style?, count?, ref?}`
+   — instead of taking positional argv. Fails fast with a clear message on
+   invalid JSON or missing `brief`. Composes with `--json` so an
+   orchestrator can pipe JSON in and get NDJSON out. Also implicitly sets
+   `skip_clarifications=True` because there's no human to answer.
+
+3. **Per-run file logging** via new `core/logging_setup.py`. Installs a
+   file handler writing
+   `<PARALLAX_LOG_DIR>/logs/runs/<run_id>/parallax.log` with format
+   `%(asctime)s %(levelname)s %(name)s: %(message)s`. Called once from
+   `cmd_run`/`cmd_create`/`cmd_animate` after the run_id is minted.
+   Instrumented the hot spots: `cmd_run` boundary, HoP assembly (replaced
+   the noisiest prints with `logger.info`/`logger.exception`), and a
+   `logger.exception` on the top-level HoP `_route` exception so
+   tracebacks land in the file instead of being swallowed into the
+   RuntimeError chain.
+
+Critical ordering detail: `emitter.enable_json()` must run BEFORE
+`_ensure_project_layout()` and any clip-scan prints, or the project-layout
+init message escapes on the real stdout and corrupts the NDJSON stream.
+Moved all three command entry points to call `enable_json` immediately
+after argv is parsed.
+
+Also normalized `TEST_MODE` truthy parsing at the CLI level — the old
+`== "true"` check rejected `TEST_MODE=1`, which the acceptance smoke test
+uses. Now accepts `1|true|yes|on` and re-exports `TEST_MODE=true` to the
+environment so the deeper `HoP`/`asset_generator` checks that still read
+the literal string keep working.
+
+Pre-existing per-run JSON state files under `.parallax/logs/runs/<run_id>/`
+(`run.json`, `job.json`, `result.json`, `review.json`) are untouched —
+these are the offline audit trail; NDJSON is the online live stream.
+
+Rejected: (a) a full `print → logger` sweep across HoP and the packs —
+would be a 400-line refactor for marginal gain over instrumenting the
+hot spots; (b) a per-agent `agent_call` registry — derive the agent name
+from the first 40 chars of the system prompt, good enough for now; (c) a
+`.env.example` — out of scope, user explicitly said no new config
+scaffolding in this task.
+
 ## 2026-04-12 — [CHANGED] bin/parallax shebang → python3, explicit version check in setup
 
 Cross-machine install compatibility. The shebang was pinned to
