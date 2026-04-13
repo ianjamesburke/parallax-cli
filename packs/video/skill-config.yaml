@@ -1,8 +1,8 @@
 paths:
   obs_clips: ~/Movies/OBS          # Where OBS recordings land (default OBS location on macOS)
-  output: /Users/ianburke/Library/CloudStorage/GoogleDrive-ian@narrativeads.com/My Drive/ians AI tools/Video Prod  # Indexed project output — all init-project.py projects land here
+  output: ~/parallax-projects      # Indexed project output — all init-project.py projects land here. Override to any local or cloud-mounted path.
   music: ~/Music                   # Default music library root
-  inbox: /Users/ianburke/Library/CloudStorage/GoogleDrive-ian@narrativeads.com/My Drive/ians AI tools/inbox  # Drop zone — files here are auto-moved into new projects on init
+  inbox: ~/parallax-inbox          # Drop zone — files here are auto-moved into new projects on init. Override to a cloud-mounted path (e.g. Google Drive, Dropbox) if you want drop-zone workflows.
 
 clip_markers:
   default_phrase: "clip that"      # Voice trigger to search for in transcript

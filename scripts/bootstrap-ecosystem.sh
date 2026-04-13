@@ -84,7 +84,7 @@ readonly PARALLAX_CLI_DIR="$GITHUB_DIR/parallax CLI"
 readonly PARALLAX_APP_DIR="$GITHUB_DIR/parallax-app"
 
 readonly PLEXI_REMOTE="https://github.com/ianjamesburke/PLEXI.git"
-readonly PARALLAX_CLI_REMOTE="https://github.com/ianjamesburke/parallax.git"
+readonly PARALLAX_CLI_REMOTE="https://github.com/ianjamesburke/parallax-cli.git"
 readonly PARALLAX_APP_REMOTE="https://github.com/ianjamesburke/parallax-app.git"
 
 readonly PLEXI_APPS_DIR="$HOME/.plexi/apps"

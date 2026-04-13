@@ -78,17 +78,17 @@ system into the one place it was always needed: before any expensive work starts
 
 **Files that change:**
 
-- `/Users/ianburke/Documents/GitHub/parallax/core/head_of_production.py` — primary change
+- `core/head_of_production.py` — primary change
   surface. Adds `_generate_plan`, `_confirm_plan`, `_write_brief_to_manifest` methods.
   Modifies `receive_job` to call the plan/confirm flow before `_route`. Modifies `_route`'s
   `footage_edit` branch to initialize and write a manifest. Modifies `_route`'s final
   evaluation call to pass the manifest path alongside the job.
 
-- `/Users/ianburke/Documents/GitHub/parallax/core/evaluator.py` — `_build_prompt` reads
+- `core/evaluator.py` — `_build_prompt` reads
   `job.get("manifest_brief")` (injected by HoP before calling evaluate) in preference to
   `job.get("content")`. No structural change to Evaluator class.
 
-- `/Users/ianburke/Documents/GitHub/parallax/packs/video/tools.py` — no changes needed.
+- `packs/video/tools.py` — no changes needed.
   Both `assemble` and `assemble_clips` already work fine. The convergence here is logical
   (manifest drives both), not a code merge.
 

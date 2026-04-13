@@ -34,8 +34,12 @@ from core.cost_tracker import cost_report
 
 
 # ── Reference paths ─────────────────────────────────────────────────────────
+# These scenarios reference real video assets on disk. Set PARALLAX_VIDPROD_DIR
+# to point at the directory containing the fixture projects below, or the tests
+# will resolve to a non-existent default and skip.
 
-VIDPROD = Path.home() / "Library/CloudStorage/GoogleDrive-ian@narrativeads.com/My Drive/ians AI tools/Video Prod"
+import os
+VIDPROD = Path(os.environ.get("PARALLAX_VIDPROD_DIR", str(Path.home() / "parallax-fixtures"))).expanduser()
 
 YOUTUBE_INPUT = VIDPROD / "5-ians-youtube-video" / "input"
 YOUTUBE_CLIPS = [
