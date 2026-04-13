@@ -1035,9 +1035,19 @@ Which option would the user most likely want? Reply with ONLY the option string,
 
                 clip_label = selected_clips if selected_clips else "all"
                 print(f"[HoP] Assembling clips ({clip_label})...")
-                asm_result = assemble_clips(
-                    effective_manifests, output_path, clips=effective_clips
-                )
+                import logging as _logging
+                _hop_log = _logging.getLogger("parallax.hop")
+                _hop_log.info("assembling clips (%s) → %s", clip_label, output_path)
+                from core.events import emitter as _emitter
+                _emitter.emit("assembly_started", output_path=output_path, clips=clip_label)
+                try:
+                    asm_result = assemble_clips(
+                        effective_manifests, output_path, clips=effective_clips
+                    )
+                except Exception as _e:
+                    _hop_log.exception("assemble_clips raised")
+                    _emitter.emit("error", message=str(_e), where="hop.assemble_clips")
+                    raise
 
                 # Inject output_path into assembly result for evaluator
                 if asm_result.get("success") and not asm_result.get("output_path"):
@@ -1045,8 +1055,13 @@ Which option would the user most likely want? Reply with ONLY the option string,
                 result["assembly"] = asm_result
                 if asm_result.get("success"):
                     print(f"[HoP] Assembly complete: {output_path}")
+                    _hop_log.info("assembly complete: %s", output_path)
+                    _emitter.emit("assembly_complete", output_path=output_path)
                 else:
-                    print(f"[HoP] Assembly failed: {asm_result.get('stderr','')[:300]}")
+                    _stderr = asm_result.get('stderr','')[:300]
+                    print(f"[HoP] Assembly failed: {_stderr}")
+                    _hop_log.error("assembly failed: %s", _stderr)
+                    _emitter.emit("error", message="assembly failed", where="hop.assemble_clips", stderr=_stderr)
 
                 # Track the pre-overlay assembly output so we can route it to
                 # drafts/ if the overlay phase actually fires. If no overlays,
@@ -1303,6 +1318,15 @@ Which option would the user most likely want? Reply with ONLY the option string,
                 result = {"error": f"Unknown job type: {job_type}"}
 
         except Exception as e:
+            import logging as _logging
+            _logging.getLogger("parallax.hop").exception(
+                "routing failed for job type %r", job_type
+            )
+            try:
+                from core.events import emitter as _emitter
+                _emitter.emit("error", message=str(e), where=f"hop._route[{job_type}]")
+            except Exception:
+                pass
             raise RuntimeError(f"[HoP] Routing failed for job type '{job_type}': {e}") from e
 
         # Inject articulated intent for evaluator

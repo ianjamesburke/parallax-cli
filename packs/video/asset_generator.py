@@ -198,6 +198,15 @@ class AssetGenerator:
         except Exception as e:
             print(f"[AssetGen] WARNING: cost logging failed: {e}")
 
+        try:
+            from core.events import emitter
+            if asset_type == "voiceover":
+                emitter.emit("voiceover_generated", path=output_path)
+            else:
+                emitter.emit("still_generated", path=output_path, prompt=brief)
+        except Exception:
+            pass
+
         return {
             "success": True,
             "output_path": output_path,
@@ -222,6 +231,14 @@ class AssetGenerator:
         else:
             output_path = self._drill_image(brief, output_path, request)
 
+        try:
+            from core.events import emitter
+            if asset_type == "voiceover":
+                emitter.emit("voiceover_generated", path=output_path)
+            else:
+                emitter.emit("still_generated", path=output_path, prompt=brief)
+        except Exception:
+            pass
         return {
             "success": True,
             "output_path": output_path,

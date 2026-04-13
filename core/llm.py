@@ -37,16 +37,35 @@ def complete(model: str, system: str, prompt: str,
             backend: str,        # "api" or "claude_cli"
         }
     """
-    if _in_claude_code():
-        return _call_claude_cli(model, system, prompt, max_tokens)
-    elif _has_api_key():
-        return _call_api(model, system, prompt, max_tokens)
-    else:
-        raise RuntimeError(
-            "[llm] No LLM backend available. Either:\n"
-            "  1. Run inside a Claude Code session (uses OAuth)\n"
-            "  2. Set ANTHROPIC_API_KEY environment variable\n"
-        )
+    # Emit a start/end event pair so the JSON observer can watch agent activity.
+    # Derive the agent name from the first ~40 chars of the system prompt so
+    # events are recognisable without leaking full prompts.
+    from core.events import emitter
+    agent = (system or "llm")[:40].replace("\n", " ").strip() or model
+    emitter.emit("agent_call", agent=agent, phase="start", model=model)
+    try:
+        if _in_claude_code():
+            result = _call_claude_cli(model, system, prompt, max_tokens)
+        elif _has_api_key():
+            result = _call_api(model, system, prompt, max_tokens)
+        else:
+            raise RuntimeError(
+                "[llm] No LLM backend available. Either:\n"
+                "  1. Run inside a Claude Code session (uses OAuth)\n"
+                "  2. Set ANTHROPIC_API_KEY environment variable\n"
+            )
+    except Exception as e:
+        emitter.emit("agent_call", agent=agent, phase="end", error=str(e), model=model)
+        raise
+    emitter.emit(
+        "agent_call",
+        agent=agent,
+        phase="end",
+        model=result.get("model", model),
+        tokens_in=result.get("input_tokens"),
+        tokens_out=result.get("output_tokens"),
+    )
+    return result
 
 
 def _call_api(model: str, system: str, prompt: str, max_tokens: int) -> dict:

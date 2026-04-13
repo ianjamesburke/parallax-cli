@@ -14,8 +14,12 @@ Run-time layout (for `parallax run` and `parallax status`):
 """
 
 import argparse
+import json as _json
+import json  # alias for new code paths — avoids touching legacy _json refs
+import logging
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -62,10 +66,56 @@ def _synthesize_test_clip(cwd: Path) -> str:
     return str(clip)
 
 
+def _resolve_brief(args: argparse.Namespace, required_fields: tuple = ("brief",)) -> dict:
+    """
+    Produce a job spec dict from either argv (brief positional + flags) or a
+    JSON object on stdin when --stdin is set. Fails fast on missing/invalid input.
+    """
+    if getattr(args, "stdin", False):
+        raw = sys.stdin.read()
+        try:
+            spec = _json.loads(raw)
+        except _json.JSONDecodeError as e:
+            print(f"[parallax] ERROR: --stdin expects a JSON object: {e}", file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(spec, dict):
+            print("[parallax] ERROR: --stdin JSON must be an object", file=sys.stderr)
+            sys.exit(2)
+        for f in required_fields:
+            if not spec.get(f):
+                print(f"[parallax] ERROR: --stdin JSON missing required field: {f!r}", file=sys.stderr)
+                sys.exit(2)
+        return spec
+    # Build a spec from argv flags so downstream code only knows one shape.
+    return {
+        "brief": getattr(args, "brief", None),
+        "count": getattr(args, "count", None),
+        "style": getattr(args, "style", None),
+        "ref": getattr(args, "ref", None),
+        "aspect_ratio": getattr(args, "aspect_ratio", None),
+    }
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     # Repo root on sys.path FIRST so `from core...` works from any cwd.
     sys.path.insert(0, str(REPO_ROOT))
+
+    # Resolve brief from argv or stdin JSON. Must happen before anything
+    # that assumes args.brief is populated.
+    spec = _resolve_brief(args)
+    brief = spec["brief"]
+
+    # Mint the run_id up front so the emitter, file logger, and HoP all share it.
+    run_id = uuid.uuid4().hex[:8]
+
+    # Enable NDJSON event emission BEFORE anything else that might print to
+    # stdout (project layout init, clip scanning, etc.). enable_json() rebinds
+    # sys.stdout → sys.stderr so existing prints don't corrupt the stream.
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+
     # Auto-scaffold canonical project layout (input/ output/ drafts/ stills/ .parallax/)
     # and migrate loose media into input/ on first run. Idempotent.
     _ensure_project_layout(cwd)
@@ -79,16 +129,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     os.environ["PARALLAX_LOG_DIR"] = str(parallax_dir)
     os.environ["PARALLAX_OUTPUT_ROOT"] = str(parallax_dir)
 
-    test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
+    # Install per-run file logging under .parallax/logs/runs/<run_id>/parallax.log
+    from core.logging_setup import setup_run_logging
+    log_path = setup_run_logging(run_id)
+    log = logging.getLogger("parallax.run")
+    log.info("cmd_run start run_id=%s cwd=%s brief=%r", run_id, cwd, brief)
+
+    test_mode = os.environ.get("TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+    if test_mode:
+        # Normalize so downstream agents (HoP, asset_generator) that check the
+        # literal string "true" behave consistently regardless of how the user
+        # spelled it on the command line.
+        os.environ["TEST_MODE"] = "true"
 
     clips = _find_clips(cwd)
     if not clips:
         if test_mode:
             print("[parallax] TEST_MODE: no clips found — synthesizing a placeholder")
+            log.info("TEST_MODE: synthesizing placeholder clip")
             clips = [_synthesize_test_clip(cwd)]
         else:
             print("[parallax] ERROR: no video files found in cwd, ./assets, or ./input", file=sys.stderr)
             print("           supported: " + ", ".join(VIDEO_EXTS), file=sys.stderr)
+            log.error("no video files found in cwd/assets/input")
+            emitter.emit("error", message="no video files found", where="cmd_run.find_clips")
             return 2
 
     # Non-interactive: auto-confirm any prompts that slip past TEST_MODE.
@@ -99,25 +163,32 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     job = {
         "type": "footage_edit",
-        "content": args.brief,  # HoP reads `content`, not `brief`
+        "content": brief,  # HoP reads `content`, not `brief`
         "clips": clips,
-        "run_id": uuid.uuid4().hex[:8],
+        "run_id": run_id,
         "test_mode": test_mode,
-        "skip_clarifications": bool(getattr(args, "yes", False)),
+        "skip_clarifications": bool(getattr(args, "yes", False)) or bool(getattr(args, "stdin", False)),
         # Project root for final-output routing: finals → cwd/output/,
         # drafts → cwd/drafts/. HoP reads this from the job dict.
         "project_root": str(cwd),
     }
-    print(f"[parallax] brief: {args.brief!r}")
+    print(f"[parallax] brief: {brief!r}")
     print(f"[parallax] clips: {len(clips)} file(s)")
     print(f"[parallax] project dir: {parallax_dir}")
     if job["skip_clarifications"]:
-        print("[parallax] --yes set — skipping clarification gate")
+        print("[parallax] --yes (or --stdin) set — skipping clarification gate")
+
+    started_at = time.time()
+    emitter.emit("run_started", brief=brief, mode="run", project_dir=str(parallax_dir))
 
     try:
         hop = HeadOfProduction(skip_health_check=True)
+        # Force the HoP run_id to match ours so log paths and events line up.
+        hop.run_id = run_id
         result = hop.receive_job(job)
     except Exception as e:
+        log.exception("pipeline failed: %s", e)
+        emitter.emit("error", message=str(e), where="cmd_run.receive_job")
         print(f"[parallax] ERROR: pipeline failed: {e}", file=sys.stderr)
         return 1
 
@@ -158,7 +229,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             pass
         print(f"[HoP] Spent: ${spent:.3f} of ${total_budget:.2f} budget")
     except Exception as e:
+        log.exception("could not read spend")
         print(f"[parallax] WARNING: could not read spend: {e}", file=sys.stderr)
+        spent = 0.0
+
+    duration_s = time.time() - started_at
+    log.info("cmd_run complete status=%s duration_s=%.2f", status, duration_s)
+    emitter.emit(
+        "run_complete",
+        output_path=final_path if final_path else None,
+        status=status,
+        cost_usd=round(spent, 4) if isinstance(spent, (int, float)) else None,
+        duration_s=round(duration_s, 2),
+    )
 
     return 0 if status == "complete" else 1
 
@@ -217,18 +300,47 @@ def cmd_create(args: argparse.Namespace) -> int:
         cwd/.parallax/            project metadata
         cwd/.parallax/manifest.yaml
     """
-    import random, string, time
+    import random, string
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
     sys.path.insert(0, str(BUNDLED_SCRIPTS))
+
+    # Resolve brief/options from argv or stdin JSON up front.
+    spec = _resolve_brief(args)
+    brief = spec["brief"]
+    count = spec.get("count") or getattr(args, "count", 3) or 3
+    style_ref = spec.get("style") or getattr(args, "style", None)
+    ref_images = spec.get("ref") or getattr(args, "ref", None) or []
+    aspect_ratio = spec.get("aspect_ratio") or getattr(args, "aspect_ratio", "3:4") or "3:4"
+
+    run_id = uuid.uuid4().hex[:8]
+
+    # Enable NDJSON mode BEFORE any pipeline code prints to stdout.
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+
+    # Pin log dir to cwd/.parallax so logging_setup writes the per-run log file
+    # under the current project.
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
     # Auto-scaffold the canonical layout in cwd (idempotent).
     _ensure_project_layout(cwd)
+
+    from core.logging_setup import setup_run_logging
+    log_path = setup_run_logging(run_id)
+    log = logging.getLogger("parallax.create")
+    log.info("cmd_create start run_id=%s brief=%r count=%s", run_id, brief, count)
+
+    started_at = time.time()
+    emitter.emit("run_started", brief=brief, mode="create", project_dir=str(cwd / ".parallax"))
 
     try:
         from api_config import get_gemini_key
         from google import genai
         from google.genai import types as genai_types
     except ImportError as e:
+        log.exception("missing dependency")
+        emitter.emit("error", message=f"missing dependency: {e}", where="cmd_create.import")
         print(f"[parallax] ERROR: missing dependency: {e}", file=sys.stderr)
         print("           install: pip install google-genai", file=sys.stderr)
         return 1
@@ -245,19 +357,33 @@ def cmd_create(args: argparse.Namespace) -> int:
     stills_dir.mkdir(parents=True, exist_ok=True)
     (cwd / ".parallax").mkdir(parents=True, exist_ok=True)
 
-    count = args.count
-    brief = args.brief
-    ref_images = args.ref or []
-    style_ref = args.style
-
     prompt_parts = [brief]
     if style_ref:
         prompt_parts.append(f"Style reference: {Path(style_ref).name}")
+    # gemini-3.1-flash-image-preview reads aspect ratio from the prompt text.
+    # The model's internal GenerateContentConfig has no aspect_ratio field, so
+    # we bake the orientation hint into the prompt to force non-landscape outputs.
+    if aspect_ratio:
+        orient_hint = {
+            "9:16": "Render in PORTRAIT orientation, 9:16 aspect ratio (tall/vertical, like a phone screen), NOT landscape.",
+            "3:4":  "Render in PORTRAIT orientation, 3:4 aspect ratio (tall/vertical), NOT landscape.",
+            "2:3":  "Render in PORTRAIT orientation, 2:3 aspect ratio (tall/vertical), NOT landscape.",
+            "4:5":  "Render in PORTRAIT orientation, 4:5 aspect ratio (slightly tall), NOT landscape.",
+            "1:1":  "Render as a SQUARE image, 1:1 aspect ratio.",
+            "5:4":  "Render in LANDSCAPE orientation, 5:4 aspect ratio (slightly wide).",
+            "4:3":  "Render in LANDSCAPE orientation, 4:3 aspect ratio.",
+            "3:2":  "Render in LANDSCAPE orientation, 3:2 aspect ratio.",
+            "16:9": "Render in LANDSCAPE orientation, 16:9 aspect ratio (wide cinematic).",
+        }.get(aspect_ratio)
+        if orient_hint:
+            prompt_parts.append(orient_hint)
     prompt = ". ".join(prompt_parts)
+
+    IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 
     print(f"[parallax] brief:  {brief!r}")
     print(f"[parallax] count:  {count}")
-    print(f"[parallax] model:  imagen-4.0-generate-001")
+    print(f"[parallax] model:  {IMAGE_MODEL}")
     if ref_images:
         print(f"[parallax] refs:   {', '.join(ref_images)}")
     print(f"[parallax] output: {stills_dir}")
@@ -281,40 +407,41 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     for i in range(1, count + 1):
         print(f"[parallax] generating {i}/{count}...", end=" ", flush=True)
+        log.info("generating still %d/%d", i, count)
         try:
-            if input_images:
-                contents = input_images + [genai_types.Part.from_text(text=prompt)]
-                response = client.models.generate_content(
-                    model="gemini-3.1-flash-image-preview",
-                    contents=contents,
-                    config=genai_types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
-                )
-                image_bytes = None
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                        image_bytes = part.inline_data.data
-                        break
-                if not image_bytes:
-                    raise RuntimeError("no image in response")
-            else:
-                result = client.models.generate_images(
-                    model="imagen-4.0-generate-001",
-                    prompt=prompt,
-                    config=genai_types.GenerateImagesConfig(
-                        number_of_images=1,
-                        aspect_ratio=args.aspect_ratio,
-                    ),
-                )
-                image_bytes = result.generated_images[0].image.image_bytes
+            # Always use Gemini 3.1 Flash Image Preview — handles both pure
+            # text-to-image AND reference-image-conditioned generation.
+            contents = list(input_images) + [genai_types.Part.from_text(text=prompt)]
+            response = client.models.generate_content(
+                model=IMAGE_MODEL,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                ),
+            )
+            image_bytes = None
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                    image_bytes = part.inline_data.data
+                    break
+            if not image_bytes:
+                raise RuntimeError("no image in response")
 
             filename = f"still_{timestamp}_{i:02d}.png"
-            (stills_dir / filename).write_bytes(image_bytes)
+            still_path = stills_dir / filename
+            still_path.write_bytes(image_bytes)
             generated_names.append(filename)
+            log.info("still generated: %s", still_path)
+            emitter.emit("still_generated", path=str(still_path), scene=i, prompt=prompt)
             print(f"done → stills/{filename}")
         except Exception as e:
+            log.exception("still generation failed")
+            emitter.emit("error", message=str(e), where=f"cmd_create.still_{i}")
             print(f"ERROR: {e}", file=sys.stderr)
 
     if not generated_names:
+        log.error("no images generated")
+        emitter.emit("error", message="no images generated", where="cmd_create")
         print("[parallax] ERROR: no images generated", file=sys.stderr)
         return 1
 
@@ -337,6 +464,15 @@ def cmd_create(args: argparse.Namespace) -> int:
     print(f"[parallax] manifest: .parallax/manifest.yaml")
     print(f"[parallax] concept:  {concept_id}")
     print(f"[parallax] next:     parallax animate  (Ken Burns + assemble to output/)")
+
+    duration_s = time.time() - started_at
+    log.info("cmd_create complete stills=%d duration_s=%.2f", len(generated_names), duration_s)
+    emitter.emit(
+        "run_complete",
+        output_path=str(stills_dir),
+        stills=len(generated_names),
+        duration_s=round(duration_s, 2),
+    )
     return 0
 
 
@@ -348,11 +484,21 @@ def cmd_animate(args) -> int:
     Writes:  cwd/output/draft_<timestamp>.mp4
     Updates: cwd/.parallax/manifest.yaml  (adds output_video field)
     """
-    import time
     cwd = Path.cwd()
     # sys.path + auto-scaffold before anything else
     sys.path.insert(0, str(REPO_ROOT))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
     _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    log = logging.getLogger("parallax.animate")
+    started_at = time.time()
+    emitter.emit("run_started", brief="animate", mode="animate", project_dir=str(cwd / ".parallax"))
 
     stills_dir = cwd / "stills"
     output_dir = cwd / "output"
@@ -434,6 +580,7 @@ def cmd_animate(args) -> int:
         concat_list.write_text("\n".join(f"file '{p}'" for p in clip_paths))
 
         print(f"\n[parallax] assembling {len(clip_paths)} clips → {output_path.name}...", end=" ", flush=True)
+        emitter.emit("assembly_started", clip_count=len(clip_paths), output_path=str(output_path))
         try:
             result = subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -442,10 +589,15 @@ def cmd_animate(args) -> int:
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
+                log.error("ffmpeg concat failed rc=%s", result.returncode)
+                emitter.emit("error", message=f"ffmpeg concat failed rc={result.returncode}", where="cmd_animate.assembly")
                 print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
                 return 1
             print("done")
+            emitter.emit("assembly_complete", output_path=str(output_path))
         except Exception as e:
+            log.exception("assembly failed")
+            emitter.emit("error", message=str(e), where="cmd_animate.assembly")
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
 
@@ -479,6 +631,1462 @@ def cmd_animate(args) -> int:
     except Exception:
         pass
 
+    duration_s = time.time() - started_at
+    emitter.emit(
+        "run_complete",
+        output_path=str(output_path),
+        duration_s=round(duration_s, 2),
+    )
+    return 0
+
+
+VOICE_SHORTCUTS = {
+    "george":  "JBFqnCBsd6RMkjVDRZzb",
+    "rachel":  "21m00Tcm4TlvDq8ikWAM",
+    "domi":    "AZnzlk1XvdvUeBnXmlld",
+    "bella":   "EXAVITQu4vr4xnSDxMaL",
+    "antoni":  "ErXwobaYiN019PkySvjV",
+    "arnold":  "VR6AewLTigWG4xSOukaG",
+}
+
+
+def _whisperx_transcribe(audio_path: Path, language: str = "en", model: str = "base.en") -> tuple:
+    """
+    Run WhisperX phoneme-level forced alignment on an audio file.
+    Returns (transcript_text, [{word, start, end}, ...]).
+
+    THIS IS THE ONLY TRANSCRIPTION PATH IN PARALLAX. No fallbacks. No backends.
+    If whisperx isn't installed, this raises ImportError and the caller fails fast.
+    """
+    import whisperx
+    device = "cpu"
+    print(f"[whisperx] loading model={model} device={device}...", flush=True)
+    wx_model = whisperx.load_model(model, device, compute_type="int8", language=language)
+    audio = whisperx.load_audio(str(audio_path))
+    print(f"[whisperx] transcribing...", flush=True)
+    result = wx_model.transcribe(audio, language=language)
+
+    # Phoneme-level forced alignment for accurate word boundaries
+    print(f"[whisperx] forced phoneme alignment...", flush=True)
+    align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
+    result = whisperx.align(result["segments"], align_model, metadata, audio, device)
+
+    transcript_parts = [s.get("text", "") for s in result.get("segments", [])]
+    words = []
+    for w in result.get("word_segments", []):
+        word_text = w.get("word", "").strip()
+        if not word_text:
+            continue
+        words.append({
+            "word": word_text,
+            "start": round(float(w.get("start", 0)), 3),
+            "end": round(float(w.get("end", 0)), 3),
+        })
+
+    return " ".join(transcript_parts).strip(), words
+
+
+def cmd_transcribe(args) -> int:
+    """
+    Transcribe an audio file with WhisperX (phoneme-level forced alignment).
+
+    THE SINGULAR TRANSCRIPTION PATH. Every audio file that needs word-level
+    timestamps in parallax MUST go through this command. No alternatives.
+
+    Defaults to audio/voiceover.mp3 in the current project. Writes:
+      audio/vo_manifest.json    — word-level timing from WhisperX
+
+    Updates manifest.voiceover.transcribed = true.
+
+    Exits 1 (fail loud) if whisperx is not installed — install it, do not fall back.
+    """
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    started_at = time.time()
+    emitter.emit("run_started", brief="transcribe", mode="transcribe",
+                 project_dir=str(cwd / ".parallax"))
+
+    # Resolve audio path: --audio flag or default
+    audio_arg = getattr(args, "audio", None)
+    if audio_arg:
+        audio_path = Path(audio_arg).resolve()
+    else:
+        audio_path = cwd / "audio" / "voiceover.mp3"
+
+    if not audio_path.exists():
+        msg = f"audio not found: {audio_path}"
+        emitter.emit("error", message=msg, where="cmd_transcribe.no_audio")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    language = getattr(args, "language", "en") or "en"
+    model = getattr(args, "model", "base.en") or "base.en"
+
+    try:
+        transcript, words = _whisperx_transcribe(audio_path, language=language, model=model)
+    except ImportError as e:
+        msg = (
+            f"whisperx is not installed: {e}\n"
+            f"           parallax transcription REQUIRES whisperx — there is no fallback.\n"
+            f"           Install with: pip install whisperx"
+        )
+        emitter.emit("error", message=str(e), where="cmd_transcribe.no_whisperx")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        emitter.emit("error", message=str(e), where="cmd_transcribe.whisperx_failed")
+        print(f"[parallax] ERROR: whisperx failed: {e}", file=sys.stderr)
+        return 1
+
+    # Probe duration
+    import subprocess as _sp
+    duration_s = 0.0
+    try:
+        probe = _sp.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(audio_path)],
+            capture_output=True, text=True, check=True,
+        )
+        duration_s = float(json.loads(probe.stdout)["format"]["duration"])
+    except Exception as e:
+        print(f"[parallax] WARNING: ffprobe failed: {e}", file=sys.stderr)
+
+    print(f"[whisperx] transcribed {len(words)} words, {duration_s:.2f}s")
+
+    # Write vo_manifest.json next to the audio file
+    audio_dir = audio_path.parent
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    vo_manifest_path = audio_dir / "vo_manifest.json"
+    vo_manifest = {
+        "audio_file": audio_path.name,
+        "total_duration_s": round(duration_s, 3),
+        "transcript": transcript,
+        "transcribed_by": "whisperx",
+        "model": model,
+        "language": language,
+        "words": words,
+    }
+    vo_manifest_path.write_text(json.dumps(vo_manifest, indent=2))
+    print(f"[whisperx] wrote {vo_manifest_path}")
+
+    # Update project manifest if present
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    if manifest_path.exists():
+        try:
+            import yaml as _yaml
+            with open(manifest_path) as f:
+                manifest = _yaml.safe_load(f) or {}
+            vo = manifest.get("voiceover") or {}
+            vo["vo_manifest"] = str(vo_manifest_path.relative_to(cwd))
+            vo["duration_s"] = round(duration_s, 3)
+            vo["transcribed"] = True
+            vo["transcribed_by"] = "whisperx"
+            manifest["voiceover"] = vo
+            with open(manifest_path, "w") as f:
+                _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+        except Exception as e:
+            print(f"[parallax] WARNING: manifest update failed: {e}", file=sys.stderr)
+
+    duration_run = time.time() - started_at
+    emitter.emit("run_complete",
+                 audio_path=str(audio_path),
+                 word_count=len(words),
+                 duration_s=round(duration_run, 2))
+    return 0
+
+
+def _derive_word_timestamps(alignment, audio_duration: float) -> list:
+    """Convert ElevenLabs character-level alignment to word-level timestamps."""
+    chars = list(alignment.characters)
+    starts = list(alignment.character_start_times_seconds)
+    words = []
+    current_word = ""
+    word_start = None
+    for i, char in enumerate(chars):
+        if char.strip() == "":
+            if current_word and word_start is not None:
+                words.append({"word": current_word, "start": word_start})
+                current_word = ""
+                word_start = None
+        else:
+            if word_start is None:
+                word_start = starts[i]
+            current_word += char
+    if current_word and word_start is not None:
+        words.append({"word": current_word, "start": word_start})
+    result = []
+    for i, w in enumerate(words):
+        end = words[i + 1]["start"] if i + 1 < len(words) else audio_duration
+        result.append({
+            "word": w["word"],
+            "start": round(w["start"], 3),
+            "end": round(end, 3),
+        })
+    return result
+
+
+def cmd_voiceover(args) -> int:
+    """
+    Generate a voiceover MP3 + word-level timestamps from the manifest.
+
+    Reads `vo_text` from each scene in .parallax/manifest.yaml, concatenates,
+    sends to ElevenLabs convert_with_timestamps. Writes:
+      audio/voiceover.mp3
+      audio/vo_manifest.json   — word-level timing for align + captions
+    Updates manifest.voiceover with audio_file/duration/voice config.
+
+    Voice config priority:
+      1. CLI/--stdin override
+      2. manifest.voice section
+      3. default: george
+    """
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(0, str(BUNDLED_SCRIPTS))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    log = logging.getLogger("parallax.voiceover")
+    started_at = time.time()
+    emitter.emit("run_started", brief="voiceover", mode="voiceover",
+                 project_dir=str(cwd / ".parallax"))
+
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    if not manifest_path.exists():
+        msg = f"manifest not found: {manifest_path}"
+        emitter.emit("error", message=msg, where="cmd_voiceover.no_manifest")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    import yaml as _yaml
+    with open(manifest_path) as f:
+        manifest = _yaml.safe_load(f) or {}
+
+    # Read overrides from --stdin or CLI flags
+    spec = {}
+    if getattr(args, "stdin", False):
+        raw = sys.stdin.read()
+        try:
+            spec = json.loads(raw)
+        except Exception as e:
+            print(f"[parallax] ERROR: --stdin expects JSON: {e}", file=sys.stderr)
+            return 1
+    voice_input = spec.get("voice") or getattr(args, "voice", None)
+    model_id = spec.get("model_id") or getattr(args, "model_id", None) or "eleven_v3"
+    script_override = spec.get("script")
+
+    # Build script text: explicit override > scene vo_text concatenation
+    if script_override:
+        script_text = script_override
+    else:
+        scenes = manifest.get("scenes") or []
+        vo_chunks = []
+        for s in scenes:
+            t = (s.get("vo_text") or "").strip() if isinstance(s, dict) else ""
+            if t:
+                vo_chunks.append(t)
+        script_text = " ".join(vo_chunks).strip()
+
+    if not script_text:
+        msg = ("no script text — set vo_text on each scene via "
+               "`parallax manifest set-vo <scene> \"<text>\"` or pass "
+               "{\"script\": \"...\"} via --stdin")
+        emitter.emit("error", message=msg, where="cmd_voiceover.no_text")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    # Resolve voice — override > manifest.voice > george default
+    if not voice_input:
+        voice_cfg = manifest.get("voice") or {}
+        voice_input = voice_cfg.get("voice_name") or voice_cfg.get("voice_id") or "george"
+    voice_input = str(voice_input).strip()
+    voice_id = VOICE_SHORTCUTS.get(voice_input.lower(), voice_input)
+    voice_name = voice_input.title() if voice_input.lower() in VOICE_SHORTCUTS else voice_input
+
+    try:
+        from elevenlabs.client import ElevenLabs
+        from elevenlabs.types import VoiceSettings
+    except ImportError as e:
+        msg = f"elevenlabs not installed: {e}. Run: pip install elevenlabs"
+        emitter.emit("error", message=msg, where="cmd_voiceover.import")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+    try:
+        from api_config import get_elevenlabs_key
+    except ImportError as e:
+        emitter.emit("error", message=str(e), where="cmd_voiceover.api_config")
+        print(f"[parallax] ERROR: api_config import failed: {e}", file=sys.stderr)
+        return 1
+
+    key = get_elevenlabs_key()
+    if not key:
+        msg = "no ElevenLabs API key. Set ELEVENLABS_API_KEY or AI_VIDEO_ELEVENLABS_KEY."
+        emitter.emit("error", message=msg, where="cmd_voiceover.no_key")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    audio_dir = cwd / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / "voiceover.mp3"
+    vo_manifest_path = audio_dir / "vo_manifest.json"
+
+    print(f"[parallax] script:  {len(script_text.split())} words")
+    print(f"[parallax] voice:   {voice_name} ({voice_id})")
+    print(f"[parallax] model:   {model_id}")
+    print(f"[parallax] output:  {audio_path}")
+    print()
+
+    client = ElevenLabs(api_key=key)
+    print(f"[parallax] calling ElevenLabs...", end=" ", flush=True)
+    try:
+        # Plain audio synthesis. We do NOT use convert_with_timestamps because
+        # ElevenLabs's character-level alignment is less accurate than WhisperX
+        # phoneme-level forced alignment. Word timings come from WhisperX below.
+        audio_iter = client.text_to_speech.convert(
+            text=script_text,
+            voice_id=voice_id,
+            model_id=model_id,
+            output_format="mp3_44100_128",
+            voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
+        )
+        audio_bytes = b"".join(audio_iter)
+    except Exception as e:
+        msg = f"ElevenLabs call failed: {e}"
+        emitter.emit("error", message=msg, where="cmd_voiceover.api_call")
+        print(f"FAILED\n[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    audio_path.write_bytes(audio_bytes)
+    print(f"done ({len(audio_bytes):,} bytes)")
+    emitter.emit("voiceover_generated", path=str(audio_path), bytes=len(audio_bytes))
+
+    # Persist voice config + voiceover stub to project manifest BEFORE transcription
+    manifest["voice"] = {
+        "voice_id": voice_id,
+        "voice_name": voice_name,
+        "model_id": model_id,
+    }
+    manifest["voiceover"] = {
+        "audio_file": "audio/voiceover.mp3",
+        "script": script_text,
+    }
+    try:
+        with open(manifest_path, "w") as f:
+            _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+    except Exception as e:
+        print(f"[parallax] WARNING: could not update manifest: {e}", file=sys.stderr)
+
+    # ── WhisperX transcription (the singular timing path) ───────────────────
+    # Auto-run unless --no-transcribe was passed. Word timings come from here.
+    if not getattr(args, "no_transcribe", False):
+        print()
+        print(f"[parallax] running WhisperX transcription...")
+        try:
+            transcript, words = _whisperx_transcribe(audio_path)
+        except ImportError as e:
+            print(
+                f"[parallax] ERROR: whisperx not installed — install with: pip install whisperx\n"
+                f"           parallax has NO transcription fallback. WhisperX is required.\n"
+                f"           ({e})",
+                file=sys.stderr,
+            )
+            emitter.emit("error", message="whisperx missing", where="cmd_voiceover.transcribe")
+            return 1
+        except Exception as e:
+            print(f"[parallax] ERROR: whisperx failed: {e}", file=sys.stderr)
+            emitter.emit("error", message=str(e), where="cmd_voiceover.transcribe")
+            return 1
+
+        # Probe duration via ffprobe
+        import subprocess as _sp
+        duration_s = 0.0
+        try:
+            probe = _sp.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(audio_path)],
+                capture_output=True, text=True, check=True,
+            )
+            duration_s = float(json.loads(probe.stdout)["format"]["duration"])
+        except Exception as e:
+            print(f"[parallax] WARNING: ffprobe failed: {e}", file=sys.stderr)
+
+        vo_manifest = {
+            "audio_file": "voiceover.mp3",
+            "total_duration_s": round(duration_s, 3),
+            "transcript": transcript,
+            "transcribed_by": "whisperx",
+            "model": "base.en",
+            "language": "en",
+            "voice_id": voice_id,
+            "voice_name": voice_name,
+            "words": words,
+        }
+        vo_manifest_path.write_text(json.dumps(vo_manifest, indent=2))
+        print(f"[whisperx] wrote {vo_manifest_path}")
+        print(f"[whisperx] transcribed {len(words)} words, {duration_s:.2f}s")
+
+        # Update manifest with full vo info
+        manifest["voiceover"] = {
+            "audio_file": "audio/voiceover.mp3",
+            "vo_manifest": "audio/vo_manifest.json",
+            "duration_s": round(duration_s, 3),
+            "script": script_text,
+            "transcribed": True,
+            "transcribed_by": "whisperx",
+        }
+        try:
+            with open(manifest_path, "w") as f:
+                _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+        except Exception as e:
+            print(f"[parallax] WARNING: manifest update failed: {e}", file=sys.stderr)
+    else:
+        words = []
+        duration_s = 0.0
+        print(f"[parallax] skipped transcription (--no-transcribe)")
+        print(f"[parallax] you must run `parallax transcribe` before `parallax align`")
+
+    print()
+    print(f"[parallax] voiceover: ./audio/voiceover.mp3 ({duration_s:.2f}s)")
+    print(f"[parallax] next:      parallax align  (sync scene durations to whisperx timings)")
+
+    duration_run = time.time() - started_at
+    emitter.emit("run_complete", output_path=str(audio_path),
+                 duration_s=round(duration_run, 2),
+                 audio_duration_s=round(duration_s, 2),
+                 word_count=len(words))
+    return 0
+
+
+def cmd_trim_silence(args) -> int:
+    """
+    Detect and trim silent gaps in audio/voiceover.mp3, then rewrite the
+    word-level timestamps in audio/vo_manifest.json to match the new audio.
+
+    Strategy:
+      1. ffmpeg silencedetect → list of silent regions
+      2. Build keep segments (everything except silences > min_silence)
+      3. Concat keep segments → new audio in place of old
+      4. For each word in vo_manifest, project its old timestamp through the
+         segment map to get its new timestamp.
+    """
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    started_at = time.time()
+    emitter.emit("run_started", brief="trim-silence", mode="trim_silence",
+                 project_dir=str(cwd / ".parallax"))
+
+    audio_path = cwd / "audio" / "voiceover.mp3"
+    vo_manifest_path = cwd / "audio" / "vo_manifest.json"
+    if not audio_path.exists():
+        msg = f"voiceover not found at {audio_path} — run `parallax voiceover` first"
+        emitter.emit("error", message=msg, where="cmd_trim_silence.missing_audio")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    import subprocess as _sp
+    import re as _re
+
+    MIN_SILENCE = 0.5  # seconds — only trim gaps longer than this
+    PAD = 0.15         # seconds — preserve this much on each side of a cut
+    THRESHOLD_DB = -35
+
+    # Probe original duration
+    try:
+        probe = _sp.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(audio_path)],
+            capture_output=True, text=True, check=True,
+        )
+        original_dur = float(json.loads(probe.stdout)["format"]["duration"])
+    except Exception as e:
+        print(f"[parallax] ERROR: ffprobe failed: {e}", file=sys.stderr)
+        return 1
+
+    print(f"[parallax] detecting silences (>{MIN_SILENCE}s, <{THRESHOLD_DB}dB)...", end=" ", flush=True)
+    detect = _sp.run(
+        ["ffmpeg", "-hide_banner", "-i", str(audio_path),
+         "-af", f"silencedetect=noise={THRESHOLD_DB}dB:d={MIN_SILENCE}",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    starts = [float(x) for x in _re.findall(r'silence_start: ([\d.]+)', detect.stderr)]
+    ends = [float(x) for x in _re.findall(r'silence_end: ([\d.]+)', detect.stderr)]
+    silences = []
+    for s, e in zip(starts, ends):
+        # Clamp to padded region
+        cs = s + PAD
+        ce = e - PAD
+        if ce > cs:
+            silences.append((cs, ce))
+    print(f"found {len(silences)}")
+
+    if not silences:
+        print("[parallax] nothing to trim")
+        duration_run = time.time() - started_at
+        emitter.emit("run_complete", output_path=str(audio_path),
+                     duration_s=round(duration_run, 2), trimmed=0)
+        return 0
+
+    # Build keep segments (inverse of silence regions)
+    keeps = []
+    cursor = 0.0
+    for cs, ce in silences:
+        if cs > cursor:
+            keeps.append((cursor, cs))
+        cursor = ce
+    if cursor < original_dur:
+        keeps.append((cursor, original_dur))
+
+    print(f"[parallax] keeping {len(keeps)} segment(s)")
+
+    # ffmpeg concat via filter: select multiple atrims and concat them.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="parallax-trim-") as tmpdir:
+        out_path = Path(tmpdir) / "trimmed.mp3"
+        # Build a single -filter_complex with N atrims and a concat
+        filter_parts = []
+        for i, (s, e) in enumerate(keeps):
+            filter_parts.append(f"[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS[a{i}]")
+        concat_inputs = "".join(f"[a{i}]" for i in range(len(keeps)))
+        filter_parts.append(f"{concat_inputs}concat=n={len(keeps)}:v=0:a=1[out]")
+        filter_complex = ";".join(filter_parts)
+
+        result = _sp.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+             "-i", str(audio_path),
+             "-filter_complex", filter_complex,
+             "-map", "[out]",
+             "-c:a", "libmp3lame", "-b:a", "128k",
+             str(out_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not out_path.exists():
+            msg = (result.stderr or "ffmpeg trim failed").strip()[-500:]
+            emitter.emit("error", message=msg, where="cmd_trim_silence.ffmpeg")
+            print(f"[parallax] ERROR: ffmpeg failed\n{msg}", file=sys.stderr)
+            return 1
+
+        # Replace the original
+        out_path.replace(audio_path)
+
+    # Reprobe new duration
+    probe2 = _sp.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(audio_path)],
+        capture_output=True, text=True, check=True,
+    )
+    new_dur = float(json.loads(probe2.stdout)["format"]["duration"])
+    removed = original_dur - new_dur
+    print(f"[parallax] trimmed: {original_dur:.2f}s → {new_dur:.2f}s (removed {removed:.2f}s)")
+
+    # Project word timestamps through the keep map
+    if vo_manifest_path.exists():
+        try:
+            with open(vo_manifest_path) as f:
+                vo_data = json.load(f)
+            old_words = vo_data.get("words") or []
+            # Build cumulative offsets: for each old time t, new time = sum of
+            # keep_lengths before t + (t - keep_start) if t falls inside a keep
+            new_words = []
+            for w in old_words:
+                old_t = w["start"]
+                new_t = None
+                offset = 0.0
+                for ks, ke in keeps:
+                    if old_t >= ks and old_t <= ke:
+                        new_t = offset + (old_t - ks)
+                        break
+                    offset += (ke - ks)
+                if new_t is None:
+                    # Word was inside a removed silence — drop it
+                    continue
+                old_e = w["end"]
+                new_e = None
+                offset_e = 0.0
+                for ks, ke in keeps:
+                    if old_e >= ks and old_e <= ke:
+                        new_e = offset_e + (old_e - ks)
+                        break
+                    offset_e += (ke - ks)
+                if new_e is None:
+                    new_e = new_t + 0.1
+                new_words.append({
+                    "word": w["word"],
+                    "start": round(new_t, 3),
+                    "end": round(new_e, 3),
+                })
+            vo_data["words"] = new_words
+            vo_data["total_duration_s"] = round(new_dur, 3)
+            vo_data["trimmed"] = True
+            vo_manifest_path.write_text(json.dumps(vo_data, indent=2))
+            print(f"[parallax] vo_manifest: {len(new_words)} words rewritten")
+        except Exception as e:
+            print(f"[parallax] WARNING: vo_manifest rewrite failed: {e}", file=sys.stderr)
+
+    # Update project manifest with new duration
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    if manifest_path.exists():
+        try:
+            import yaml as _yaml
+            with open(manifest_path) as f:
+                manifest = _yaml.safe_load(f) or {}
+            vo = manifest.get("voiceover") or {}
+            vo["duration_s"] = round(new_dur, 3)
+            vo["trimmed"] = True
+            manifest["voiceover"] = vo
+            with open(manifest_path, "w") as f:
+                _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+        except Exception as e:
+            print(f"[parallax] WARNING: project manifest rewrite failed: {e}", file=sys.stderr)
+
+    duration_run = time.time() - started_at
+    emitter.emit("run_complete", output_path=str(audio_path),
+                 duration_s=round(duration_run, 2),
+                 removed_s=round(removed, 2))
+    return 0
+
+
+def cmd_align(args) -> int:
+    """
+    Align scene durations to voiceover word timestamps.
+
+    For each scene with `vo_text`, find the start of its first word in
+    audio/vo_manifest.json and the start of the next scene's first word.
+    The difference is the new scene duration. Last scene runs to end of audio.
+
+    Scenes without vo_text keep their existing duration.
+    """
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    started_at = time.time()
+    emitter.emit("run_started", brief="align", mode="align",
+                 project_dir=str(cwd / ".parallax"))
+
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    vo_manifest_path = cwd / "audio" / "vo_manifest.json"
+    if not manifest_path.exists():
+        msg = f"manifest not found: {manifest_path}"
+        emitter.emit("error", message=msg, where="cmd_align.no_manifest")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+    if not vo_manifest_path.exists():
+        msg = (f"vo_manifest not found at {vo_manifest_path} — "
+               f"run `parallax voiceover` first")
+        emitter.emit("error", message=msg, where="cmd_align.no_vo_manifest")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    import yaml as _yaml
+    with open(manifest_path) as f:
+        manifest = _yaml.safe_load(f) or {}
+    with open(vo_manifest_path) as f:
+        vo_data = json.load(f)
+
+    words = vo_data.get("words") or []
+    audio_duration = vo_data.get("total_duration_s") or 0.0
+    if not words:
+        print("[parallax] WARNING: no word timestamps in vo_manifest", file=sys.stderr)
+        return 1
+
+    scenes = manifest.get("scenes") or []
+    if not scenes:
+        print("[parallax] ERROR: manifest has no scenes", file=sys.stderr)
+        return 1
+
+    # For each scene with vo_text, find the start time of its first word
+    # in the global word timeline. We use a multi-word prefix match (up to 3
+    # consecutive words) so common short words like "In", "The", "And" don't
+    # false-positive on earlier occurrences in another sentence.
+    def _norm(w: str) -> str:
+        return w.lower().strip(".,!?;:\"'()[]")
+
+    word_idx = 0
+    scene_starts = []  # parallel to scenes; None means no vo_text
+    for scene in scenes:
+        vo_text = (scene.get("vo_text") or "").strip() if isinstance(scene, dict) else ""
+        if not vo_text:
+            scene_starts.append(None)
+            continue
+        scene_words = [_norm(w) for w in vo_text.split() if _norm(w)]
+        if not scene_words:
+            scene_starts.append(None)
+            continue
+
+        # Try a 3-word prefix match first, fall back to 2-word, then 1-word.
+        # Always walking forward from word_idx so scenes match in order.
+        found = None
+        found_at = None
+        for prefix_len in (3, 2, 1):
+            if prefix_len > len(scene_words):
+                continue
+            target = scene_words[:prefix_len]
+            for j in range(word_idx, len(words) - prefix_len + 1):
+                window = [_norm(words[j + k]["word"]) for k in range(prefix_len)]
+                if window == target:
+                    found = words[j]["start"]
+                    found_at = j
+                    break
+            if found is not None:
+                break
+
+        if found is None:
+            print(f"[parallax] WARNING: scene {scene.get('number','?')} prefix "
+                  f"{scene_words[:3]!r} not found in voiceover", file=sys.stderr)
+            scene_starts.append(None)
+        else:
+            scene_starts.append(found)
+            word_idx = found_at + 1
+
+    # Snap the first vo'd scene to t=0 so any lead-in silence is covered.
+    # Without this, scene 1 starts at its first word's start time and there's
+    # uncovered audio at the head, which -shortest clips at the tail.
+    first_vo_idx = next((i for i, s in enumerate(scene_starts) if s is not None), None)
+    if first_vo_idx is not None:
+        scene_starts[first_vo_idx] = 0.0
+
+    # Compute durations: each scene runs from its start to the next scene's start
+    # (or to end of audio for the last vo'd scene).
+    aligned_count = 0
+    for i, scene in enumerate(scenes):
+        if scene_starts[i] is None:
+            continue
+        # Find the next scene that has a start time
+        next_start = None
+        for j in range(i + 1, len(scenes)):
+            if scene_starts[j] is not None:
+                next_start = scene_starts[j]
+                break
+        if next_start is None:
+            next_start = audio_duration
+        new_dur = round(next_start - scene_starts[i], 3)
+        if new_dur > 0.1:
+            scene["duration"] = new_dur
+            aligned_count += 1
+            print(f"[parallax] scene {scene.get('number','?')}: {new_dur:.2f}s "
+                  f"({scene_starts[i]:.2f}–{next_start:.2f})")
+
+    with open(manifest_path, "w") as f:
+        _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+
+    print()
+    print(f"[parallax] aligned {aligned_count} scene(s) to voiceover timing")
+    print(f"[parallax] next:     parallax compose  (renders with audio mux)")
+
+    duration_run = time.time() - started_at
+    emitter.emit("run_complete", duration_s=round(duration_run, 2),
+                 aligned_scenes=aligned_count)
+    return 0
+
+
+def cmd_compose(args) -> int:
+    """
+    Manifest-first render. Reads .parallax/manifest.yaml and renders
+    EXACTLY the scenes listed there — no globbing, no fallbacks.
+
+    Each scene must have:
+      still:    relative path to a still image
+      duration: seconds for that scene
+    Optional per-scene fields:
+      motion:   ken-burns preset (default: zoom_drift_right)
+
+    Optional top-level manifest fields:
+      output_motion:     default motion if scenes don't specify one
+      output_resolution: default '1080x1920'
+
+    Reads:   cwd/.parallax/manifest.yaml + the stills it references
+    Writes:  cwd/output/<concept_id>_v<version>.mp4
+    """
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    _ensure_project_layout(cwd)
+
+    run_id = uuid.uuid4().hex[:8]
+    from core.events import emitter
+    if getattr(args, "json", False):
+        emitter.enable_json(run_id)
+    from core.logging_setup import setup_run_logging
+    setup_run_logging(run_id)
+    log = logging.getLogger("parallax.compose")
+    started_at = time.time()
+    emitter.emit("run_started", brief="compose", mode="compose", project_dir=str(cwd / ".parallax"))
+
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    if not manifest_path.exists():
+        msg = f"manifest not found: {manifest_path}"
+        emitter.emit("error", message=msg, where="cmd_compose.read_manifest")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        print(f"           run `parallax create` first or write a manifest.yaml", file=sys.stderr)
+        return 1
+
+    try:
+        import yaml as _yaml
+        with open(manifest_path) as f:
+            manifest = _yaml.safe_load(f) or {}
+    except Exception as e:
+        emitter.emit("error", message=str(e), where="cmd_compose.parse_manifest")
+        print(f"[parallax] ERROR: failed to parse manifest: {e}", file=sys.stderr)
+        return 1
+
+    scenes = manifest.get("scenes") or []
+    if not scenes:
+        msg = "manifest has no scenes — add a `scenes:` list with `still` and `duration` per entry"
+        emitter.emit("error", message=msg, where="cmd_compose.no_scenes")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    default_motion = manifest.get("output_motion") or "zoom_drift_right"
+    resolution = manifest.get("output_resolution") or "1080x1920"
+    concept_id = manifest.get("concept_id") or f"CMP-{int(time.time()) % 1000:03d}"
+
+    valid_motions = {
+        "zoom_in", "zoom_out", "zoom_drift_right", "zoom_drift_left",
+        "zoom_drift_down", "zoom_drift_up", "pan_right", "pan_left",
+        "pan_down", "pan_up",
+    }
+
+    # Validate every scene before rendering anything — fail fast.
+    # A scene is one of:
+    #   - still scene: requires `still` (path) and `duration` (and optional motion)
+    #   - video scene: type='video', requires `source` (path), optional start_s/end_s
+    resolved_scenes = []
+    for i, scene in enumerate(scenes, 1):
+        if not isinstance(scene, dict):
+            msg = f"scene {i}: must be a mapping"
+            emitter.emit("error", message=msg, where="cmd_compose.validate")
+            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+            return 1
+
+        scene_type = scene.get("type") or ("video" if scene.get("source") else "still")
+
+        if scene_type == "video":
+            source_rel = scene.get("source") or scene.get("video")
+            if not source_rel:
+                msg = f"scene {i}: video scene requires `source` (path to mp4/mov)"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            source_path = (cwd / source_rel).resolve()
+            if not source_path.exists():
+                msg = f"scene {i}: video source not found: {source_rel}"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            start_s = scene.get("start_s")
+            end_s = scene.get("end_s")
+            duration = scene.get("duration")
+            try:
+                if start_s is not None: start_s = float(start_s)
+                if end_s is not None: end_s = float(end_s)
+                if duration is not None: duration = float(duration)
+            except (TypeError, ValueError):
+                msg = f"scene {i}: start_s/end_s/duration must be numbers"
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            # Compute effective duration: prefer explicit, else end_s-start_s, else full clip
+            if duration is None and start_s is not None and end_s is not None:
+                duration = end_s - start_s
+            resolved_scenes.append({
+                "index": i,
+                "type": "video",
+                "source": source_path,
+                "source_rel": source_rel,
+                "start_s": start_s,
+                "end_s": end_s,
+                "duration": duration,
+            })
+        else:
+            # still scene
+            still_rel = scene.get("still")
+            if not still_rel:
+                msg = f"scene {i}: still scene requires `still` (path)"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            still_path = (cwd / still_rel).resolve()
+            if not still_path.exists():
+                msg = f"scene {i}: still not found: {still_rel}"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            duration = scene.get("duration")
+            if duration is None:
+                msg = f"scene {i}: still scene requires `duration`"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            try:
+                duration = float(duration)
+            except (TypeError, ValueError):
+                msg = f"scene {i}: duration must be a number, got {duration!r}"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            motion = scene.get("motion") or default_motion
+            if motion not in valid_motions:
+                msg = f"scene {i}: invalid motion {motion!r}. Valid: {sorted(valid_motions)}"
+                emitter.emit("error", message=msg, where="cmd_compose.validate")
+                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+                return 1
+            resolved_scenes.append({
+                "index": i,
+                "type": "still",
+                "still": still_path,
+                "still_rel": still_rel,
+                "duration": duration,
+                "motion": motion,
+            })
+
+    print(f"[parallax] composing {len(resolved_scenes)} scene(s) from manifest")
+    print(f"[parallax] concept:  {concept_id}")
+    print(f"[parallax] resolution: {resolution}")
+    print()
+
+    ken_burns_script = BUNDLED_SCRIPTS / "ken-burns.py"
+    if not ken_burns_script.exists():
+        msg = f"ken-burns.py not found at {ken_burns_script}"
+        emitter.emit("error", message=msg, where="cmd_compose.script_missing")
+        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    output_dir = cwd / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import subprocess as _sp, tempfile
+    clip_paths = []
+    # Parse resolution into width/height for video normalization
+    try:
+        res_w, res_h = (int(x) for x in resolution.split("x"))
+    except Exception:
+        res_w, res_h = 1080, 1920
+
+    with tempfile.TemporaryDirectory(prefix="parallax-compose-") as tmpdir:
+        for scene in resolved_scenes:
+            clip_path = Path(tmpdir) / f"clip_{scene['index']:02d}.mp4"
+            try:
+                if scene["type"] == "still":
+                    print(
+                        f"[parallax] scene {scene['index']} (still): {scene['still'].name} "
+                        f"({scene['motion']}, {scene['duration']}s)...",
+                        end=" ", flush=True,
+                    )
+                    result = _sp.run(
+                        [sys.executable, str(ken_burns_script),
+                         "--input", str(scene["still"]),
+                         "--output", str(clip_path),
+                         "--duration", str(scene["duration"]),
+                         "--motion", scene["motion"],
+                         "--resolution", resolution],
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    if result.returncode != 0:
+                        print(f"FAILED\n{result.stderr.strip()}", file=sys.stderr)
+                        emitter.emit("error", message=f"ken-burns failed for scene {scene['index']}",
+                                     where="cmd_compose.ken_burns")
+                        return 1
+                else:
+                    # video scene: trim + scale + pad to target resolution
+                    if scene.get("start_s") is not None:
+                        trim_label = f" ({scene['start_s']}–{scene['end_s']})"
+                    else:
+                        trim_label = ""
+                    print(
+                        f"[parallax] scene {scene['index']} (video): {scene['source'].name}"
+                        f"{trim_label}...",
+                        end=" ", flush=True,
+                    )
+                    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+                    if scene.get("start_s") is not None:
+                        cmd += ["-ss", str(scene["start_s"])]
+                    cmd += ["-i", str(scene["source"])]
+                    if scene.get("end_s") is not None and scene.get("start_s") is not None:
+                        cmd += ["-t", str(scene["end_s"] - scene["start_s"])]
+                    elif scene.get("duration") is not None:
+                        cmd += ["-t", str(scene["duration"])]
+                    # Scale to fit, pad to exact res, force 30fps + libx264 + aac for concat compat
+                    vf = (
+                        f"scale={res_w}:{res_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={res_w}:{res_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+                    )
+                    cmd += [
+                        "-vf", vf,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-pix_fmt", "yuv420p",
+                        "-an",  # strip audio — voiceover is muxed in later
+                        str(clip_path),
+                    ]
+                    result = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+                    if result.returncode != 0:
+                        print(f"FAILED\n{result.stderr.strip()[-500:]}", file=sys.stderr)
+                        emitter.emit("error", message=f"video scene {scene['index']} failed",
+                                     where="cmd_compose.video_scene")
+                        return 1
+                clip_paths.append(str(clip_path))
+                emitter.emit("still_generated", path=str(clip_path), scene=scene["index"])
+                print("done")
+            except Exception as e:
+                emitter.emit("error", message=str(e), where=f"cmd_compose.scene_{scene['index']}")
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+
+        from core.project_layout import next_version, update_latest_symlink
+        version = next_version(cwd, concept_id)
+        silent_path = Path(tmpdir) / f"silent_{concept_id}_v{version}.mp4"
+        output_path = output_dir / f"{concept_id}_v{version}.mp4"
+        concat_list = Path(tmpdir) / "concat.txt"
+        concat_list.write_text("\n".join(f"file '{p}'" for p in clip_paths))
+
+        print(f"\n[parallax] assembling → {output_path.name}...", end=" ", flush=True)
+        emitter.emit("assembly_started", clip_count=len(clip_paths), output_path=str(output_path))
+        try:
+            result = _sp.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list),
+                 "-c", "copy", str(silent_path)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                emitter.emit("error", message=f"ffmpeg concat failed rc={result.returncode}",
+                             where="cmd_compose.assembly")
+                print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                return 1
+            print("done")
+        except Exception as e:
+            emitter.emit("error", message=str(e), where="cmd_compose.assembly")
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+
+        # ── Audio mux ────────────────────────────────────────────────────────
+        # If manifest.voiceover.audio_file exists, mux it into the silent video.
+        # Otherwise, copy the silent video to the output path.
+        vo_info = manifest.get("voiceover") or {}
+        vo_rel = vo_info.get("audio_file") if isinstance(vo_info, dict) else None
+        vo_audio_path = (cwd / vo_rel).resolve() if vo_rel else None
+        if vo_audio_path and vo_audio_path.exists():
+            print(f"[parallax] muxing audio: {vo_rel}...", end=" ", flush=True)
+            try:
+                result = _sp.run(
+                    ["ffmpeg", "-y",
+                     "-i", str(silent_path),
+                     "-i", str(vo_audio_path),
+                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                     "-shortest",
+                     str(output_path)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode != 0:
+                    emitter.emit("error", message=f"ffmpeg mux failed rc={result.returncode}",
+                                 where="cmd_compose.mux")
+                    print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                    return 1
+                print("done")
+                emitter.emit("audio_muxed", audio_file=vo_rel, output_path=str(output_path))
+            except Exception as e:
+                emitter.emit("error", message=str(e), where="cmd_compose.mux")
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+        else:
+            try:
+                _sp.run(["cp", str(silent_path), str(output_path)], check=True)
+            except Exception as e:
+                emitter.emit("error", message=str(e), where="cmd_compose.copy")
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+
+        # ── Headline overlay ─────────────────────────────────────────────────
+        # If manifest.headline is set, generate a PNG via generate-caption.py
+        # and burn it in for the full video duration (or a window).
+        headline_cfg = manifest.get("headline")
+        if headline_cfg:
+            if isinstance(headline_cfg, str):
+                headline_text = headline_cfg
+                headline_style = "banner"
+                headline_start = 0.0
+                headline_end = None
+            elif isinstance(headline_cfg, dict):
+                headline_text = headline_cfg.get("text", "")
+                headline_style = headline_cfg.get("style", "banner")
+                headline_start = float(headline_cfg.get("start_s", 0.0))
+                headline_end = headline_cfg.get("end_s")
+                if headline_end is not None:
+                    headline_end = float(headline_end)
+            else:
+                headline_text = ""
+                headline_style = "banner"
+                headline_start = 0.0
+                headline_end = None
+
+            if headline_text:
+                gen_caption_script = BUNDLED_SCRIPTS / "generate-caption.py"
+                if not gen_caption_script.exists():
+                    print(f"[parallax] WARNING: generate-caption.py not found, skipping headline",
+                          file=sys.stderr)
+                else:
+                    headline_png = Path(tmpdir) / "headline.png"
+                    print(f"[parallax] rendering headline: {headline_text!r}...", end=" ", flush=True)
+                    try:
+                        result = _sp.run(
+                            [sys.executable, str(gen_caption_script),
+                             "--text", headline_text,
+                             "--style", headline_style,
+                             "--resolution", resolution,
+                             "--output", str(headline_png)],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        if result.returncode != 0:
+                            print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                        else:
+                            print("done")
+                            # Burn the PNG over the video for the requested window
+                            with_headline = output_dir / f"{concept_id}_v{version}_headlined.mp4"
+                            enable_expr = f"between(t,{headline_start},{headline_end})" if headline_end is not None else f"gte(t,{headline_start})"
+                            print(f"[parallax] burning headline overlay...", end=" ", flush=True)
+                            ov_result = _sp.run(
+                                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                 "-i", str(output_path),
+                                 "-i", str(headline_png),
+                                 "-filter_complex",
+                                 f"[0:v][1:v]overlay=0:0:enable='{enable_expr}'[outv]",
+                                 "-map", "[outv]", "-map", "0:a?",
+                                 "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                 "-c:a", "copy",
+                                 str(with_headline)],
+                                capture_output=True, text=True, timeout=300,
+                            )
+                            if ov_result.returncode != 0:
+                                print(f"FAILED\n{ov_result.stderr[-500:]}", file=sys.stderr)
+                            else:
+                                print("done")
+                                with_headline.replace(output_path)
+                                emitter.emit("headline_burned", text=headline_text)
+                    except Exception as e:
+                        print(f"ERROR: {e}", file=sys.stderr)
+
+        # ── Caption burn ─────────────────────────────────────────────────────
+        # If voiceover and vo_manifest both exist AND manifest.captions.enabled
+        # is truthy (default off — opt in), burn word-level captions.
+        captions_cfg = manifest.get("captions") or {}
+        captions_enabled = bool(captions_cfg.get("enabled"))
+        vo_manifest_rel = vo_info.get("vo_manifest") if isinstance(vo_info, dict) else None
+        vo_manifest_path_full = (cwd / vo_manifest_rel).resolve() if vo_manifest_rel else None
+        if captions_enabled and vo_manifest_path_full and vo_manifest_path_full.exists():
+            burn_script = BUNDLED_SCRIPTS / "burn-captions.py"
+            if burn_script.exists():
+                # burn-captions.py uses the video-production manifest schema
+                # which expects project as a dict with id + config.resolution.
+                # Write a stub manifest in tmpdir that satisfies that schema
+                # while pointing at our real vo_manifest.
+                import yaml as _yaml
+                stub_manifest = {
+                    "project": {
+                        "id": concept_id,
+                        "name": str(manifest.get("project") or "parallax"),
+                    },
+                    "config": {
+                        "resolution": resolution,
+                        "fps": 30,
+                    },
+                    "voiceover": {
+                        "vo_manifest": str(vo_manifest_path_full),
+                    },
+                }
+                stub_path = Path(tmpdir) / "burn_captions_stub.yaml"
+                stub_path.write_text(_yaml.dump(stub_manifest))
+
+                captioned_path = output_dir / f"{concept_id}_v{version}_captioned.mp4"
+                print(f"[parallax] burning captions...", end=" ", flush=True)
+                try:
+                    result = _sp.run(
+                        [sys.executable, str(burn_script),
+                         "--manifest", str(stub_path),
+                         "--video", str(output_path),
+                         "--vo-manifest", str(vo_manifest_path_full),
+                         "--output", str(captioned_path),
+                         "--block-bg"],
+                        capture_output=True, text=True, timeout=600,
+                    )
+                    if result.returncode != 0:
+                        print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                        emitter.emit("error", message="burn-captions failed",
+                                     where="cmd_compose.captions")
+                    else:
+                        print("done")
+                        # Replace output with captioned version
+                        captioned_path.replace(output_path)
+                        emitter.emit("captions_burned", output_path=str(output_path))
+                except Exception as e:
+                    print(f"ERROR: {e}", file=sys.stderr)
+                    emitter.emit("error", message=str(e), where="cmd_compose.captions")
+            else:
+                print(f"[parallax] WARNING: burn-captions.py not found, skipping captions",
+                      file=sys.stderr)
+
+        emitter.emit("assembly_complete", output_path=str(output_path))
+
+    # Update manifest with output_video field (preserve existing content).
+    try:
+        content = manifest_path.read_text()
+        if "output_video:" in content:
+            import re
+            content = re.sub(r'output_video:.*', f'output_video: "output/{output_path.name}"', content)
+        else:
+            content = content.rstrip() + f'\noutput_video: "output/{output_path.name}"\n'
+        manifest_path.write_text(content)
+    except Exception as e:
+        print(f"[parallax] WARNING: could not update manifest: {e}", file=sys.stderr)
+
+    try:
+        update_latest_symlink(cwd, output_path)
+    except Exception as e:
+        print(f"[parallax] WARNING: could not update latest.mp4: {e}", file=sys.stderr)
+
+    print()
+    print(f"[parallax] final: ./output/{output_path.name}")
+
+    duration_s = time.time() - started_at
+    emitter.emit("run_complete", output_path=str(output_path), duration_s=round(duration_s, 2))
+    return 0
+
+
+def cmd_manifest_edit(args) -> int:
+    """
+    Apply a single edit to .parallax/manifest.yaml.
+
+    Operations:
+      set-scenes <still1[:duration[:motion]]> ...   replace scenes list
+      add-scene <still> [--duration N] [--motion M] append a scene
+      remove-scene <number>                         remove scene by number
+      reorder <number,number,...>                   reorder scenes
+      set <key> <value>                             set top-level key
+      show                                          print current manifest
+    """
+    cwd = Path.cwd()
+    _ensure_project_layout(cwd)
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+
+    import yaml as _yaml
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest = _yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"[parallax] ERROR: failed to parse manifest: {e}", file=sys.stderr)
+            return 1
+    else:
+        # Lazy-init a blank manifest so set-scenes/add-scene/etc. work from scratch
+        manifest = {
+            "project": cwd.name,
+            "concept_id": f"PRX-{int(time.time()) % 1000:03d}",
+            "scenes": [],
+        }
+
+    op = args.op
+
+    if op == "show":
+        import yaml as _yaml
+        print(_yaml.dump(manifest, sort_keys=False, default_flow_style=False))
+        return 0
+
+    scenes = manifest.get("scenes") or []
+
+    if op == "set-scenes":
+        if not args.values:
+            print("[parallax] ERROR: set-scenes needs at least one still spec", file=sys.stderr)
+            return 1
+        new_scenes = []
+        for i, spec in enumerate(args.values, 1):
+            parts = spec.split(":")
+            still = parts[0]
+            duration = float(parts[1]) if len(parts) > 1 and parts[1] else 3.0
+            motion = parts[2] if len(parts) > 2 and parts[2] else None
+            still_path = (cwd / still).resolve()
+            if not still_path.exists():
+                print(f"[parallax] ERROR: still not found: {still}", file=sys.stderr)
+                return 1
+            scene = {"number": i, "duration": duration, "still": still}
+            if motion:
+                scene["motion"] = motion
+            new_scenes.append(scene)
+        manifest["scenes"] = new_scenes
+
+    elif op == "add-scene":
+        if not args.values:
+            print("[parallax] ERROR: add-scene needs a still path", file=sys.stderr)
+            return 1
+        still = args.values[0]
+        still_path = (cwd / still).resolve()
+        if not still_path.exists():
+            print(f"[parallax] ERROR: still not found: {still}", file=sys.stderr)
+            return 1
+        new_num = max((s.get("number", 0) for s in scenes), default=0) + 1
+        scene = {"number": new_num, "duration": args.duration, "still": still}
+        if args.motion:
+            scene["motion"] = args.motion
+        scenes.append(scene)
+        manifest["scenes"] = scenes
+
+    elif op == "remove-scene":
+        if not args.values:
+            print("[parallax] ERROR: remove-scene needs a scene number", file=sys.stderr)
+            return 1
+        try:
+            target = int(args.values[0])
+        except ValueError:
+            print(f"[parallax] ERROR: scene number must be an integer", file=sys.stderr)
+            return 1
+        scenes = [s for s in scenes if s.get("number") != target]
+        for i, s in enumerate(scenes, 1):
+            s["number"] = i
+        manifest["scenes"] = scenes
+
+    elif op == "reorder":
+        if not args.values:
+            print("[parallax] ERROR: reorder needs comma-separated scene numbers", file=sys.stderr)
+            return 1
+        try:
+            order = [int(x) for x in args.values[0].split(",")]
+        except ValueError:
+            print(f"[parallax] ERROR: reorder values must be integers", file=sys.stderr)
+            return 1
+        by_num = {s.get("number"): s for s in scenes}
+        new_scenes = []
+        for new_idx, old_num in enumerate(order, 1):
+            if old_num not in by_num:
+                print(f"[parallax] ERROR: scene {old_num} not in manifest", file=sys.stderr)
+                return 1
+            s = dict(by_num[old_num])
+            s["number"] = new_idx
+            new_scenes.append(s)
+        manifest["scenes"] = new_scenes
+
+    elif op == "set":
+        if len(args.values) < 2:
+            print("[parallax] ERROR: set needs <key> <value>", file=sys.stderr)
+            return 1
+        key, value = args.values[0], args.values[1]
+        # Try to coerce to int/float, fall back to string
+        try:
+            value = int(value)
+        except ValueError:
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+        manifest[key] = value
+
+    elif op == "set-vo":
+        # set-vo <scene_number> "<text>"
+        if len(args.values) < 2:
+            print("[parallax] ERROR: set-vo needs <scene_number> <text>", file=sys.stderr)
+            return 1
+        try:
+            target = int(args.values[0])
+        except ValueError:
+            print("[parallax] ERROR: scene number must be an integer", file=sys.stderr)
+            return 1
+        text = " ".join(args.values[1:])
+        found = False
+        for s in scenes:
+            if s.get("number") == target:
+                s["vo_text"] = text
+                found = True
+                break
+        if not found:
+            print(f"[parallax] ERROR: scene {target} not in manifest", file=sys.stderr)
+            return 1
+        manifest["scenes"] = scenes
+
+    elif op == "set-voice":
+        # set-voice <name_or_id>
+        if not args.values:
+            print("[parallax] ERROR: set-voice needs a voice name or id", file=sys.stderr)
+            return 1
+        voice_input = args.values[0]
+        manifest["voice"] = {
+            "voice_name": voice_input,
+            "voice_id": voice_input,
+        }
+
+    elif op == "enable-captions":
+        manifest["captions"] = {"enabled": True}
+
+    elif op == "disable-captions":
+        manifest["captions"] = {"enabled": False}
+
+    elif op == "set-headline":
+        if not args.values:
+            print("[parallax] ERROR: set-headline needs the headline text", file=sys.stderr)
+            return 1
+        text = " ".join(args.values)
+        manifest["headline"] = {"text": text, "style": "banner"}
+
+    elif op == "clear-headline":
+        manifest.pop("headline", None)
+
+    elif op == "add-video-scene":
+        # add-video-scene <source_path> [--start-s X] [--end-s Y]
+        if not args.values:
+            print("[parallax] ERROR: add-video-scene needs a source path", file=sys.stderr)
+            return 1
+        src = args.values[0]
+        src_path = (cwd / src).resolve()
+        if not src_path.exists():
+            print(f"[parallax] ERROR: video source not found: {src}", file=sys.stderr)
+            return 1
+        new_num = max((s.get("number", 0) for s in scenes), default=0) + 1
+        scene = {"number": new_num, "type": "video", "source": src}
+        # Optional start/end via flags
+        if hasattr(args, "start_s") and args.start_s is not None:
+            scene["start_s"] = args.start_s
+        if hasattr(args, "end_s") and args.end_s is not None:
+            scene["end_s"] = args.end_s
+        if hasattr(args, "duration") and args.duration is not None and args.duration != 3.0:
+            scene["duration"] = args.duration
+        scenes.append(scene)
+        manifest["scenes"] = scenes
+
+    else:
+        print(f"[parallax] ERROR: unknown op {op!r}", file=sys.stderr)
+        return 1
+
+    try:
+        import yaml as _yaml
+        with open(manifest_path, "w") as f:
+            _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+    except Exception as e:
+        print(f"[parallax] ERROR: failed to write manifest: {e}", file=sys.stderr)
+        return 1
+
+    print(f"[parallax] manifest updated: {op}")
     return 0
 
 
@@ -615,27 +2223,117 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chat(args: argparse.Namespace) -> int:
+    """
+    Launch the localhost parallax-web chat UI in the default browser.
+
+    Spawns `python3 -m parallax_web` with PYTHONPATH pointed at the web/
+    directory bundled with this CLI. The subprocess handles its own port
+    selection, HTTP server, SSE loop, and browser launch. Ctrl+C here is
+    forwarded to the child for a clean shutdown.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    web_dir = REPO_ROOT / "web"
+    if not web_dir.is_dir():
+        print(
+            f"[parallax] ERROR: web/ directory not found at {web_dir}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "[parallax chat] ANTHROPIC_API_KEY is not set. "
+            "Export it and try again:\n"
+            "  export ANTHROPIC_API_KEY=sk-ant-...",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Pick a python interpreter: prefer a web/.venv if present, otherwise
+    # fall back to the current interpreter.
+    venv_py = web_dir / ".venv" / "bin" / "python3"
+    python_bin = str(venv_py) if venv_py.is_file() else (_shutil.which("python3") or sys.executable)
+
+    # Probe for the anthropic package; if missing, tell the user how to fix.
+    probe = _subprocess.run(
+        [python_bin, "-c", "import anthropic"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        print(
+            "[parallax chat] the `anthropic` Python package isn't installed in\n"
+            f"  {python_bin}\n"
+            "Install it:\n"
+            f"  cd \"{web_dir}\" && python3 -m venv .venv\n"
+            f"  source .venv/bin/activate\n"
+            "  pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(web_dir) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    env.setdefault("PARALLAX_PROJECT_DIR", os.getcwd())
+
+    try:
+        proc = _subprocess.Popen(
+            [python_bin, "-m", "parallax_web"],
+            env=env,
+            cwd=os.getcwd(),
+        )
+    except Exception as e:
+        print(f"[parallax chat] failed to spawn server: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        return proc.wait()
+    except KeyboardInterrupt:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="parallax", description="Parallax video pipeline CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="kick off a footage_edit pipeline run in cwd")
-    p_run.add_argument("brief", help="brief text for the footage edit")
+    p_run.add_argument("brief", nargs="?", help="brief text for the footage edit (omit when using --stdin)")
     p_run.add_argument(
         "-y", "--yes",
         action="store_true",
         help="skip the clarification gate — assume the brief is fully specified and proceed with defaults",
     )
+    p_run.add_argument("--json", action="store_true",
+                       help="emit NDJSON events to stdout; human prose goes to stderr")
+    p_run.add_argument("--stdin", action="store_true",
+                       help="read a JSON job spec from stdin instead of using the positional brief")
     p_run.set_defaults(func=cmd_run)
 
     p_create = sub.add_parser("create", help="generate still images from a brief (no footage needed)")
-    p_create.add_argument("brief", help="creative brief — what to generate")
+    p_create.add_argument("brief", nargs="?", help="creative brief — what to generate (omit when using --stdin)")
     p_create.add_argument("--count", "-n", type=int, default=3, help="number of variations (default: 3)")
     p_create.add_argument("--ref", "-r", action="append", metavar="IMAGE", help="reference image path (can repeat)")
     p_create.add_argument("--style", "-s", metavar="IMAGE", help="style reference image path")
     p_create.add_argument("--aspect-ratio", "-a", default="3:4",
                           choices=["1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9"],
                           help="output aspect ratio (default: 3:4)")
+    p_create.add_argument("--json", action="store_true",
+                          help="emit NDJSON events to stdout; human prose goes to stderr")
+    p_create.add_argument("--stdin", action="store_true",
+                          help="read a JSON job spec from stdin instead of using the positional brief")
     p_create.set_defaults(func=cmd_create)
 
     p_animate = sub.add_parser("animate", help="Ken Burns animate stills → assembled draft video")
@@ -645,7 +2343,89 @@ def build_parser() -> argparse.ArgumentParser:
                                     "zoom_drift_down","zoom_drift_up","pan_right","pan_left","pan_down","pan_up"],
                            help="Ken Burns motion preset (default: zoom_drift_right)")
     p_animate.add_argument("--resolution", "-r", default="1080x1920", help="output resolution (default: 1080x1920)")
+    p_animate.add_argument("--json", action="store_true",
+                           help="emit NDJSON events to stdout; human prose goes to stderr")
     p_animate.set_defaults(func=cmd_animate)
+
+    p_compose = sub.add_parser(
+        "compose",
+        help="render the project EXACTLY as specified in .parallax/manifest.yaml — no globbing",
+    )
+    p_compose.add_argument("--json", action="store_true",
+                           help="emit NDJSON events to stdout; human prose goes to stderr")
+    p_compose.set_defaults(func=cmd_compose)
+
+    p_voiceover = sub.add_parser(
+        "voiceover",
+        help="generate ElevenLabs voiceover and auto-transcribe with WhisperX",
+    )
+    p_voiceover.add_argument("--voice", default=None,
+                             help="voice name shortcut (george/rachel/...) or raw voice_id")
+    p_voiceover.add_argument("--model-id", dest="model_id", default=None,
+                             help="ElevenLabs model id (default: eleven_v3)")
+    p_voiceover.add_argument("--no-transcribe", dest="no_transcribe", action="store_true",
+                             help="skip the auto WhisperX pass (you must run `parallax transcribe` later)")
+    p_voiceover.add_argument("--json", action="store_true",
+                             help="emit NDJSON events to stdout")
+    p_voiceover.add_argument("--stdin", action="store_true",
+                             help="read JSON job spec from stdin")
+    p_voiceover.set_defaults(func=cmd_voiceover)
+
+    p_transcribe = sub.add_parser(
+        "transcribe",
+        help="transcribe an audio file with WhisperX (the singular timing source). NO fallbacks.",
+    )
+    p_transcribe.add_argument("--audio", default=None,
+                              help="audio file path (default: ./audio/voiceover.mp3)")
+    p_transcribe.add_argument("--model", default="base.en",
+                              help="whisperx model (default: base.en)")
+    p_transcribe.add_argument("--language", default="en",
+                              help="language code (default: en)")
+    p_transcribe.add_argument("--json", action="store_true",
+                              help="emit NDJSON events to stdout")
+    p_transcribe.set_defaults(func=cmd_transcribe)
+
+    p_trim = sub.add_parser(
+        "trim-silence",
+        help="remove silent gaps from audio/voiceover.mp3 and rewrite vo_manifest timestamps",
+    )
+    p_trim.add_argument("--json", action="store_true",
+                        help="emit NDJSON events to stdout")
+    p_trim.set_defaults(func=cmd_trim_silence)
+
+    p_align = sub.add_parser(
+        "align",
+        help="align scene durations to voiceover word timestamps from vo_manifest.json",
+    )
+    p_align.add_argument("--json", action="store_true",
+                         help="emit NDJSON events to stdout")
+    p_align.set_defaults(func=cmd_align)
+
+    p_manifest = sub.add_parser("manifest", help="edit .parallax/manifest.yaml programmatically")
+    p_manifest.add_argument(
+        "op",
+        choices=[
+            "set-scenes", "add-scene", "add-video-scene", "remove-scene", "reorder",
+            "set", "set-vo", "set-voice",
+            "set-headline", "clear-headline",
+            "enable-captions", "disable-captions",
+            "show",
+        ],
+        help="manifest edit operation",
+    )
+    p_manifest.add_argument("values", nargs="*", help="op-specific values")
+    p_manifest.add_argument("--duration", type=float, default=3.0, help="duration for add-scene")
+    p_manifest.add_argument("--start-s", dest="start_s", type=float, default=None,
+                            help="start time in source video (add-video-scene)")
+    p_manifest.add_argument("--end-s", dest="end_s", type=float, default=None,
+                            help="end time in source video (add-video-scene)")
+    p_manifest.add_argument(
+        "--motion",
+        choices=["zoom_in","zoom_out","zoom_drift_right","zoom_drift_left",
+                 "zoom_drift_down","zoom_drift_up","pan_right","pan_left","pan_down","pan_up"],
+        help="motion preset for add-scene",
+    )
+    p_manifest.set_defaults(func=cmd_manifest_edit)
 
     p_status = sub.add_parser("status", help="print manifest stats for the current project")
     p_status.set_defaults(func=cmd_status)
@@ -661,6 +2441,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_setup = sub.add_parser("setup", help="check dependencies and guide first-time setup")
     p_setup.set_defaults(func=cmd_setup)
+
+    p_chat = sub.add_parser(
+        "chat",
+        help="open the parallax-web localhost chat UI in the browser",
+    )
+    p_chat.set_defaults(func=cmd_chat)
 
     return parser
 
