@@ -1,0 +1,4 @@
+anthropic>=0.40.0
+pillow>=10.0.0
+pyyaml>=6.0
+whisperx  # optional, for voice memo transcription

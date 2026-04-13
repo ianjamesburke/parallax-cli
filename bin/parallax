@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+parallax — thin CLI wrapper for the Parallax video agent pipeline.
+
+Commands:
+    parallax run "brief text"     Kick off a footage_edit run in cwd.
+    parallax status               Print manifest stats from the current project.
+    parallax project new <name>   Scaffold ~/Documents/parallax-projects/<name>/.
+    parallax projects             List known parallax projects.
+
+Run-time layout (for `parallax run` and `parallax status`):
+    cwd/.parallax/              logs + project output (via PARALLAX_LOG_DIR + PARALLAX_OUTPUT_ROOT)
+    cwd/.parallax/<concept>/manifest.yaml
+"""
+
+import argparse
+import os
+import sys
+import uuid
+from pathlib import Path
+
+PROJECTS_ROOT = Path.home() / "Documents" / "parallax-projects"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Bundled video-production scripts — parallax is self-contained.
+BUNDLED_SCRIPTS = REPO_ROOT / "packs" / "video" / "scripts"
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".mkv")
+
+
+def _ensure_project_layout(cwd: Path) -> None:
+    """Auto-scaffold the canonical Parallax project layout in cwd."""
+    sys.path.insert(0, str(REPO_ROOT))
+    from core.project_layout import ensure_project_layout
+    ensure_project_layout(cwd)
+
+
+def _find_clips(cwd: Path) -> list:
+    """Glob video files in cwd/input (preferred), cwd, cwd/assets (legacy)."""
+    out = []
+    seen = set()
+    for d in (cwd / "input", cwd, cwd / "assets"):
+        if d.is_dir():
+            for ext in VIDEO_EXTS:
+                for p in sorted(d.glob(f"*{ext}")):
+                    rp = p.resolve()
+                    if rp not in seen:
+                        seen.add(rp)
+                        out.append(p)
+    return [str(p) for p in out]
+
+
+def _synthesize_test_clip(cwd: Path) -> str:
+    """In TEST_MODE with no clips, create a 2s black clip so the pipeline has input."""
+    import subprocess
+    clip = cwd / ".parallax" / "_synthetic_clip.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "color=black:s=320x240:d=2",
+         "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+         "-t", "2", "-shortest", "-y", str(clip)],
+        capture_output=True, check=True, timeout=30,
+    )
+    return str(clip)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cwd = Path.cwd()
+    # Repo root on sys.path FIRST so `from core...` works from any cwd.
+    sys.path.insert(0, str(REPO_ROOT))
+    # Auto-scaffold canonical project layout (input/ output/ drafts/ stills/ .parallax/)
+    # and migrate loose media into input/ on first run. Idempotent.
+    _ensure_project_layout(cwd)
+
+    parallax_dir = cwd / ".parallax"
+    parallax_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pin logs and HoP's internal project output under cwd/.parallax/.
+    # The canonical *final* is republished to cwd/output/ at the end of the
+    # pipeline via core/project_layout.py (see HoP footage_edit branch).
+    os.environ["PARALLAX_LOG_DIR"] = str(parallax_dir)
+    os.environ["PARALLAX_OUTPUT_ROOT"] = str(parallax_dir)
+
+    test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
+
+    clips = _find_clips(cwd)
+    if not clips:
+        if test_mode:
+            print("[parallax] TEST_MODE: no clips found — synthesizing a placeholder")
+            clips = [_synthesize_test_clip(cwd)]
+        else:
+            print("[parallax] ERROR: no video files found in cwd, ./assets, or ./input", file=sys.stderr)
+            print("           supported: " + ", ".join(VIDEO_EXTS), file=sys.stderr)
+            return 2
+
+    # Non-interactive: auto-confirm any prompts that slip past TEST_MODE.
+    import builtins
+    builtins.input = lambda _prompt="": ""
+
+    from core.head_of_production import HeadOfProduction
+
+    job = {
+        "type": "footage_edit",
+        "content": args.brief,  # HoP reads `content`, not `brief`
+        "clips": clips,
+        "run_id": uuid.uuid4().hex[:8],
+        "test_mode": test_mode,
+        "skip_clarifications": bool(getattr(args, "yes", False)),
+        # Project root for final-output routing: finals → cwd/output/,
+        # drafts → cwd/drafts/. HoP reads this from the job dict.
+        "project_root": str(cwd),
+    }
+    print(f"[parallax] brief: {args.brief!r}")
+    print(f"[parallax] clips: {len(clips)} file(s)")
+    print(f"[parallax] project dir: {parallax_dir}")
+    if job["skip_clarifications"]:
+        print("[parallax] --yes set — skipping clarification gate")
+
+    try:
+        hop = HeadOfProduction(skip_health_check=True)
+        result = hop.receive_job(job)
+    except Exception as e:
+        print(f"[parallax] ERROR: pipeline failed: {e}", file=sys.stderr)
+        return 1
+
+    status = result.get("status", "unknown")
+    print(f"[parallax] status: {status}")
+    concept = result.get("concept_id")
+    if concept:
+        print(f"[parallax] concept_id: {concept}")
+        manifest = parallax_dir / concept / "manifest.yaml"
+        if manifest.exists():
+            print(f"[parallax] manifest: {manifest}")
+
+    # Show the canonical final path relative to cwd if we have one.
+    final_path = result.get("final_path")
+    if final_path:
+        try:
+            rel = Path(final_path).resolve().relative_to(cwd.resolve())
+            print(f"[parallax] final: ./{rel}")
+        except ValueError:
+            print(f"[parallax] final: {final_path}")
+    copied = result.get("copied_to")
+    if copied:
+        print(f"[parallax] copied: {copied}")
+
+    # Final spend print — uses the run-scoped cost tracker.
+    try:
+        from core.cost_tracker import get_run_cost
+        from core.budget import BudgetGate
+        run_id = result.get("run_id")
+        spent = get_run_cost(run_id) if run_id else 0.0
+        # Read the default total budget from BudgetGate (same default HoP uses).
+        total_budget = 20.0
+        try:
+            if concept:
+                bg = BudgetGate(concept)
+                total_budget = bg.budget.total_budget
+        except Exception:
+            pass
+        print(f"[HoP] Spent: ${spent:.3f} of ${total_budget:.2f} budget")
+    except Exception as e:
+        print(f"[parallax] WARNING: could not read spend: {e}", file=sys.stderr)
+
+    return 0 if status == "complete" else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    cwd = Path.cwd()
+    parallax_dir = cwd / ".parallax"
+    if not parallax_dir.exists():
+        print("[parallax] no .parallax/ directory in cwd", file=sys.stderr)
+        return 1
+
+    # Look for manifest.yaml in any concept subdir under .parallax/
+    manifests = sorted(parallax_dir.glob("*/manifest.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not manifests:
+        print("[parallax] no manifest.yaml found under .parallax/", file=sys.stderr)
+        return 1
+
+    manifest_path = manifests[0]
+    try:
+        import yaml
+        with open(manifest_path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[parallax] ERROR: could not read {manifest_path}: {e}", file=sys.stderr)
+        return 1
+
+    footage = data.get("footage", {}) or {}
+    source_clips = footage.get("source_clips", []) or []
+    scenes = data.get("scenes", []) or footage.get("scenes", []) or []
+    total_dur = 0.0
+    for clip in source_clips:
+        try:
+            total_dur += max(0.0, float(clip.get("end_s", 0)) - float(clip.get("start_s", 0)))
+        except Exception:
+            pass
+
+    stills_dir = manifest_path.parent / "stills"
+    stills_count = len(list(stills_dir.glob("*.png"))) if stills_dir.exists() else 0
+
+    print(f"manifest:    {manifest_path}")
+    print(f"concept_id:  {manifest_path.parent.name}")
+    print(f"scenes:      {len(scenes)}")
+    print(f"clips:       {len(source_clips)}")
+    print(f"duration:    {total_dur:.1f}s")
+    print(f"stills:      {stills_count}")
+    print(f"last run:    {data.get('run_id') or data.get('brief', {}).get('run_id') or 'unknown'}")
+    return 0
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    """
+    Generate still images from a brief — no footage required.
+
+    Creates:
+        cwd/stills/               generated images (PNG) — read by the Plexi viewer
+        cwd/.parallax/            project metadata
+        cwd/.parallax/manifest.yaml
+    """
+    import random, string, time
+    cwd = Path.cwd()
+    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(0, str(BUNDLED_SCRIPTS))
+    # Auto-scaffold the canonical layout in cwd (idempotent).
+    _ensure_project_layout(cwd)
+
+    try:
+        from api_config import get_gemini_key
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError as e:
+        print(f"[parallax] ERROR: missing dependency: {e}", file=sys.stderr)
+        print("           install: pip install google-genai", file=sys.stderr)
+        return 1
+
+    key = get_gemini_key()
+    if not key:
+        print(f"[parallax] ERROR: no Gemini API key found.", file=sys.stderr)
+        print(f"           set AI_VIDEO_GEMINI_KEY or GEMINI_API_KEY in your environment.", file=sys.stderr)
+        print(f"           export AI_VIDEO_GEMINI_KEY=\"your-key-here\"", file=sys.stderr)
+        return 1
+
+    # stills/ at the project root — this is where the Plexi viewer reads from
+    stills_dir = cwd / "stills"
+    stills_dir.mkdir(parents=True, exist_ok=True)
+    (cwd / ".parallax").mkdir(parents=True, exist_ok=True)
+
+    count = args.count
+    brief = args.brief
+    ref_images = args.ref or []
+    style_ref = args.style
+
+    prompt_parts = [brief]
+    if style_ref:
+        prompt_parts.append(f"Style reference: {Path(style_ref).name}")
+    prompt = ". ".join(prompt_parts)
+
+    print(f"[parallax] brief:  {brief!r}")
+    print(f"[parallax] count:  {count}")
+    print(f"[parallax] model:  imagen-4.0-generate-001")
+    if ref_images:
+        print(f"[parallax] refs:   {', '.join(ref_images)}")
+    print(f"[parallax] output: {stills_dir}")
+    print()
+
+    client = genai.Client(api_key=key)
+    generated_names = []  # filenames only — manifest uses relative paths
+
+    input_images = []
+    for ref_path in ref_images:
+        p = Path(ref_path)
+        if not p.exists():
+            print(f"[parallax] WARNING: ref image not found: {ref_path}", file=sys.stderr)
+            continue
+        suffix = p.suffix.lower().lstrip(".")
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/png")
+        input_images.append(genai_types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+
+    concept_id = "".join(random.choices(string.ascii_uppercase, k=3)) + "-" + str(random.randint(1, 999)).zfill(3)
+    timestamp = int(time.time())
+
+    for i in range(1, count + 1):
+        print(f"[parallax] generating {i}/{count}...", end=" ", flush=True)
+        try:
+            if input_images:
+                contents = input_images + [genai_types.Part.from_text(text=prompt)]
+                response = client.models.generate_content(
+                    model="gemini-3.1-flash-image-preview",
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+                )
+                image_bytes = None
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                        image_bytes = part.inline_data.data
+                        break
+                if not image_bytes:
+                    raise RuntimeError("no image in response")
+            else:
+                result = client.models.generate_images(
+                    model="imagen-4.0-generate-001",
+                    prompt=prompt,
+                    config=genai_types.GenerateImagesConfig(
+                        number_of_images=1,
+                        aspect_ratio=args.aspect_ratio,
+                    ),
+                )
+                image_bytes = result.generated_images[0].image.image_bytes
+
+            filename = f"still_{timestamp}_{i:02d}.png"
+            (stills_dir / filename).write_bytes(image_bytes)
+            generated_names.append(filename)
+            print(f"done → stills/{filename}")
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+
+    if not generated_names:
+        print("[parallax] ERROR: no images generated", file=sys.stderr)
+        return 1
+
+    # Manifest uses paths relative to cwd — portable across machines
+    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    project_name = cwd.name
+    with open(manifest_path, "w") as f:
+        f.write(f'project: "{project_name}"\n')
+        f.write(f'concept_id: "{concept_id}"\n')
+        f.write(f'brief: "{brief}"\n')
+        f.write("scenes:\n")
+        for idx, name in enumerate(generated_names, 1):
+            f.write(f"  - number: {idx}\n")
+            f.write(f'    title: "Variation {idx}"\n')
+            f.write(f"    duration: 3.0\n")
+            f.write(f'    still: "stills/{name}"\n')  # relative path
+
+    print()
+    print(f"[parallax] generated {len(generated_names)} still(s) → stills/")
+    print(f"[parallax] manifest: .parallax/manifest.yaml")
+    print(f"[parallax] concept:  {concept_id}")
+    print(f"[parallax] next:     parallax animate  (Ken Burns + assemble to output/)")
+    return 0
+
+
+def cmd_animate(args) -> int:
+    """
+    Convert stills/ images into Ken Burns video clips and assemble to output/.
+
+    Reads:   cwd/stills/*.png  (or --stills path)
+    Writes:  cwd/output/draft_<timestamp>.mp4
+    Updates: cwd/.parallax/manifest.yaml  (adds output_video field)
+    """
+    import time
+    cwd = Path.cwd()
+    # sys.path + auto-scaffold before anything else
+    sys.path.insert(0, str(REPO_ROOT))
+    _ensure_project_layout(cwd)
+
+    stills_dir = cwd / "stills"
+    output_dir = cwd / "output"
+    drafts_dir = cwd / "drafts"
+
+    if not stills_dir.exists() or not list(stills_dir.glob("*.png")):
+        print("[parallax] ERROR: no stills found in stills/", file=sys.stderr)
+        print("           run `parallax create \"your brief\"` first", file=sys.stderr)
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+
+    # ken-burns.py ships bundled inside parallax
+    ken_burns_script = BUNDLED_SCRIPTS / "ken-burns.py"
+    if not ken_burns_script.exists():
+        print(f"[parallax] ERROR: ken-burns.py not found at {ken_burns_script}", file=sys.stderr)
+        print(f"           (the parallax install looks corrupted — reinstall)", file=sys.stderr)
+        return 1
+
+    stills = sorted(stills_dir.glob("*.png"))
+    duration = args.duration
+    motion = args.motion
+    resolution = args.resolution
+
+    print(f"[parallax] animating {len(stills)} still(s) → Ken Burns clips")
+    print(f"[parallax] motion:     {motion}  duration: {duration}s  resolution: {resolution}")
+    print()
+
+    import subprocess, tempfile
+    clip_paths = []
+    with tempfile.TemporaryDirectory(prefix="parallax-clips-") as tmpdir:
+        for i, still in enumerate(stills, 1):
+            clip_path = Path(tmpdir) / f"clip_{i:02d}.mp4"
+            print(f"[parallax] animating {i}/{len(stills)}: {still.name}...", end=" ", flush=True)
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(ken_burns_script),
+                     "--input", str(still),
+                     "--output", str(clip_path),
+                     "--duration", str(duration),
+                     "--motion", motion,
+                     "--resolution", resolution],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    print(f"FAILED\n{result.stderr.strip()}", file=sys.stderr)
+                    continue
+                clip_paths.append(str(clip_path))
+                print("done")
+            except Exception as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+
+        if not clip_paths:
+            print("[parallax] ERROR: no clips rendered", file=sys.stderr)
+            return 1
+
+        # Assemble clips with ffmpeg concat.
+        # Name the final with the canonical <concept>_v<version>.mp4 convention.
+        # Concept_id is read from the manifest if present; otherwise we mint a
+        # timestamp-derived one so every animate run produces a versioned file.
+        manifest_path = cwd / ".parallax" / "manifest.yaml"
+        concept_id = None
+        if manifest_path.exists():
+            try:
+                import yaml as _yaml
+                with open(manifest_path) as _f:
+                    _m = _yaml.safe_load(_f) or {}
+                concept_id = _m.get("concept_id")
+            except Exception:
+                concept_id = None
+        if not concept_id:
+            concept_id = f"ANM-{int(time.time()) % 1000:03d}"
+
+        from core.project_layout import next_version, update_latest_symlink
+        version = next_version(cwd, concept_id)
+        output_path = output_dir / f"{concept_id}_v{version}.mp4"
+        concat_list = Path(tmpdir) / "concat.txt"
+        concat_list.write_text("\n".join(f"file '{p}'" for p in clip_paths))
+
+        print(f"\n[parallax] assembling {len(clip_paths)} clips → {output_path.name}...", end=" ", flush=True)
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list),
+                 "-c", "copy", str(output_path)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                return 1
+            print("done")
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+
+    # Update manifest with output video path
+    if manifest_path.exists():
+        content = manifest_path.read_text()
+        if "output_video:" in content:
+            import re
+            content = re.sub(r'output_video: ".*"', f'output_video: "output/{output_path.name}"', content)
+        else:
+            content += f'\noutput_video: "output/{output_path.name}"\n'
+        manifest_path.write_text(content)
+
+    # Point output/latest.mp4 at the new final.
+    try:
+        update_latest_symlink(cwd, output_path)
+    except Exception as e:
+        print(f"[parallax] WARNING: could not update latest.mp4: {e}", file=sys.stderr)
+
+    print()
+    print(f"[parallax] final: ./output/{output_path.name}")
+    print(f"[parallax] the Plexi viewer will pick it up automatically")
+
+    # Final spend print (best-effort — animate doesn't use HoP cost tracking,
+    # so this will typically be $0.000 unless parallax create was run in the
+    # same session with cost logging enabled).
+    try:
+        from core.cost_tracker import get_concept_cost
+        spent = get_concept_cost(concept_id)
+        print(f"[HoP] Spent: ${spent:.3f} of $20.00 budget")
+    except Exception:
+        pass
+
+    return 0
+
+
+def cmd_setup(args) -> int:
+    """
+    Check dependencies and guide first-time setup.
+    Run this once after installing Parallax.
+    """
+    import shutil
+    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(0, str(BUNDLED_SCRIPTS))
+
+    ok = True
+
+    print("Parallax setup check\n" + "=" * 40)
+
+    # --- Python version ---
+    if sys.version_info < (3, 11):
+        print(f"  ✗ Python         {sys.version_info.major}.{sys.version_info.minor}  (3.11+ required)")
+        print(f"                  install: brew install python@3.11")
+        return 1
+    print(f"  ✓ Python         {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+
+    # --- ffmpeg ---
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        print(f"  ✓ ffmpeg        {ffmpeg}")
+    else:
+        print(f"  ✗ ffmpeg        NOT FOUND")
+        print(f"                  install: brew install ffmpeg")
+        ok = False
+
+    # --- Python / Pillow ---
+    try:
+        import PIL
+        print(f"  ✓ Pillow        {PIL.__version__}")
+    except ImportError:
+        print(f"  ✗ Pillow        NOT FOUND")
+        print(f"                  install: pip install Pillow")
+        ok = False
+
+    # --- google-genai ---
+    try:
+        import google.genai
+        print(f"  ✓ google-genai  OK")
+    except ImportError:
+        print(f"  ✗ google-genai  NOT FOUND")
+        print(f"                  install: pip install google-genai")
+        ok = False
+
+    # --- Gemini API key ---
+    try:
+        from api_config import get_gemini_key
+        key = get_gemini_key()
+    except Exception:
+        key = os.environ.get("AI_VIDEO_GEMINI_KEY") or os.environ.get("GEMINI_API_KEY")
+
+    if key:
+        print(f"  ✓ Gemini key    set ({key[:8]}...)")
+    else:
+        print(f"  ✗ Gemini key    NOT SET  ← required for image generation")
+        print(f"")
+        print(f"  To fix: add this to your ~/.zshrc (or ~/.zsh_secrets):")
+        print(f'    export AI_VIDEO_GEMINI_KEY="your-key-here"')
+        print(f"")
+        print(f"  Get a key at: https://aistudio.google.com/app/apikey")
+        ok = False
+
+    # --- Anthropic key (for parallax run / HoP) ---
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        print(f"  ✓ Anthropic key set ({anthropic_key[:8]}...)")
+    else:
+        print(f"  ◌ Anthropic key NOT SET  (optional — needed for parallax run)")
+        print(f'    export ANTHROPIC_API_KEY="your-key-here"')
+
+    # --- bundled scripts ---
+    kb = BUNDLED_SCRIPTS / "ken-burns.py"
+    if kb.exists():
+        script_count = len(list(BUNDLED_SCRIPTS.glob("*.py")))
+        print(f"  ✓ bundled scripts  {script_count} scripts at {BUNDLED_SCRIPTS}")
+    else:
+        print(f"  ✗ bundled scripts  NOT FOUND at {BUNDLED_SCRIPTS}")
+        print(f"                  (the parallax install looks corrupted — reinstall)")
+        ok = False
+
+    # --- parallax on PATH ---
+    parallax_bin = shutil.which("parallax")
+    if parallax_bin:
+        print(f"  ✓ parallax CLI  {parallax_bin}")
+    else:
+        this = Path(__file__).resolve()
+        print(f"  ✗ parallax CLI  not on PATH")
+        print(f"                  fix: ln -sf {this} /usr/local/bin/parallax")
+        ok = False
+
+    print()
+    if ok:
+        print("All required dependencies found. You're good to go.")
+        print()
+        print("Quick start:")
+        print('  mkdir my-project && cd my-project')
+        print('  parallax create "your creative brief" --count 3')
+        print('  parallax animate')
+    else:
+        print("Fix the items marked ✗ above, then re-run: parallax setup")
+
+    return 0 if ok else 1
+
+
+def cmd_project_new(args: argparse.Namespace) -> int:
+    proj = PROJECTS_ROOT / args.name
+    if proj.exists():
+        print(f"[parallax] ERROR: {proj} already exists", file=sys.stderr)
+        return 1
+    # Scaffold the canonical Parallax project layout.
+    for sub in (".parallax", "input", "output", "drafts", "stills"):
+        (proj / sub).mkdir(parents=True, exist_ok=True)
+    print(str(proj.resolve()))
+    return 0
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    if not PROJECTS_ROOT.exists():
+        print(f"[parallax] no projects directory yet at {PROJECTS_ROOT}")
+        print("           run `parallax project new <name>` to create one")
+        return 0
+    subs = sorted(p.name for p in PROJECTS_ROOT.iterdir() if p.is_dir())
+    if not subs:
+        print(f"[parallax] {PROJECTS_ROOT} is empty")
+        return 0
+    for name in subs:
+        print(name)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="parallax", description="Parallax video pipeline CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="kick off a footage_edit pipeline run in cwd")
+    p_run.add_argument("brief", help="brief text for the footage edit")
+    p_run.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="skip the clarification gate — assume the brief is fully specified and proceed with defaults",
+    )
+    p_run.set_defaults(func=cmd_run)
+
+    p_create = sub.add_parser("create", help="generate still images from a brief (no footage needed)")
+    p_create.add_argument("brief", help="creative brief — what to generate")
+    p_create.add_argument("--count", "-n", type=int, default=3, help="number of variations (default: 3)")
+    p_create.add_argument("--ref", "-r", action="append", metavar="IMAGE", help="reference image path (can repeat)")
+    p_create.add_argument("--style", "-s", metavar="IMAGE", help="style reference image path")
+    p_create.add_argument("--aspect-ratio", "-a", default="3:4",
+                          choices=["1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9"],
+                          help="output aspect ratio (default: 3:4)")
+    p_create.set_defaults(func=cmd_create)
+
+    p_animate = sub.add_parser("animate", help="Ken Burns animate stills → assembled draft video")
+    p_animate.add_argument("--duration", "-d", type=float, default=4.0, help="seconds per still (default: 4)")
+    p_animate.add_argument("--motion", "-m", default="zoom_drift_right",
+                           choices=["zoom_in","zoom_out","zoom_drift_right","zoom_drift_left",
+                                    "zoom_drift_down","zoom_drift_up","pan_right","pan_left","pan_down","pan_up"],
+                           help="Ken Burns motion preset (default: zoom_drift_right)")
+    p_animate.add_argument("--resolution", "-r", default="1080x1920", help="output resolution (default: 1080x1920)")
+    p_animate.set_defaults(func=cmd_animate)
+
+    p_status = sub.add_parser("status", help="print manifest stats for the current project")
+    p_status.set_defaults(func=cmd_status)
+
+    p_projects = sub.add_parser("projects", help="list known parallax projects")
+    p_projects.set_defaults(func=cmd_projects)
+
+    p_project = sub.add_parser("project", help="project management")
+    proj_sub = p_project.add_subparsers(dest="project_cmd", required=True)
+    p_new = proj_sub.add_parser("new", help="scaffold a new project directory")
+    p_new.add_argument("name")
+    p_new.set_defaults(func=cmd_project_new)
+
+    p_setup = sub.add_parser("setup", help="check dependencies and guide first-time setup")
+    p_setup.set_defaults(func=cmd_setup)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

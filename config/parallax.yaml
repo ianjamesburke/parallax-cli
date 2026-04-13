@@ -1,0 +1,11 @@
+# Parallax global configuration
+
+paths:
+  # Default output directory for all video projects
+  output: ~/Movies/Parallax
+  # Where to look for source footage (optional, clips can be passed as absolute paths)
+  # sources: ~/Movies/OBS
+
+# ffmpeg defaults
+ffmpeg:
+  timeout: 900  # seconds — large file re-encodes can exceed 300s

@@ -1,0 +1,27 @@
+paths:
+  obs_clips: ~/Movies/OBS          # Where OBS recordings land (default OBS location on macOS)
+  output: /Users/ianburke/Library/CloudStorage/GoogleDrive-ian@narrativeads.com/My Drive/ians AI tools/Video Prod  # Indexed project output — all init-project.py projects land here
+  music: ~/Music                   # Default music library root
+  inbox: /Users/ianburke/Library/CloudStorage/GoogleDrive-ian@narrativeads.com/My Drive/ians AI tools/inbox  # Drop zone — files here are auto-moved into new projects on init
+
+clip_markers:
+  default_phrase: "clip that"      # Voice trigger to search for in transcript
+  default_lookback: 60             # Seconds before marker to include in clip
+  default_trim_tail: 2             # Seconds to trim from end (excludes the utterance)
+
+transcription:
+  model: base.en                   # faster-whisper model: base.en, small.en, medium.en
+
+models:
+  # Provider selection — who handles each capability
+  # "agent" means the calling LLM handles it at runtime (zero-config default for analysis)
+  image_analysis: agent            # agent | gemini
+  image_generation: gemini         # gemini
+  video_generation: fal            # fal | gemini
+  scene_planning: gemini           # gemini
+
+  # Model name overrides — change these when newer versions release
+  # Scripts fall back to sensible defaults if omitted
+  gemini_image_model: gemini-2.5-flash-image   # for generate-still, generate-char-ref
+  gemini_text_model: gemini-2.5-flash                             # for plan-scenes
+  gemini_vision_model: gemini-2.5-flash-preview-05-20             # for hook-test (when image_analysis: gemini)

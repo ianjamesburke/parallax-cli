@@ -1,0 +1,58 @@
+# Agent network configuration
+# Escalation thresholds: 0.0 = never escalate, 1.0 = always escalate
+# Graduation: humans can mark runs as good to relax thresholds over time
+
+agents:
+  head_of_production:
+    model: claude-sonnet-4-6
+    description: "Orchestrator. Routes jobs, manages concept IDs, owns human check-in gate."
+    escalation_threshold: null  # Never escalates — IS the top level
+
+  script_writer:
+    model: claude-sonnet-4-6
+    description: "Generates scripts from briefs, ideas, voice transcripts, or B-roll descriptions."
+    escalation_threshold: 0.6
+
+  assistant_editor:
+    model: claude-haiku-4-5
+    description: "Translates raw client notes into structured revision briefs with success metrics."
+    escalation_threshold: 0.65
+
+  junior_editor:
+    model: claude-haiku-4-5
+    description: "Executes video edits. Returns confidence score. Escalates below threshold."
+    escalation_threshold: 0.70
+    graduation_record: []  # List of run IDs marked good by human — threshold relaxes 0.02 per good run
+
+  senior_editor:
+    model: claude-sonnet-4-6
+    description: "Handles escalated edits from junior editor."
+    escalation_threshold: 0.85
+
+  evaluator:
+    model: claude-sonnet-4-6
+    description: "Brand compliance check + regression detection vs prior versions."
+    escalation_threshold: null  # Always surfaces to human for final approval
+
+  asset_generator:
+    model: claude-haiku-4-5
+    description: "Media specialist. Owns all generation tools. Validates briefs, picks cheapest model, self-evaluates output."
+    escalation_threshold: 0.60
+    models_available:
+      image: [gemini_flash, gemini_pro]
+      voiceover: [elevenlabs_flash, elevenlabs_standard, macos_say]
+      video: [fal_video]
+    self_eval_threshold: 0.60  # Re-raise concern if self-eval score is below this
+
+  improvement_officer:
+    model: claude-opus-4-6
+    description: "Offline. Reviews logs, replays runs with agent swaps, proposes systemic improvements."
+    escalation_threshold: null  # Runs offline only
+
+# Cost alerts — escalate to human if a job exceeds these
+cost_alerts:
+  per_job_usd: 2.00
+  per_concept_usd: 10.00
+
+# Concept ID format: 3 uppercase letters + hyphen + 3 digits (e.g. NTV-001)
+concept_id_format: "^[A-Z]{3}-[0-9]{3}$"
