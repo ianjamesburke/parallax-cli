@@ -1,51 +1,81 @@
 # Parallax CLI
 
-AI video agent pipeline. Analyzes footage, makes edit decisions, and renders output using an LLM agent network.
+AI video agent pipeline. Analyzes footage, makes edit decisions, and renders output using an LLM agent network. Includes a web interface (`parallax chat`) for directing the pipeline through a browser.
+
+## Requirements
+
+- Python 3.11+
+- `ffmpeg` — `brew install ffmpeg`
+- [`just`](https://github.com/casey/just) — `brew install just`
 
 ## Install
 
 ```sh
 git clone https://github.com/ianjamesburke/parallax-cli
 cd parallax-cli
-just install-cli
+just install
 ```
 
-Requires [`just`](https://github.com/casey/just) (`brew install just`).
+`just install` does two things:
+1. Symlinks `bin/parallax` into `~/.local/bin/`
+2. Creates `web/.venv` and installs all web server dependencies
 
-This symlinks `bin/parallax` into `~/.local/bin/`. Make sure `~/.local/bin` is on your `PATH`:
+Make sure `~/.local/bin` is on your `PATH`:
 
 ```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-Parallax is self-contained. The video-production scripts it needs ship inside `packs/video/scripts/` — no external skill install required.
+## API Keys
 
-## Requirements
-
-- Python 3.11+
-- `ffmpeg` on PATH
-- `ANTHROPIC_API_KEY` or run inside a Claude Code session
-- `AI_VIDEO_GEMINI_KEY` — for image generation ([get one](https://aistudio.google.com/app/apikey))
+Add these to your shell rc (`~/.zshrc` or `~/.zsh_secrets`):
 
 ```sh
-export ANTHROPIC_API_KEY="sk-ant-..."
-export AI_VIDEO_GEMINI_KEY="..."
+export ANTHROPIC_API_KEY="sk-ant-..."      # required — chat agent
+export AI_VIDEO_GEMINI_KEY="AIza..."       # required — image generation
+export ELEVENLABS_API_KEY="sk_..."         # required — voiceover
 ```
 
-## Commands
+Get keys: [Anthropic](https://console.anthropic.com/) · [Google AI Studio](https://aistudio.google.com/app/apikey) · [ElevenLabs](https://elevenlabs.io/)
+
+## Launch the Web Interface
+
+```sh
+cd ~/my-project
+parallax chat
+```
+
+Opens a browser at `http://127.0.0.1:<port>/`. Talk to the Head of Production agent to generate images, build a manifest, and render videos.
+
+To share with others, set a password and expose via [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+
+```sh
+PARALLAX_WEB_PASSWORD=yourpassword parallax chat
+cloudflared tunnel run --url http://127.0.0.1:<port> parallax
+```
+
+## CLI Commands
 
 ```sh
 parallax run "cut a 15s teaser from these clips"   # run pipeline in cwd
+parallax chat                                       # launch web interface
 parallax status                                    # show manifest stats for cwd
 parallax project new my-shoot                      # scaffold a new project
 parallax projects                                  # list known projects
 ```
 
-`parallax run` discovers video files in `./`, `./assets/`, or `./input/` and writes manifest + outputs under `cwd/.parallax/<concept_id>/`.
+## Environment Variables
 
-## Plexi Viewer
-
-Install the [Parallax viewer app](https://github.com/ianjamesburke/parallax-app) from the Plexi App Store to watch your pipeline run live.
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | **required** | Anthropic API credentials |
+| `AI_VIDEO_GEMINI_KEY` | **required** | Gemini image generation |
+| `ELEVENLABS_API_KEY` | **required** | ElevenLabs voiceover |
+| `PARALLAX_WEB_PASSWORD` | — | Enables basic auth + per-user workspaces |
+| `PARALLAX_WEB_MODEL` | `claude-sonnet-4-6` | Model override |
+| `PARALLAX_WEB_PORT` | auto | Force a specific port |
+| `PARALLAX_WEB_NO_BROWSER` | `0` | Set to `1` to skip auto-open |
+| `PARALLAX_PROJECT_DIR` | cwd | Override the project root |
 
 ## Test Mode
 
@@ -54,3 +84,10 @@ TEST_MODE=true parallax run "test prompt"
 ```
 
 Uses placeholders, makes zero external API calls.
+
+## Tests
+
+```sh
+just test        # full suite
+just test-cli    # CLI smoke tests only
+```
