@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parallax — Head of Production</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="app">
+      <section class="chat">
+        <header class="chat-header">
+          <div class="brand">
+            <span class="brand-mark">◐</span>
+            <span class="brand-name">Parallax</span>
+            <span class="brand-sub">Head of Production</span>
+          </div>
+          <div class="chat-meta">
+            <span class="status-dot" id="status-dot" title="idle"></span>
+            <span class="model-name" id="model-name">claude-sonnet-4-6</span>
+            <span class="project-badge" id="project-badge" title="active project workspace">main</span>
+            <button type="button" class="btn ghost btn-sm" id="new-project-btn" title="open a new project in a new tab">+ New Project</button>
+            <button type="button" class="btn ghost btn-sm" id="history-btn">History</button>
+          </div>
+        </header>
+
+        <div class="history-drawer hidden" id="history-drawer">
+          <div class="history-drawer-inner" id="history-list"></div>
+        </div>
+
+        <div class="messages" id="messages"></div>
+        <div class="thinking-bar hidden" id="thinking-bar">
+          <span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>
+          <span class="thinking-label" id="thinking-label">Thinking</span>
+        </div>
+        <form class="composer" id="composer">
+          <textarea
+            id="composer-input"
+            placeholder="Brief the Head of Production... (Enter to send, Shift+Enter for newline)"
+            rows="3"
+            autofocus
+          ></textarea>
+          <div class="composer-row">
+            <button type="button" id="cancel-btn" class="btn ghost" disabled>
+              Cancel
+            </button>
+            <button type="submit" id="send-btn" class="btn primary">
+              Send
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section class="media">
+        <header class="media-header">
+          <div class="project-label" id="project-label">—</div>
+          <button type="button" class="btn ghost" id="open-finder-btn">
+            Open in Finder
+          </button>
+        </header>
+
+        <div class="player-wrap" id="player-wrap">
+          <div class="video-empty">No videos yet.</div>
+        </div>
+
+        <div class="gallery-head">
+          <span class="gallery-title">Videos</span>
+          <span class="gallery-count" id="video-count">0</span>
+        </div>
+        <div class="video-gallery" id="video-gallery"></div>
+
+        <div class="gallery-head">
+          <span class="gallery-title">Stills</span>
+          <span class="gallery-count" id="gallery-count">0</span>
+          <button type="button" class="btn ghost btn-sm" id="upload-btn" title="Upload an image">
+            + Upload
+          </button>
+          <input type="file" id="upload-input" accept="image/*" multiple style="display:none" />
+        </div>
+        <div class="gallery dropzone" id="gallery">
+          <div class="gallery-empty" id="gallery-empty">
+            Drag images here or click <strong>+ Upload</strong>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="lightbox hidden" id="lightbox">
+      <img id="lightbox-img" alt="" />
+    </div>
+
+    <script src="/static/marked.min.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

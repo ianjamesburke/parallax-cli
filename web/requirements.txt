@@ -1,0 +1,22 @@
+# parallax-web runtime dependencies.
+# Install with: pip install -r requirements.txt (inside your venv).
+
+# Anthropic SDK — HoP agent loop
+anthropic>=0.40.0
+
+# Storyboard contact sheets (tools/storyboard.py)
+Pillow>=10.0
+
+# YAML manifest parsing (used by parallax CLI subprocesses inheriting this env)
+PyYAML>=6.0
+
+# ElevenLabs voiceover (called by `parallax voiceover` subprocess)
+elevenlabs>=1.0
+
+# WhisperX phoneme-level forced alignment (called by `parallax transcribe` and
+# auto-run inside `parallax voiceover`). Torch is a large install — if it's
+# already present system-wide, pip will satisfy this from there.
+whisperx
+
+# Google Gemini image generation (called by `parallax create`)
+google-genai>=0.3
