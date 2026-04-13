@@ -224,16 +224,16 @@ stage_parallax_cli() {
     log "Stage 4: install Parallax CLI"
     pushd "$PARALLAX_CLI_DIR" >/dev/null
 
-    if ! make install-cli; then
+    if ! just install-cli; then
         popd >/dev/null
-        die "make install-cli failed in $PARALLAX_CLI_DIR"
+        die "just install-cli failed in $PARALLAX_CLI_DIR"
     fi
 
     popd >/dev/null
 
     local bin="$HOME/.local/bin/parallax"
     if [[ ! -e "$bin" ]]; then
-        die "expected $bin after make install-cli, but it's missing."
+        die "expected $bin after just install-cli, but it's missing."
     fi
 
     # Ensure ~/.local/bin is on PATH via ~/.zshenv (idempotent).

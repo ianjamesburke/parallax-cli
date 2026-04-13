@@ -7,8 +7,10 @@ AI video agent pipeline. Analyzes footage, makes edit decisions, and renders out
 ```sh
 git clone https://github.com/ianjamesburke/parallax-cli
 cd parallax-cli
-make install-cli
+just install-cli
 ```
+
+Requires [`just`](https://github.com/casey/just) (`brew install just`).
 
 This symlinks `bin/parallax` into `~/.local/bin/`. Make sure `~/.local/bin` is on your `PATH`:
 
