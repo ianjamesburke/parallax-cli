@@ -33,12 +33,21 @@ install-cli:
     @echo "linked $HOME/.local/bin/parallax -> $(pwd)/bin/parallax"
     @echo "ensure $HOME/.local/bin is on your PATH"
 
-# Set up the web server venv and install its dependencies
+# Set up the web server venv and install its dependencies (requires Python 3.11+)
 install-web:
-    python3 -m venv web/.venv
+    #!/usr/bin/env bash
+    set -e
+    PYTHON=$(command -v python3.11 || command -v python3.12 || command -v python3)
+    PY_VERSION=$("$PYTHON" -c "import sys; print(sys.version_info[:2])")
+    if [[ "$PY_VERSION" < "(3, 11)" ]]; then
+        echo "error: Python 3.11+ required, found $("$PYTHON" --version)"
+        echo "install with: brew install python@3.11"
+        exit 1
+    fi
+    "$PYTHON" -m venv web/.venv
     web/.venv/bin/pip install --quiet --upgrade pip
     web/.venv/bin/pip install -r web/requirements.txt
-    @echo "web venv ready at web/.venv"
+    @echo "web venv ready at web/.venv ($(web/.venv/bin/python3 --version))"
 
 # Run the CLI smoke tests
 test-cli:
