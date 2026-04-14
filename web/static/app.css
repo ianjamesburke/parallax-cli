@@ -683,17 +683,17 @@ body {
 }
 .thumb-delete {
   position: absolute;
-  top: 5px;
-  right: 5px;
+  top: 6px;
+  right: 6px;
   display: none;
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.72);
   border: none;
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--fg-mute);
-  font-size: 13px;
-  font-weight: 400;
+  font-size: 16px;
+  font-weight: 500;
   line-height: 1;
-  padding: 3px 5px;
+  padding: 5px 8px;
   cursor: pointer;
   z-index: 2;
 }
@@ -706,17 +706,17 @@ body {
 }
 .thumb-download {
   position: absolute;
-  bottom: 5px;
-  left: 5px;
+  bottom: 6px;
+  left: 6px;
   display: none;
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.72);
   border: none;
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--fg-mute);
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 600;
   line-height: 1;
-  padding: 3px 5px;
+  padding: 5px 8px;
   cursor: pointer;
   z-index: 2;
   text-decoration: none;
@@ -725,22 +725,22 @@ body {
   display: block;
 }
 .thumb-download:hover {
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.88);
   color: var(--fg);
 }
 .thumb-zoom {
   position: absolute;
-  bottom: 5px;
-  right: 5px;
+  bottom: 6px;
+  right: 6px;
   display: none;
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.72);
   border: none;
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--fg-mute);
-  font-size: 12px;
-  font-weight: 400;
+  font-size: 15px;
+  font-weight: 500;
   line-height: 1;
-  padding: 3px 5px;
+  padding: 5px 8px;
   cursor: pointer;
   z-index: 2;
 }
@@ -748,7 +748,7 @@ body {
   display: block;
 }
 .thumb-zoom:hover {
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.88);
   color: var(--fg);
 }
 .thumb.ref-selected {
@@ -806,10 +806,10 @@ body {
   background: none;
   border: none;
   color: var(--fg-mute);
-  font-size: 13px;
-  font-weight: 400;
+  font-size: 16px;
+  font-weight: 500;
   line-height: 1;
-  padding: 0 4px;
+  padding: 4px 7px;
   cursor: pointer;
   flex-shrink: 0;
   text-decoration: none;
