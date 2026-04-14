@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import socket
 import socketserver
@@ -207,6 +208,12 @@ PARALLAX_CANDIDATES = (
 
 
 def _find_parallax_bin() -> Optional[str]:
+    # Explicit override wins — lets tests / worktrees point at a specific
+    # binary without relying on PATH order (e.g. when ~/.local/bin/parallax
+    # symlinks to main while you're developing in a worktree).
+    override = os.environ.get("PARALLAX_BIN")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
     which = shutil.which("parallax")
     if which:
         return which
@@ -334,6 +341,10 @@ class Session:
         self.dispatch_proc: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
         self.created_at = time.time()
+        # Session-sticky test mode — tripped by the user typing "TEST MODE"
+        # (case-insensitive) in their message. Once on, stays on for the
+        # lifetime of the session and every subprocess runs with TEST_MODE=true.
+        self.test_mode = False
         telemetry.create_session(session_id, str(self.workspace), MODEL, user=self.user)
 
     # ---- SSE fan-out ------------------------------------------------------
@@ -876,6 +887,9 @@ def _stream_parallax_subprocess(
     session.broadcast("dispatch_event", {"phase": "starting", "text": label})
 
     try:
+        subproc_env = _clean_subprocess_env()
+        if getattr(session, "test_mode", False):
+            subproc_env["TEST_MODE"] = "true"
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
@@ -884,7 +898,7 @@ def _stream_parallax_subprocess(
             text=True,
             bufsize=1,
             cwd=str(session.workspace),
-            env=_clean_subprocess_env(),
+            env=subproc_env,
         )
     except Exception as e:
         msg = f"failed to spawn parallax: {e}"
@@ -1767,11 +1781,13 @@ class Handler(BaseHTTPRequestHandler):
                 sid if isinstance(sid, str) else None,
                 user=user, project=project,
             )
-            # Prepend selected reference images so the agent sees them naturally
-            ref_images = body.get("reference_images")
-            if isinstance(ref_images, list) and ref_images:
-                paths_str = ", ".join(str(p) for p in ref_images if p)
-                text = f"[Reference images selected: {paths_str}]\n\n{text}"
+            # Session-sticky TEST MODE trigger: if the user's message contains
+            # "TEST MODE" (case-insensitive, whole phrase), flip the session
+            # into test mode. Every subprocess dispatch then runs with
+            # TEST_MODE=true, so Gemini/ElevenLabs are never called.
+            if re.search(r"\bTEST\s+MODE\b", text, re.IGNORECASE):
+                session.test_mode = True
+                print(f"session {session.id}: TEST MODE enabled", file=sys.stderr, flush=True)
             start_agent_thread(session, text)
             return self._write_json(200, {"session_id": session.id, "project": session.project})
 

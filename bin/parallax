@@ -334,6 +334,66 @@ def cmd_create(args: argparse.Namespace) -> int:
     started_at = time.time()
     emitter.emit("run_started", brief=brief, mode="create", project_dir=str(cwd / ".parallax"))
 
+    # TEST_MODE: short-circuit Gemini and produce placeholder stills locally.
+    if os.environ.get("TEST_MODE", "").lower() == "true":
+        stills_dir = cwd / "stills"
+        stills_dir.mkdir(parents=True, exist_ok=True)
+        (cwd / ".parallax").mkdir(parents=True, exist_ok=True)
+        concept_id = "".join(random.choices(string.ascii_uppercase, k=3)) + "-" + str(random.randint(1, 999)).zfill(3)
+        timestamp = int(time.time())
+        generated_names = []
+        try:
+            from PIL import Image, ImageDraw
+            have_pil = True
+        except ImportError:
+            have_pil = False
+        for i in range(1, count + 1):
+            filename = f"still_{timestamp}_{i:02d}.png"
+            still_path = stills_dir / filename
+            if have_pil:
+                w, h = 1080, 1920
+                shade = 50 + (i * 30) % 150
+                img = Image.new("RGB", (w, h), color=(shade, shade, shade + 20))
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([0, 0, w, 120], fill=(180, 40, 40))
+                draw.text((30, 40), "TEST MODE — PLACEHOLDER", fill="white")
+                draw.text((30, 150), f"Scene {i}", fill=(200, 200, 200))
+                y = 220
+                for chunk in [brief[j:j+44] for j in range(0, min(len(brief), 600), 44)]:
+                    draw.text((30, y), chunk, fill=(220, 220, 220))
+                    y += 36
+                img.save(still_path)
+            else:
+                still_path.write_bytes(b"TEST_PLACEHOLDER")
+            generated_names.append(filename)
+            emitter.emit("still_generated", path=str(still_path), scene=i, prompt=brief)
+            print(f"[parallax] test-mode still {i}/{count} -> stills/{filename}")
+
+        manifest_path = cwd / ".parallax" / "manifest.yaml"
+        project_name = cwd.name
+        with open(manifest_path, "w") as f:
+            f.write(f'project: "{project_name}"\n')
+            f.write(f'concept_id: "{concept_id}"\n')
+            f.write(f'brief: "{brief}"\n')
+            f.write("scenes:\n")
+            for idx, name in enumerate(generated_names, 1):
+                f.write(f"  - number: {idx}\n")
+                f.write(f'    title: "Variation {idx}"\n')
+                f.write(f"    duration: 3.0\n")
+                f.write(f'    still: "stills/{name}"\n')
+
+        duration_s = time.time() - started_at
+        log.info("cmd_create TEST_MODE complete stills=%d duration_s=%.2f", len(generated_names), duration_s)
+        emitter.emit(
+            "run_complete",
+            output_path=str(stills_dir),
+            stills=len(generated_names),
+            duration_s=round(duration_s, 2),
+            test_mode=True,
+        )
+        print(f"[parallax] TEST_MODE: generated {len(generated_names)} placeholder still(s)")
+        return 0
+
     try:
         from api_config import get_gemini_key
         from google import genai
@@ -932,6 +992,100 @@ def cmd_voiceover(args) -> int:
     voice_input = str(voice_input).strip()
     voice_id = VOICE_SHORTCUTS.get(voice_input.lower(), voice_input)
     voice_name = voice_input.title() if voice_input.lower() in VOICE_SHORTCUTS else voice_input
+
+    # TEST_MODE: macOS `say` + ffmpeg for a real mp3, fake word timings so
+    # cmd_align's prefix matching still works (words come from the actual script).
+    if os.environ.get("TEST_MODE", "").lower() == "true":
+        import subprocess as _sp
+        audio_dir = cwd / "audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = audio_dir / "voiceover.mp3"
+        vo_manifest_path_tm = audio_dir / "vo_manifest.json"
+        aiff_path = audio_dir / "voiceover.aiff"
+
+        print(f"[parallax] TEST_MODE: generating voiceover via macOS say...")
+        try:
+            _sp.run(["say", "-o", str(aiff_path), script_text],
+                    check=True, capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            msg = f"macOS say failed: {e}"
+            emitter.emit("error", message=msg, where="cmd_voiceover.test_mode.say")
+            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+            return 1
+        try:
+            _sp.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                     "-i", str(aiff_path),
+                     "-codec:a", "libmp3lame", "-qscale:a", "2", str(audio_path)],
+                    check=True, capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            msg = f"ffmpeg aiff->mp3 failed: {e}"
+            emitter.emit("error", message=msg, where="cmd_voiceover.test_mode.ffmpeg")
+            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
+            return 1
+        try:
+            aiff_path.unlink()
+        except Exception:
+            pass
+
+        duration_s = 0.0
+        try:
+            probe = _sp.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_format", str(audio_path)],
+                capture_output=True, text=True, check=True,
+            )
+            duration_s = float(json.loads(probe.stdout)["format"]["duration"])
+        except Exception:
+            duration_s = max(1.0, len(script_text.split()) * 0.4)
+
+        script_words = script_text.split()
+        per_word = duration_s / max(len(script_words), 1)
+        words_list = []
+        for i, w in enumerate(script_words):
+            start = round(i * per_word, 3)
+            end = round((i + 1) * per_word, 3)
+            words_list.append({"word": w, "start": start, "end": end})
+
+        vo_manifest = {
+            "audio_file": "voiceover.mp3",
+            "total_duration_s": round(duration_s, 3),
+            "transcript": script_text,
+            "transcribed_by": "test_mode_stub",
+            "model": "macos_say",
+            "language": "en",
+            "voice_id": voice_id,
+            "voice_name": voice_name,
+            "words": words_list,
+        }
+        vo_manifest_path_tm.write_text(json.dumps(vo_manifest, indent=2))
+
+        manifest["voice"] = {
+            "voice_id": voice_id,
+            "voice_name": voice_name,
+            "model_id": "test_mode",
+        }
+        manifest["voiceover"] = {
+            "audio_file": "audio/voiceover.mp3",
+            "vo_manifest": "audio/vo_manifest.json",
+            "duration_s": round(duration_s, 3),
+            "script": script_text,
+            "transcribed": True,
+            "transcribed_by": "test_mode_stub",
+        }
+        try:
+            with open(manifest_path, "w") as f:
+                _yaml.dump(manifest, f, sort_keys=False, default_flow_style=False)
+        except Exception as e:
+            print(f"[parallax] WARNING: manifest update failed: {e}", file=sys.stderr)
+
+        print(f"[parallax] TEST_MODE voiceover: {duration_s:.2f}s, {len(words_list)} words")
+        duration_run = time.time() - started_at
+        emitter.emit("run_complete", output_path=str(audio_path),
+                     duration_s=round(duration_run, 2),
+                     audio_duration_s=round(duration_s, 2),
+                     word_count=len(words_list),
+                     test_mode=True)
+        return 0
 
     try:
         from elevenlabs.client import ElevenLabs
