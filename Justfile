@@ -5,6 +5,18 @@
 default:
     @just --list
 
+# Launch parallax chat, loading .env from this directory if present
+start:
+    #!/usr/bin/env bash
+    set -e
+    if [ -f .env ]; then
+        echo "loading .env"
+        set -a
+        source .env
+        set +a
+    fi
+    parallax chat
+
 # Install everything: CLI symlink + web venv
 install: install-cli install-web
 
