@@ -45,6 +45,7 @@ if str(_HERE) not in sys.path:
 
 import telemetry  # noqa: E402
 import costs  # noqa: E402
+import registry  # noqa: E402
 
 
 def _fal_whoami() -> dict:
@@ -1742,6 +1743,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/costs":
             return self._serve_static("costs.html")
 
+        if path == "/api/servers":
+            return self._write_json(200, {"servers": registry.list_servers()})
+
         if path.startswith("/api/session/") and path.endswith("/history"):
             sid = path[len("/api/session/"):-len("/history")]
             return self._handle_session_history(sid)
@@ -2319,6 +2323,20 @@ def main() -> int:
         print(f"parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
 
     server = ThreadedHTTPServer((bind_host, port), Handler)
+
+    # Announce ourselves in the cross-machine server registry so other
+    # parallax-web processes (and the CLI) can find us by cwd/port/pid.
+    try:
+        registry.install_shutdown_hooks()
+        registry.register(
+            cwd=str(PROJECT_DIR),
+            host=host,
+            port=port,
+            user=os.environ.get("USER", "unknown"),
+        )
+    except Exception as e:
+        print(f"parallax-web: registry register failed: {e}", file=sys.stderr)
+
     if os.environ.get("PARALLAX_WEB_NO_BROWSER") != "1":
         try:
             webbrowser.open(url)
@@ -2330,6 +2348,10 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nparallax-web: shutting down")
     finally:
+        try:
+            registry.deregister()
+        except Exception:
+            pass
         server.server_close()
     return 0
 
