@@ -91,6 +91,39 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 6px 12px 2px;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-group-label::before {
+  content: "▶";
+  font-size: 8px;
+  opacity: 0.5;
+  transition: transform 0.15s;
+}
+
+.sidebar-group-label.active {
+  color: var(--accent);
+}
+
+.sidebar-group-label.active::before {
+  transform: rotate(90deg);
+  opacity: 1;
+}
+
+.sidebar-group-label:hover {
+  color: var(--fg);
+}
+
+.sidebar-item-empty {
+  color: var(--fg-mute);
+  font-style: italic;
+  font-size: 11px;
+  cursor: default;
+  padding-left: 20px;
 }
 
 .sidebar-item {

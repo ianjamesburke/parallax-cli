@@ -516,82 +516,139 @@ function closeLightbox() {
 
 // ----- sidebar -------------------------------------------------------------
 
+// Projects come from the filesystem (Drive folders on disk).
+// Sessions are nested under the active project.
+const sidebarState = {
+  projects: [],       // [{name, path}] from /api/projects
+  sessions: [],       // from /api/sessions
+  activeProject: null, // currently selected project name
+};
+
 async function refreshSidebar() {
   try {
-    const r = await fetch("/api/sessions");
-    if (!r.ok) return;
-    const data = await r.json();
-    renderSidebar(data.sessions || []);
+    const [projRes, sessRes] = await Promise.all([
+      fetch("/api/projects"),
+      fetch("/api/sessions"),
+    ]);
+    if (projRes.ok) {
+      const data = await projRes.json();
+      sidebarState.projects = data.projects || [];
+    }
+    if (sessRes.ok) {
+      const data = await sessRes.json();
+      sidebarState.sessions = data.sessions || [];
+    }
+    renderSidebar();
   } catch (e) {
     console.error("sidebar fetch failed", e);
   }
 }
 
-function renderSidebar(sessions) {
+function renderSidebar() {
   const list = $("sidebar-list");
-  if (sessions.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No sessions yet.</div>';
+  const { projects, sessions, activeProject } = sidebarState;
+
+  if (projects.length === 0 && sessions.length === 0) {
+    list.innerHTML = '<div class="sidebar-empty">No projects yet. Hit + to create one.</div>';
     return;
   }
 
-  // Group by project
-  const groups = {};
+  // Build session lookup by project name
+  const sessionsByProject = {};
   for (const s of sessions) {
     const proj = s.project || "main";
-    if (!groups[proj]) groups[proj] = [];
-    groups[proj].push(s);
+    if (!sessionsByProject[proj]) sessionsByProject[proj] = [];
+    sessionsByProject[proj].push(s);
+  }
+
+  // Merge: projects from disk + any orphan session projects not on disk
+  const projectNames = new Set(projects.map((p) => p.name));
+  for (const proj of Object.keys(sessionsByProject)) {
+    if (!projectNames.has(proj)) {
+      projects.push({ name: proj, path: null });
+      projectNames.add(proj);
+    }
   }
 
   list.innerHTML = "";
-  for (const [proj, items] of Object.entries(groups)) {
-    const group = document.createElement("div");
-    group.className = "sidebar-group";
+  for (const proj of projects) {
+    const projSessions = sessionsByProject[proj.name] || [];
+    const isActive = proj.name === activeProject;
 
+    const group = document.createElement("div");
+    group.className = "sidebar-group" + (isActive ? " open" : "");
+
+    // Project label row — click to expand/collapse
     const label = document.createElement("div");
-    label.className = "sidebar-group-label";
-    label.textContent = proj;
+    label.className = "sidebar-group-label" + (isActive ? " active" : "");
+    label.textContent = proj.name;
+    label.addEventListener("click", () => {
+      if (sidebarState.activeProject === proj.name) {
+        sidebarState.activeProject = null;
+      } else {
+        sidebarState.activeProject = proj.name;
+        // Switch URL to this project so next message lands here
+        const url = new URL(window.location.href);
+        if (proj.name === "main") {
+          url.searchParams.delete("project");
+        } else {
+          url.searchParams.set("project", proj.name);
+        }
+        window.history.pushState({}, "", url);
+        refreshProjectBadge();
+      }
+      renderSidebar();
+    });
     group.appendChild(label);
 
-    for (const s of items) {
-      const item = document.createElement("div");
-      item.className = "sidebar-item" + (s.id === state.sessionId ? " active" : "");
-      item.dataset.sid = s.id;
+    // Session list — only visible when project is expanded
+    if (isActive) {
+      if (projSessions.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "sidebar-item sidebar-item-empty";
+        empty.textContent = "No sessions yet.";
+        group.appendChild(empty);
+      }
+      for (const s of projSessions) {
+        const item = document.createElement("div");
+        item.className = "sidebar-item" + (s.id === state.sessionId ? " active" : "");
+        item.dataset.sid = s.id;
 
-      const dot = document.createElement("span");
-      dot.className = "sidebar-item-dot" + (s.live ? " live" : "");
-      item.appendChild(dot);
+        const dot = document.createElement("span");
+        dot.className = "sidebar-item-dot" + (s.live ? " live" : "");
+        item.appendChild(dot);
 
-      const text = document.createElement("span");
-      text.className = "sidebar-item-text";
-      text.textContent = s.preview || "(empty)";
-      item.appendChild(text);
+        const text = document.createElement("span");
+        text.className = "sidebar-item-text";
+        text.textContent = s.preview || "(empty)";
+        item.appendChild(text);
 
-      const del = document.createElement("button");
-      del.className = "sidebar-item-del";
-      del.title = "Delete session";
-      del.textContent = "×";
-      del.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        try {
-          await fetch(`/api/session/${s.id}`, { method: "DELETE" });
-          if (state.sessionId === s.id) {
-            // Switched away — clear to a fresh state
-            state.sessionId = null;
-            state.thinking = false;
-            state.dispatchActive = false;
-            setStatus("");
-            updateButtons();
-            messagesEl().innerHTML = "";
+        const del = document.createElement("button");
+        del.className = "sidebar-item-del";
+        del.title = "Delete session";
+        del.textContent = "×";
+        del.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await fetch(`/api/session/${s.id}`, { method: "DELETE" });
+            if (state.sessionId === s.id) {
+              state.sessionId = null;
+              state.thinking = false;
+              state.dispatchActive = false;
+              setStatus("");
+              updateButtons();
+              messagesEl().innerHTML = "";
+            }
+            refreshSidebar();
+          } catch (err) {
+            console.error("delete session failed", err);
           }
-          refreshSidebar();
-        } catch (err) {
-          console.error("delete session failed", err);
-        }
-      });
-      item.appendChild(del);
+        });
+        item.appendChild(del);
 
-      item.addEventListener("click", () => loadSessionHistory(s.id));
-      group.appendChild(item);
+        item.addEventListener("click", () => loadSessionHistory(s.id));
+        group.appendChild(item);
+      }
     }
 
     list.appendChild(group);
@@ -635,6 +692,14 @@ async function loadSessionHistory(sessionId) {
     // Switch session and open stream so the user can continue
     state.sessionId = sessionId;
     openStream(sessionId);
+
+    // Reset any status that got set during history replay — history is done,
+    // nothing is actually running right now.
+    state.dispatchActive = false;
+    state.thinking = false;
+    setStatus("");
+    updateButtons();
+
     refreshSidebar();
   } catch (e) {
     appendError(`failed to load history: ${e}`);
@@ -780,7 +845,43 @@ function initComposer() {
   });
 }
 
-function startNewSession() {
+async function startNewSession() {
+  // Ask for a project name — this creates a real folder on disk (Drive-backed)
+  const raw = window.prompt("Project name:", "");
+  if (raw === null) return; // user cancelled
+
+  const name = raw.trim().replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "") || "main";
+
+  // Create the folder on disk via the server
+  try {
+    const r = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      appendError(`failed to create project: ${err.error || r.statusText}`);
+      return;
+    }
+  } catch (e) {
+    appendError(`failed to create project: ${e}`);
+    return;
+  }
+
+  // Update the URL so sessions land in this project
+  const url = new URL(window.location.href);
+  if (name === "main") {
+    url.searchParams.delete("project");
+  } else {
+    url.searchParams.set("project", name);
+  }
+  window.history.pushState({}, "", url);
+  refreshProjectBadge();
+
+  // Expand this project in the sidebar
+  sidebarState.activeProject = name;
+
   // Clear the chat panel and drop the session ID — next send creates a fresh one
   state.sessionId = null;
   state.thinking = false;
@@ -793,10 +894,9 @@ function startNewSession() {
   updateButtons();
   messagesEl().innerHTML = "";
   $("composer-input").focus();
-  // Update active highlight in sidebar
-  for (const el of document.querySelectorAll(".sidebar-item")) {
-    el.classList.remove("active");
-  }
+
+  // Refresh sidebar so the new folder appears
+  refreshSidebar();
 }
 
 function init() {

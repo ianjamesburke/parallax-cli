@@ -1641,6 +1641,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             return self._handle_list_sessions()
 
+        if path == "/api/projects":
+            return self._handle_list_projects()
+
         if path == "/api/usage":
             return self._handle_usage()
 
@@ -1685,6 +1688,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             start_agent_thread(session, text)
             return self._write_json(200, {"session_id": session.id, "project": session.project})
+
+        if path == "/api/projects":
+            return self._handle_create_project()
 
         if path == "/api/cancel":
             body = self._read_json_body()
@@ -1902,6 +1908,41 @@ class Handler(BaseHTTPRequestHandler):
             "today": today,
             "lifetime": lifetime,
         })
+
+    # ---- projects (filesystem-backed) -----------------------------------
+
+    def _handle_list_projects(self) -> None:
+        """GET /api/projects — list subdirectories of the user's root workspace as projects."""
+        user = self._get_request_user()
+        if PER_USER_WORKSPACES and user:
+            user_root = (PROJECT_DIR / _sanitize_name(user)).resolve()
+        else:
+            user_root = PROJECT_DIR
+
+        projects = []
+        try:
+            if user_root.exists():
+                for entry in sorted(user_root.iterdir()):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        projects.append({"name": entry.name, "path": str(entry)})
+        except Exception as e:
+            return self._write_error(500, f"failed to list projects: {e}")
+
+        return self._write_json(200, {"projects": projects, "user": user or ""})
+
+    def _handle_create_project(self) -> None:
+        """POST /api/projects — create a new project folder."""
+        body = self._read_json_body()
+        name = _sanitize_name(body.get("name") or "")
+        if not name:
+            return self._write_error(400, "name is required")
+        user = self._get_request_user()
+        workspace = _workspace_for(user, name)
+        try:
+            _ensure_workspace(workspace)
+        except Exception as e:
+            return self._write_error(500, f"failed to create project: {e}")
+        return self._write_json(200, {"name": name, "path": str(workspace)})
 
     # ---- session history -------------------------------------------------
 
