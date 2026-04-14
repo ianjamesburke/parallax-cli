@@ -84,10 +84,17 @@ STATIC_DIR = _HERE / "static"
 HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
 
 # When True, every user gets their own subdirectory under PROJECT_DIR.
-# Defaults to True when there's a real multi-user setup (PARALLAX_WEB_PASSWORD
-# is set), False otherwise so single-user local sessions keep their flat layout.
-PER_USER_WORKSPACES = bool(os.environ.get("PARALLAX_WEB_PASSWORD")) or bool(
-    os.environ.get("PARALLAX_PER_USER_WORKSPACES")
+# Enabled automatically when the server is network-accessible (PARALLAX_WEB_HOST
+# set) or password-protected. Opt out explicitly with PARALLAX_SINGLE_USER=1
+# for a known single-user local setup.
+_network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
+PER_USER_WORKSPACES = (
+    not bool(os.environ.get("PARALLAX_SINGLE_USER"))
+    and (
+        bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
+        or bool(os.environ.get("PARALLAX_PER_USER_WORKSPACES"))
+        or _network_accessible
+    )
 )
 
 
@@ -309,7 +316,17 @@ def get_or_create_session(session_id: Optional[str], user: Optional[str] = None,
                            project: Optional[str] = None) -> Session:
     with SESSIONS_LOCK:
         if session_id and session_id in SESSIONS:
-            return SESSIONS[session_id]
+            existing = SESSIONS[session_id]
+            # Reject if the session belongs to a different user — don't let one
+            # user resume another's session, even with a valid session_id.
+            if PER_USER_WORKSPACES and user and existing.user != user:
+                print(
+                    f"session {session_id}: user mismatch (owner={existing.user!r}, "
+                    f"requester={user!r}) — creating new session",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                return existing
         sid = session_id or uuid.uuid4().hex
         s = Session(sid, user=user, project=project)
         SESSIONS[sid] = s
@@ -1686,6 +1703,11 @@ class Handler(BaseHTTPRequestHandler):
                 sid if isinstance(sid, str) else None,
                 user=user, project=project,
             )
+            # Prepend selected reference images so the agent sees them naturally
+            ref_images = body.get("reference_images")
+            if isinstance(ref_images, list) and ref_images:
+                paths_str = ", ".join(str(p) for p in ref_images if p)
+                text = f"[Reference images selected: {paths_str}]\n\n{text}"
             start_agent_thread(session, text)
             return self._write_json(200, {"session_id": session.id, "project": session.project})
 
@@ -1948,8 +1970,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_list_sessions(self) -> None:
         """GET /api/sessions — recent sessions with preview text and live status."""
+        request_user = self._get_request_user() if PER_USER_WORKSPACES else None
         try:
-            sessions = telemetry.list_sessions(limit=50)
+            sessions = telemetry.list_sessions(limit=50, user=request_user)
         except Exception as e:
             return self._write_error(500, f"sessions query failed: {e}")
 

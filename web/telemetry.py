@@ -229,9 +229,10 @@ def _fold_session_totals(session_id: str) -> dict[str, Any]:
     return state
 
 
-def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
+def list_sessions(limit: int = 50, user: Optional[str] = None) -> list[dict[str, Any]]:
     """
     Return up to `limit` sessions, most recent last_activity_at first.
+    If `user` is provided, only sessions belonging to that user are returned.
     Scans the log once and buckets events by session_id.
     """
     buckets: dict[str, dict[str, Any]] = {}
@@ -273,8 +274,11 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
             if text:
                 s["first_user_message"] = text
 
+    all_sessions = list(buckets.values())
+    if user:
+        all_sessions = [s for s in all_sessions if s.get("user") == user]
     sessions = sorted(
-        buckets.values(),
+        all_sessions,
         key=lambda s: s.get("last_activity_at") or 0,
         reverse=True,
     )

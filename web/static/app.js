@@ -19,6 +19,7 @@ const state = {
   thinking: false,
   dispatchActive: false,
   activeVideo: null,
+  refImages: new Set(), // paths selected as reference images
 };
 
 const $ = (id) => document.getElementById(id);
@@ -254,11 +255,20 @@ async function sendMessage(text) {
   setStatus("thinking");
   updateButtons();
 
+  const refImages = state.refImages.size > 0 ? Array.from(state.refImages) : undefined;
+  // Clear reference selection immediately after send
+  if (state.refImages.size > 0) {
+    state.refImages.clear();
+    updateRefBar();
+    // Remove selected styling from all thumbs
+    document.querySelectorAll(".thumb.ref-selected").forEach((t) => t.classList.remove("ref-selected"));
+  }
+
   try {
     const r = await fetch("/api/message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: state.sessionId, text }),
+      body: JSON.stringify({ session_id: state.sessionId, text, reference_images: refImages }),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ error: r.statusText }));
@@ -354,6 +364,12 @@ function renderGallery(data) {
       let thumb = existing.get(s.path);
       if (thumb) {
         existing.delete(s.path);
+        // Sync ref-selected class in case state changed
+        if (state.refImages.has(s.path)) {
+          thumb.classList.add("ref-selected");
+        } else {
+          thumb.classList.remove("ref-selected");
+        }
       } else {
         thumb = document.createElement("div");
         thumb.className = "thumb";
@@ -389,7 +405,29 @@ function renderGallery(data) {
           }
         });
         thumb.appendChild(del);
-        thumb.addEventListener("click", () => openLightbox(img.src));
+
+        // Zoom button (opens lightbox)
+        const zoom = document.createElement("button");
+        zoom.className = "thumb-zoom";
+        zoom.title = "View full size";
+        zoom.textContent = "⤢";
+        zoom.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openLightbox(img.src);
+        });
+        thumb.appendChild(zoom);
+
+        // Click anywhere on thumb toggles reference selection
+        thumb.addEventListener("click", () => {
+          if (state.refImages.has(s.path)) {
+            state.refImages.delete(s.path);
+            thumb.classList.remove("ref-selected");
+          } else {
+            state.refImages.add(s.path);
+            thumb.classList.add("ref-selected");
+          }
+          updateRefBar();
+        });
       }
       frag.appendChild(thumb);
     }
@@ -467,6 +505,21 @@ function renderGallery(data) {
       });
       vList.appendChild(item);
     }
+  }
+}
+
+// ----- reference image bar -------------------------------------------------
+
+function updateRefBar() {
+  const bar = $("ref-bar");
+  const label = $("ref-bar-label");
+  if (!bar || !label) return;
+  const count = state.refImages.size;
+  if (count === 0) {
+    bar.classList.add("hidden");
+  } else {
+    label.textContent = `${count} reference image${count === 1 ? "" : "s"} selected`;
+    bar.classList.remove("hidden");
   }
 }
 
@@ -842,6 +895,11 @@ function initComposer() {
 
   $("cancel-btn").addEventListener("click", () => cancel());
   $("new-session-btn").addEventListener("click", () => startNewSession());
+  $("ref-bar-clear").addEventListener("click", () => {
+    state.refImages.clear();
+    updateRefBar();
+    document.querySelectorAll(".thumb.ref-selected").forEach((t) => t.classList.remove("ref-selected"));
+  });
 
   $("lightbox").addEventListener("click", closeLightbox);
   document.addEventListener("keydown", (e) => {
