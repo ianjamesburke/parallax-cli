@@ -14,9 +14,10 @@ PyYAML>=6.0
 elevenlabs>=1.0
 
 # WhisperX phoneme-level forced alignment (called by `parallax transcribe` and
-# auto-run inside `parallax voiceover`). Torch is a large install — if it's
-# already present system-wide, pip will satisfy this from there.
-whisperx
+# auto-run inside `parallax voiceover`). Torch is a large install — NOT included
+# by default. Install manually if you need voice transcription:
+#   pip install whisperx
+# whisperx
 
 # Google Gemini image generation (called by `parallax create`)
 google-genai>=0.3
