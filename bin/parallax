@@ -2090,6 +2090,144 @@ def cmd_manifest_edit(args) -> int:
     return 0
 
 
+def cmd_update(args) -> int:
+    """
+    Pull the latest Parallax from GitHub and re-run just install.
+    Works as long as the repo was cloned (not installed from a tarball).
+    """
+    import shutil
+    import subprocess as sp
+
+    print("Parallax update\n" + "=" * 40)
+
+    # Verify we're in a git repo
+    result = sp.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("error: repo not found — was Parallax installed via git clone?")
+        print(f"  expected repo at: {REPO_ROOT}")
+        return 1
+
+    # Pull
+    print("pulling from origin/main...")
+    try:
+        pull = sp.run(
+            ["git", "-C", str(REPO_ROOT), "pull", "--ff-only", "origin", "main"],
+            capture_output=True, text=True,
+        )
+        sys.stdout.write(pull.stdout)
+        if pull.returncode != 0:
+            print(f"git pull failed:\n{pull.stderr}", file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"git pull failed: {e}", file=sys.stderr)
+        return 1
+
+    # Re-install via just if available, otherwise fall back to install.sh
+    just_bin = shutil.which("just")
+    if just_bin:
+        print("running just install...")
+        try:
+            r = sp.run([just_bin, "install"], cwd=str(REPO_ROOT))
+            if r.returncode != 0:
+                return r.returncode
+        except Exception as e:
+            print(f"just install failed: {e}", file=sys.stderr)
+            return 1
+    else:
+        install_sh = REPO_ROOT / "scripts" / "install.sh"
+        print(f"just not found — running {install_sh}...")
+        try:
+            r = sp.run(["bash", str(install_sh)], cwd=str(REPO_ROOT))
+            if r.returncode != 0:
+                return r.returncode
+        except Exception as e:
+            print(f"install.sh failed: {e}", file=sys.stderr)
+            return 1
+
+    # Reset the update check cache so we don't immediately nag again
+    _clear_update_cache()
+    print("\nParallax is up to date.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Daily update check
+# ---------------------------------------------------------------------------
+
+_UPDATE_CACHE = Path.home() / ".parallax" / ".update_check"
+_UPDATE_INTERVAL = 86400  # 24 hours
+_REMOTE_URL = "https://github.com/ianjamesburke/parallax-cli"
+
+
+def _clear_update_cache() -> None:
+    try:
+        _UPDATE_CACHE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _check_for_update_once() -> None:
+    """
+    Run at most once per 24 hours. Compares local HEAD with origin/main HEAD
+    via git ls-remote. Prints a single-line notice if behind, then exits.
+    Completely silent on any failure — never blocks the main command.
+    """
+    import subprocess as sp
+
+    try:
+        import json as _j
+
+        # Read cache
+        now = time.time()
+        if _UPDATE_CACHE.exists():
+            try:
+                cached = _j.loads(_UPDATE_CACHE.read_text())
+                if now - cached.get("ts", 0) < _UPDATE_INTERVAL:
+                    if cached.get("behind"):
+                        print(
+                            f'[parallax] update available — run "parallax update" to get the latest',
+                            file=sys.stderr,
+                        )
+                    return
+            except Exception:
+                pass
+
+        # Fetch remote HEAD (fast — no clone, just a single ref lookup)
+        r = sp.run(
+            ["git", "-C", str(REPO_ROOT), "ls-remote", "origin", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return
+
+        remote_sha = r.stdout.split()[0] if r.stdout.strip() else ""
+        if not remote_sha:
+            return
+
+        local_r = sp.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        local_sha = local_r.stdout.strip() if local_r.returncode == 0 else ""
+
+        behind = bool(remote_sha and local_sha and remote_sha != local_sha)
+
+        # Write cache
+        _UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _UPDATE_CACHE.write_text(_j.dumps({"ts": now, "behind": behind, "remote_sha": remote_sha}))
+
+        if behind:
+            print(
+                f'[parallax] update available — run "parallax update" to get the latest',
+                file=sys.stderr,
+            )
+    except Exception:
+        pass  # never surface update-check errors
+
+
 def cmd_setup(args) -> int:
     """
     Check dependencies and guide first-time setup.
@@ -2442,6 +2580,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup = sub.add_parser("setup", help="check dependencies and guide first-time setup")
     p_setup.set_defaults(func=cmd_setup)
 
+    p_update = sub.add_parser("update", help="pull the latest Parallax from GitHub and re-install")
+    p_update.set_defaults(func=cmd_update)
+
     p_chat = sub.add_parser(
         "chat",
         help="open the parallax-web localhost chat UI in the browser",
@@ -2452,9 +2593,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    import threading
+    # Fire-and-forget daily update check — runs in background, zero latency impact
+    t = threading.Thread(target=_check_for_update_once, daemon=True)
+    t.start()
+
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    rc = args.func(args)
+
+    # Give the update check thread a moment to finish writing its cache/notice
+    # before the process exits. 6s max — well within any command's runtime.
+    t.join(timeout=6)
+    return rc
 
 
 if __name__ == "__main__":
