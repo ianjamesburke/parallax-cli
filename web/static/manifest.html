@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parallax — Manifest</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <style>
+      body { overflow-y: auto; }
+
+      .manifest-page {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 32px 28px 80px;
+      }
+
+      .manifest-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        padding-bottom: 18px;
+        border-bottom: 1px solid var(--line);
+        margin-bottom: 24px;
+      }
+      .manifest-header .brand-name {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .manifest-header .brand-sub {
+        color: var(--fg-dim);
+        margin-left: 10px;
+        font-size: 13px;
+      }
+      .manifest-header .back-link {
+        color: var(--fg-dim);
+        text-decoration: none;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+      .manifest-header .back-link:hover { color: var(--accent); }
+
+      .manifest-empty {
+        padding: 48px 24px;
+        text-align: center;
+        color: var(--fg-mute);
+        font-size: 14px;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .manifest-empty strong { color: var(--fg-dim); }
+
+      /* Top meta strip: project / concept / duration / voice */
+      .meta-strip {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        margin-bottom: 24px;
+        overflow: hidden;
+      }
+      .meta-cell {
+        padding: 10px 14px;
+        background: var(--bg-2);
+      }
+      .meta-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fg-mute);
+        margin-bottom: 2px;
+      }
+      .meta-value {
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--fg);
+      }
+      .meta-value.dim { color: var(--fg-dim); }
+
+      /* Brief block */
+      .brief-block {
+        margin-bottom: 28px;
+      }
+      .brief-block .section-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fg-mute);
+        margin-bottom: 8px;
+      }
+      .brief-block .brief-text {
+        padding: 14px 18px;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--fg);
+        font-size: 14px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+
+      /* Voiceover script */
+      .vo-block {
+        margin-bottom: 28px;
+      }
+      .vo-block .section-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fg-mute);
+        margin-bottom: 8px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .vo-block .vo-box {
+        padding: 14px 18px;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+      }
+      .vo-block .vo-script {
+        color: var(--fg);
+        font-size: 14px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+      .vo-block audio {
+        width: 100%;
+        margin-top: 12px;
+      }
+
+      /* Scene rows */
+      .scenes-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 10px;
+      }
+      .scenes-head .section-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fg-mute);
+      }
+      .scenes-head .scene-count {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--fg-dim);
+      }
+
+      .scene {
+        display: grid;
+        grid-template-columns: 140px 1fr;
+        gap: 18px;
+        padding: 16px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .scene:last-child { border-bottom: none; }
+
+      .scene-thumb {
+        width: 140px;
+        aspect-ratio: 3 / 4;
+        background: var(--bg-3);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--fg-mute);
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+      .scene-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .scene-body {
+        min-width: 0;
+      }
+      .scene-title-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 6px;
+      }
+      .scene-number {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--fg-mute);
+        letter-spacing: 0.04em;
+      }
+      .scene-title {
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--fg);
+      }
+      .scene-meta {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--fg-dim);
+        margin-bottom: 8px;
+      }
+      .scene-vo {
+        font-size: 13px;
+        line-height: 1.55;
+        color: var(--fg-dim);
+        padding: 10px 14px;
+        background: var(--bg-2);
+        border-left: 2px solid var(--accent);
+        border-radius: 0 4px 4px 0;
+      }
+      .scene-vo.empty {
+        color: var(--fg-mute);
+        border-left-color: var(--fg-mute);
+        font-style: italic;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="manifest-page">
+      <header class="manifest-header">
+        <div>
+          <span class="brand-name">Parallax</span>
+          <span class="brand-sub">Manifest</span>
+        </div>
+        <a class="back-link" id="back-link" href="/">← chat</a>
+      </header>
+
+      <div id="body">
+        <div class="manifest-empty">Loading…</div>
+      </div>
+    </div>
+
+    <script>
+      function esc(s) {
+        return String(s ?? "").replace(/[&<>"']/g, (c) => (
+          { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+        ));
+      }
+
+      function qs() {
+        return new URLSearchParams(window.location.search);
+      }
+
+      function currentQuery() {
+        // Forward ?user / ?project to the API so the manifest view is
+        // bookmark-able for a specific workspace.
+        const params = qs();
+        const out = new URLSearchParams();
+        for (const k of ["user", "project"]) {
+          const v = params.get(k);
+          if (v) out.set(k, v);
+        }
+        return out.toString();
+      }
+
+      function fmtDuration(d) {
+        if (d == null) return "—";
+        const n = Number(d);
+        if (Number.isNaN(n)) return String(d);
+        return `${n.toFixed(2)}s`;
+      }
+
+      function render(data) {
+        const body = document.getElementById("body");
+        const backLink = document.getElementById("back-link");
+        const q = currentQuery();
+        if (q) backLink.href = "/?" + q;
+
+        if (!data.exists) {
+          body.innerHTML = `
+            <div class="manifest-empty">
+              <div><strong>No manifest yet.</strong></div>
+              <div style="margin-top: 10px; font-size: 13px;">
+                Brief the Head of Production in <a href="/?${q}">chat</a> to create one.
+                The manifest lands at <code>${esc(data.workspace || "")}/manifest.yaml</code>.
+              </div>
+            </div>`;
+          return;
+        }
+
+        const totalDuration = (data.scenes || []).reduce(
+          (sum, s) => sum + (Number(s.duration) || 0), 0
+        );
+        const voice = data.voice || {};
+        const voiceLabel = voice.voice_name || voice.voice_id || "—";
+
+        const metaHtml = `
+          <div class="meta-strip">
+            <div class="meta-cell">
+              <div class="meta-label">Project</div>
+              <div class="meta-value">${esc(data.project || "main")}</div>
+            </div>
+            <div class="meta-cell">
+              <div class="meta-label">Concept</div>
+              <div class="meta-value">${esc(data.concept_id || "—")}</div>
+            </div>
+            <div class="meta-cell">
+              <div class="meta-label">Scenes</div>
+              <div class="meta-value">${(data.scenes || []).length} · ${fmtDuration(totalDuration)}</div>
+            </div>
+            <div class="meta-cell">
+              <div class="meta-label">Voice</div>
+              <div class="meta-value dim">${esc(voiceLabel)}</div>
+            </div>
+          </div>`;
+
+        const briefHtml = data.brief ? `
+          <div class="brief-block">
+            <div class="section-label">Brief</div>
+            <div class="brief-text">${esc(data.brief)}</div>
+          </div>` : "";
+
+        let voHtml = "";
+        const vo = data.voiceover;
+        if (vo && (vo.script || vo.audio_url)) {
+          const dur = vo.duration_s != null ? fmtDuration(vo.duration_s) : "—";
+          voHtml = `
+            <div class="vo-block">
+              <div class="section-label">
+                <span>Voiceover</span>
+                <span style="color: var(--fg-dim)">${esc(dur)}</span>
+              </div>
+              <div class="vo-box">
+                ${vo.script ? `<div class="vo-script">${esc(vo.script)}</div>` : ""}
+                ${vo.audio_url ? `<audio controls preload="none" src="${esc(vo.audio_url)}${q ? "?" + q : ""}"></audio>` : ""}
+              </div>
+            </div>`;
+        }
+
+        const scenes = data.scenes || [];
+        const scenesHtml = `
+          <div class="scenes-head">
+            <div class="section-label">Scenes</div>
+            <div class="scene-count">${scenes.length} scene${scenes.length === 1 ? "" : "s"}</div>
+          </div>` + scenes.map((s) => {
+            const stillUrl = s.still_url
+              ? (s.still_url + (q ? "?" + q : ""))
+              : null;
+            const thumb = stillUrl
+              ? `<img src="${esc(stillUrl)}" alt="scene ${esc(s.number)}" loading="lazy" />`
+              : "no still";
+            const motion = s.motion ? ` · ${esc(s.motion)}` : "";
+            const vo = (s.vo_text || "").trim();
+            const voClass = vo ? "scene-vo" : "scene-vo empty";
+            const voText = vo || "no voiceover text yet";
+            return `
+              <div class="scene">
+                <div class="scene-thumb">${thumb}</div>
+                <div class="scene-body">
+                  <div class="scene-title-row">
+                    <div>
+                      <div class="scene-number">SCENE ${esc(s.number ?? "?")}</div>
+                      <div class="scene-title">${esc(s.title || "Untitled")}</div>
+                    </div>
+                  </div>
+                  <div class="scene-meta">${fmtDuration(s.duration)}${motion}</div>
+                  <div class="${voClass}">${esc(voText)}</div>
+                </div>
+              </div>`;
+          }).join("");
+
+        body.innerHTML = metaHtml + briefHtml + voHtml + scenesHtml;
+      }
+
+      async function load() {
+        try {
+          const q = currentQuery();
+          const r = await fetch("/api/manifest" + (q ? "?" + q : ""));
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          render(await r.json());
+        } catch (e) {
+          document.getElementById("body").innerHTML =
+            `<div class="manifest-empty">Failed to load: ${esc(e.message || e)}</div>`;
+        }
+      }
+
+      load();
+    </script>
+  </body>
+</html>

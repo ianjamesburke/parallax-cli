@@ -935,6 +935,20 @@ body {
   cursor: help;
 }
 
+.header-link {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-mute);
+  text-decoration: none;
+  padding: 3px 6px;
+  border-radius: 4px;
+  transition: color 0.1s;
+}
+.header-link:hover {
+  color: var(--accent);
+  background: var(--bg-3);
+}
+
 /* ---------- drop overlay ---------- */
 
 .drop-overlay {

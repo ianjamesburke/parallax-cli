@@ -1805,6 +1805,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/costs":
             return self._serve_static("costs.html")
 
+        if path == "/api/manifest":
+            return self._handle_manifest_report()
+
+        if path == "/manifest":
+            return self._serve_static("manifest.html")
+
         if path == "/api/servers":
             return self._write_json(200, {"servers": registry.list_servers()})
 
@@ -2131,6 +2137,79 @@ class Handler(BaseHTTPRequestHandler):
             "user": user,
             "today": today,
             "lifetime": lifetime,
+        })
+
+    def _handle_manifest_report(self) -> None:
+        """
+        GET /api/manifest — parsed workspace manifest.yaml + a scene list
+        with resolved thumbnail URLs. Honors ?user= and ?project= via the
+        same rules as the rest of the app, so the manifest view can be
+        bookmarked for a specific workspace.
+        """
+        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
+        manifest_path = workspace / "manifest.yaml"
+        if not manifest_path.is_file():
+            return self._write_json(200, {
+                "exists": False,
+                "workspace": str(workspace),
+                "manifest": None,
+                "voiceover": None,
+                "scenes": [],
+            })
+        try:
+            import yaml as _yaml
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                raw = _yaml.safe_load(f) or {}
+        except Exception as e:
+            return self._write_error(500, f"manifest read failed: {e}")
+
+        scenes_out: list[dict] = []
+        for s in (raw.get("scenes") or []):
+            if not isinstance(s, dict):
+                continue
+            still_rel = s.get("still") or ""
+            still_url = None
+            if still_rel:
+                # /media/... resolves via _resolve_project_path with read
+                # fallback, so this works for master-dir and workspace stills.
+                still_url = f"/media/{still_rel}"
+            scenes_out.append({
+                "number": s.get("number"),
+                "title": s.get("title"),
+                "duration": s.get("duration"),
+                "still": still_rel,
+                "still_url": still_url,
+                "motion": s.get("motion"),
+                "vo_text": s.get("vo_text") or "",
+            })
+
+        # Voiceover block gets its own shape so the UI can link to the
+        # audio file + display word count / duration if present.
+        vo = raw.get("voiceover") or {}
+        vo_out = None
+        if isinstance(vo, dict) and vo:
+            audio_rel = vo.get("audio_file") or ""
+            vo_out = {
+                "audio_file": audio_rel,
+                "audio_url": f"/media/{audio_rel}" if audio_rel else None,
+                "vo_manifest": vo.get("vo_manifest"),
+                "duration_s": vo.get("duration_s"),
+                "script": vo.get("script"),
+                "transcribed_by": vo.get("transcribed_by"),
+            }
+
+        return self._write_json(200, {
+            "exists": True,
+            "workspace": str(workspace),
+            "project": workspace.name,
+            "brief": raw.get("brief"),
+            "concept_id": raw.get("concept_id"),
+            "voice": raw.get("voice") or {},
+            "voiceover": vo_out,
+            "headline": raw.get("headline"),
+            "captions": raw.get("captions") or {},
+            "scenes": scenes_out,
+            "raw": raw,
         })
 
     def _handle_costs_report(self) -> None:

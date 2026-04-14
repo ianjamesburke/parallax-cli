@@ -831,6 +831,22 @@ function refreshProjectBadge() {
       `run completely in parallel.`
     );
   }
+
+  // Forward ?user= / ?project= to the header links so opening /manifest
+  // or /costs from the chat lands in the same workspace the user is in.
+  const forwarded = new URLSearchParams();
+  for (const k of ["user", "project"]) {
+    const v = params.get(k);
+    if (v) forwarded.set(k, v);
+  }
+  const suffix = forwarded.toString() ? "?" + forwarded.toString() : "";
+  for (const id of ["manifest-link", "costs-link"]) {
+    const el = document.getElementById(id);
+    if (el) {
+      const base = el.getAttribute("href").split("?")[0];
+      el.href = base + suffix;
+    }
+  }
 }
 
 // ----- file uploads --------------------------------------------------------
