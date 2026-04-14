@@ -406,6 +406,16 @@ function renderGallery(data) {
         });
         thumb.appendChild(del);
 
+        // Download button
+        const dl = document.createElement("a");
+        dl.className = "thumb-download";
+        dl.title = "Download";
+        dl.textContent = "↓";
+        dl.href = `/media/${encodeURI(s.path)}`;
+        dl.download = s.name;
+        dl.addEventListener("click", (e) => e.stopPropagation());
+        thumb.appendChild(dl);
+
         // Zoom button (opens lightbox)
         const zoom = document.createElement("button");
         zoom.className = "thumb-zoom";
@@ -475,6 +485,15 @@ function renderGallery(data) {
       const item = document.createElement("div");
       item.className = "video-item" + (v.path === state.activeVideo ? " active" : "");
       item.innerHTML = `<span class="video-item-icon">▶</span><span class="video-item-name">${escapeHtml(v.name)}</span>`;
+      const vDl = document.createElement("a");
+      vDl.className = "video-item-download";
+      vDl.title = "Download";
+      vDl.textContent = "↓";
+      vDl.href = `/media/${encodeURI(v.path)}`;
+      vDl.download = v.name;
+      vDl.addEventListener("click", (e) => e.stopPropagation());
+      item.appendChild(vDl);
+
       const vDel = document.createElement("button");
       vDel.className = "video-item-delete";
       vDel.title = "Move to Trash";
