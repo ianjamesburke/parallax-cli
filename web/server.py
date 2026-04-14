@@ -255,26 +255,36 @@ class PathError(ValueError):
     pass
 
 
-def _resolve_project_path(user_path: str, workspace: Optional[Path] = None) -> Path:
+def _resolve_project_path(
+    user_path: str,
+    workspace: Optional[Path] = None,
+    read_fallback: bool = False,
+) -> Path:
     """
     Resolve `user_path` relative to a workspace and verify it stays inside
     the master PROJECT_DIR tree.
 
     Two concentric sandboxes:
       - primary:  the per-user workspace (where writes should land)
-      - fallback: PROJECT_DIR itself (the master launch dir, cross-project
-                  shared raw media)
+      - fallback: PROJECT_DIR itself (the master launch dir, for cross-
+                  project shared raw media)
 
-    Relative paths are joined against the workspace first; if that escapes,
-    we fall back to joining against PROJECT_DIR so a project can reference
-    raw files the user dropped at the master dir. Absolute paths and `..`
-    traversal are allowed as long as the final resolved path stays inside
-    PROJECT_DIR.
+    Relative paths are joined against the workspace first. If the resolved
+    path escapes the workspace (`..`), we fall back to joining against
+    PROJECT_DIR. When `read_fallback=True` the caller is doing a read, so
+    we also fall through to PROJECT_DIR when the workspace-side path is
+    valid but the file does not exist — that's how raw media at the master
+    dir becomes visible from any per-user project. For writes, leave
+    `read_fallback=False` so new files always land inside the workspace.
+
+    Absolute paths and `..` traversal are allowed only if the final
+    resolved path stays inside PROJECT_DIR.
     """
     if not isinstance(user_path, str) or not user_path:
         raise PathError("path must be a non-empty string")
     workspace = workspace or PROJECT_DIR
     p = Path(user_path)
+    escaped = False
     if not p.is_absolute():
         candidate = workspace / p
         try:
@@ -283,10 +293,12 @@ def _resolve_project_path(user_path: str, workspace: Optional[Path] = None) -> P
             raise PathError(f"could not resolve path: {e}") from e
         try:
             resolved.relative_to(workspace)
-            return resolved
+            if not read_fallback or resolved.exists():
+                return resolved
+            escaped = True  # fall through to PROJECT_DIR for a read
         except ValueError:
-            # Path escapes the workspace — fall back to the master dir so
-            # cross-project shared media is reachable.
+            escaped = True
+        if escaped:
             candidate = PROJECT_DIR / p
     else:
         candidate = p
@@ -2074,12 +2086,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---- projects (filesystem-backed) -----------------------------------
 
     def _handle_list_projects(self) -> None:
-        """GET /api/projects — list subdirectories of the user's root workspace as projects."""
+        """GET /api/projects — list every project folder owned by the user."""
         user = self._get_request_user()
         if PER_USER_WORKSPACES and user:
-            user_root = (PROJECT_DIR / _sanitize_name(user)).resolve()
+            user_root = (_users_root() / _sanitize_name(user)).resolve()
         else:
-            user_root = PROJECT_DIR
+            user_root = _workspace_root()
 
         projects = []
         try:
@@ -2238,7 +2250,10 @@ class Handler(BaseHTTPRequestHandler):
         # chars, but Path resolution needs the raw filename.
         rel = unquote(rel)
         try:
-            target = _resolve_project_path(rel, workspace=workspace)
+            # `read_fallback=True` lets any project read raw media dropped
+            # at the master launch dir — core to the beta cross-project
+            # layout. Writes still target the workspace.
+            target = _resolve_project_path(rel, workspace=workspace, read_fallback=True)
         except PathError as e:
             return self._write_error(400, str(e))
         if not target.is_file():

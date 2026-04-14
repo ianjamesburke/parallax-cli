@@ -5,8 +5,7 @@ Boots `parallax chat` in a scratch workspace, navigates the headless
 browser to /costs, waits for the report to render, takes a screenshot,
 and asserts the page title contains "Cost".
 
-Reuses the server boot helper from baseline_e2e.py — same spawn pattern,
-same URL-regex probe, same output draining.
+Reuses the shared server boot helper in _helpers.py.
 
 Run:
     python3 test/playwright/costs_page.py
@@ -22,12 +21,14 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from baseline_e2e import _start_server, SCRATCH_DIR  # noqa: E402
+from _helpers import start_server, stop_server  # noqa: E402
+
+SCRATCH_DIR = Path("/tmp/parallax-beta-e2e-costs")
 
 
 def main() -> int:
     print(f"[test] starting parallax chat in {SCRATCH_DIR}")
-    proc, url = _start_server()
+    proc, url = start_server(SCRATCH_DIR)
     print(f"[test] server URL: {url}")
 
     try:
@@ -71,15 +72,7 @@ def main() -> int:
         return 1
     finally:
         print("[test] stopping server")
-        try:
-            import signal
-            proc.send_signal(signal.SIGINT)
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        stop_server(proc)
 
 
 if __name__ == "__main__":
