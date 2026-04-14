@@ -60,6 +60,7 @@ function scrollToBottom() {
 }
 
 function appendUserMsg(text) {
+  hideWelcome();
   const el = document.createElement("div");
   el.className = "msg user";
   el.textContent = text;
@@ -542,39 +543,11 @@ function updateRefBar() {
   }
 }
 
-// ----- Google Drive link ---------------------------------------------------
+// ----- welcome hide --------------------------------------------------------
 
-const DRIVE_KEY = "parallax_drive_url";
-
-function initDriveBtn() {
-  const link = $("drive-btn");
-  const setBtn = $("drive-set-btn");
-
-  function applyDriveUrl(url) {
-    if (url) {
-      link.href = url;
-      link.style.display = "";
-      setBtn.style.display = "none";
-    } else {
-      link.style.display = "none";
-      setBtn.style.display = "";
-    }
-  }
-
-  applyDriveUrl(localStorage.getItem(DRIVE_KEY) || "");
-
-  setBtn.addEventListener("click", () => {
-    const current = localStorage.getItem(DRIVE_KEY) || "";
-    const raw = window.prompt("Paste your Google Drive folder URL:", current);
-    if (raw === null) return; // cancelled
-    const url = raw.trim();
-    if (url) {
-      localStorage.setItem(DRIVE_KEY, url);
-    } else {
-      localStorage.removeItem(DRIVE_KEY);
-    }
-    applyDriveUrl(url);
-  });
+function hideWelcome() {
+  const w = $("welcome");
+  if (w) w.remove();
 }
 
 // ----- lightbox ------------------------------------------------------------
@@ -654,10 +627,57 @@ function renderSidebar() {
     const group = document.createElement("div");
     group.className = "sidebar-group" + (isActive ? " open" : "");
 
-    // Project label row — click to expand/collapse
+    // Project label row — click to expand/collapse, × to delete
     const label = document.createElement("div");
     label.className = "sidebar-group-label" + (isActive ? " active" : "");
-    label.textContent = proj.name;
+
+    const labelText = document.createElement("span");
+    labelText.className = "sidebar-group-label-text";
+    labelText.textContent = proj.name;
+    label.appendChild(labelText);
+
+    // Delete button — refuses to delete the active project or `main` to
+    // avoid locking the user out of their default workspace.
+    if (proj.name !== "main") {
+      const del = document.createElement("button");
+      del.className = "sidebar-group-del";
+      del.title = "Delete project";
+      del.textContent = "×";
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const current = new URL(window.location.href).searchParams.get("project") || "main";
+        if (proj.name === current) {
+          appendError(
+            `can't delete the active project "${proj.name}". Switch to another project first.`
+          );
+          return;
+        }
+        if (!window.confirm(
+          `Delete project "${proj.name}"?\n\n` +
+          `This removes parallax/users/<you>/${proj.name}/ and every still, ` +
+          `voiceover, draft, output, and log inside it. ` +
+          `Raw media at the master dir is not touched.`
+        )) return;
+        try {
+          const r = await fetch(`/api/projects/${encodeURIComponent(proj.name)}`, {
+            method: "DELETE",
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            appendError(`failed to delete project: ${err.error || r.statusText}`);
+            return;
+          }
+          if (sidebarState.activeProject === proj.name) {
+            sidebarState.activeProject = null;
+          }
+          refreshSidebar();
+        } catch (err) {
+          appendError(`failed to delete project: ${err}`);
+        }
+      });
+      label.appendChild(del);
+    }
+
     label.addEventListener("click", () => {
       if (sidebarState.activeProject === proj.name) {
         sidebarState.activeProject = null;
@@ -826,10 +846,15 @@ async function uploadFile(file) {
       return;
     }
     const data = await r.json();
-    // Surface as a system-style message in the chat
+    // Auto-select the upload as a reference image. The user can still
+    // deselect it from the gallery — this just removes the dead click step.
+    if (data.path) {
+      state.refImages.add(data.path);
+      renderRefBar();
+    }
     appendDispatchEvent({
       phase: "done",
-      text: `uploaded ${data.path} (${(data.size / 1024).toFixed(1)} KB)`,
+      text: `uploaded ${data.path} (${(data.size / 1024).toFixed(1)} KB) — selected as reference`,
     });
     refreshGallery();
   } catch (e) {
@@ -983,7 +1008,6 @@ async function startNewSession() {
 function init() {
   initComposer();
   initDropZone();
-  initDriveBtn();
   refreshProjectBadge();
   refreshGallery();
   refreshSidebar();

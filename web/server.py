@@ -393,6 +393,11 @@ class Session:
         # (case-insensitive) in their message. Once on, stays on for the
         # lifetime of the session and every subprocess runs with TEST_MODE=true.
         self.test_mode = False
+        # Session-sticky reference images — the frontend sends these with
+        # every /api/message POST. Populated per message so `parallax_create`
+        # tool calls can auto-inject them even if Claude forgets to set the
+        # `ref` arg. Cleared when the user explicitly deselects refs.
+        self.selected_refs: list[str] = []
         telemetry.create_session(session_id, str(self.workspace), MODEL, user=self.user)
 
     # ---- SSE fan-out ------------------------------------------------------
@@ -1045,12 +1050,22 @@ def tool_parallax_create(
     bin_path = _find_parallax_bin()
     if bin_path is None:
         return "parallax CLI binary not found on PATH"
-    # Validate any reference paths are inside the workspace
+    # Auto-inject session.selected_refs when the model forgets to. The
+    # user's intent is "use what I selected in the gallery", so if the tool
+    # call ships without a ref list we fill it in from the session. Claude
+    # can still override by passing an explicit empty list [] plus text
+    # like "ignore the selected references" — but nothing in the prompt
+    # contract encourages that, so in practice this closes the gap.
+    if not ref and session.selected_refs:
+        ref = list(session.selected_refs)
+    # Validate any reference paths — reads allowed to fall through to the
+    # master dir (read_fallback=True) so a project can point at raw media
+    # at the launch root.
     resolved_refs = []
     if ref:
         for r in ref:
             try:
-                p = _resolve_project_path(r, workspace=session.workspace)
+                p = _resolve_project_path(r, workspace=session.workspace, read_fallback=True)
             except PathError as e:
                 return f"invalid ref path {r!r}: {e}"
             if not p.exists():
@@ -1832,6 +1847,16 @@ class Handler(BaseHTTPRequestHandler):
                 sid if isinstance(sid, str) else None,
                 user=user, project=project,
             )
+            # Capture selected reference images on the session so
+            # tool_parallax_create can auto-inject them even if Claude
+            # doesn't set `ref` explicitly. Also prepend a visible hint to
+            # the user turn so the model knows refs are in play.
+            ref_images = body.get("reference_images")
+            if isinstance(ref_images, list):
+                session.selected_refs = [str(p) for p in ref_images if p]
+            if session.selected_refs:
+                paths_str = ", ".join(session.selected_refs)
+                text = f"[Reference images selected: {paths_str}]\n\n{text}"
             # Session-sticky TEST MODE trigger: if the user's message contains
             # "TEST MODE" (case-insensitive, whole phrase), flip the session
             # into test mode. Every subprocess dispatch then runs with
@@ -1931,7 +1956,53 @@ class Handler(BaseHTTPRequestHandler):
                 SESSIONS.pop(sid, None)
             return self._write_json(200, {"ok": True, "removed": removed})
 
+        if path.startswith("/api/projects/"):
+            name = unquote(path[len("/api/projects/"):])
+            return self._handle_delete_project(name)
+
         self._write_error(404, f"not found: {path}")
+
+    # ---- projects --------------------------------------------------------
+
+    def _handle_delete_project(self, name: str) -> None:
+        """
+        DELETE /api/projects/<name> — remove a per-user project workspace.
+
+        Refuses to delete `main` (the default, always required) and refuses
+        to delete the caller's currently-active project (which would pull
+        the rug out from under their running session). Raw media at the
+        master dir is never touched — this only nukes the nested workspace.
+        """
+        name = _sanitize_name(name or "")
+        if not name:
+            return self._write_error(400, "project name is required")
+        if name == "main":
+            return self._write_error(400, "cannot delete the default 'main' project")
+        current = self._get_request_project() or "main"
+        if name == current:
+            return self._write_error(
+                400,
+                f"cannot delete the active project '{name}'. Switch to another project first.",
+            )
+        user = self._get_request_user()
+        if PER_USER_WORKSPACES and user:
+            workspace = (_users_root() / _sanitize_name(user) / name).resolve()
+            scope = _users_root() / _sanitize_name(user)
+        else:
+            workspace = (_workspace_root() / name).resolve()
+            scope = _workspace_root()
+        # Belt-and-suspenders: the target must live inside the expected scope.
+        try:
+            workspace.relative_to(scope.resolve())
+        except ValueError:
+            return self._write_error(400, "invalid project path")
+        if not workspace.is_dir():
+            return self._write_error(404, f"project '{name}' not found")
+        try:
+            shutil.rmtree(workspace)
+        except Exception as e:
+            return self._write_error(500, f"failed to delete: {e}")
+        return self._write_json(200, {"ok": True, "deleted": name})
 
     # ---- upload ----------------------------------------------------------
 
