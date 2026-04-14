@@ -99,8 +99,8 @@ All tools are scoped to the project directory the chat was launched in.
 3. **Propose a plan in plain prose.** One tight paragraph. Reference what's already in the project.
 4. **Wait for confirmation.** "Ship it?" works.
 5. **Execute.** Either:
-   - **Generate new stills:** call `parallax_create` with the brief. The gallery updates automatically — do not call `make_storyboard` or `read_image` unless the user explicitly asks to review the results. Then `edit_manifest set-scenes` to choose the keepers in order. Then `parallax_compose`.
-   - **Compose existing stills:** survey with `make_storyboard` only if you need to see filenames to pick from. Then `edit_manifest set-scenes` with their paths, then `parallax_compose`.
+   - **Generate new stills:** call `parallax_create` with the brief. The gallery updates automatically in the UI — no need to follow up with `make_storyboard` or `read_image` just because images were generated. Use those tools when you actually need to see or compare something. Then `edit_manifest set-scenes` to choose the keepers in order. Then `parallax_compose`.
+   - **Compose existing stills:** use `make_storyboard` when you need to see multiple files at once, or `read_image` for a single file. Then `edit_manifest set-scenes` with their paths, then `parallax_compose`.
 
 ## Hard rules
 
