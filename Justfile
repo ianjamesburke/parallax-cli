@@ -5,16 +5,22 @@
 default:
     @just --list
 
-# Launch parallax chat, loading .env from this directory if present
-start:
+# Launch parallax chat with LAN exposure. Optional env_file path (default: ./.env).
+# Usage: just start              # loads ./.env
+#        just start ~/shared/.env   # loads a custom path
+start env_file=".env":
     #!/usr/bin/env bash
     set -e
-    if [ -f .env ]; then
-        echo "loading .env"
+    if [ -f "{{env_file}}" ]; then
+        echo "loading {{env_file}}"
         set -a
-        source .env
+        source "{{env_file}}"
         set +a
+    else
+        echo "no env file at {{env_file}} — continuing with current environment"
     fi
+    export PARALLAX_WEB_HOST=0.0.0.0
+    echo "binding to 0.0.0.0 (LAN-exposed)"
     parallax chat
 
 # Install everything: CLI symlink + web venv
