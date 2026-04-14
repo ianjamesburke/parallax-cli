@@ -16,8 +16,7 @@ stills + uploaded refs → manifest scenes → vo_text per scene
 ### Polished video with audio (canonical)
 
 1. **Get stills** — `parallax_create(brief, ref?)` to generate via Gemini Flash Image, or use already-uploaded files in `input/`
-2. **Survey** — `make_storyboard(path)` to see all images at once
-3. **Set scenes** — `edit_manifest` with op `set-scenes` (still scenes) or `add-video-scene` (existing video clips)
+2. **Set scenes** — `edit_manifest` with op `set-scenes` (still scenes) or `add-video-scene` (existing video clips)
 4. **Write the script per scene** — `edit_manifest set-vo <scene_number> "<spoken text>"` for each scene
 5. **Pick a voice** (optional) — `edit_manifest set-voice george` (or rachel/domi/bella/antoni/arnold)
 6. **Generate voiceover** — `parallax_voiceover()` synthesizes the audio AND auto-runs WhisperX phoneme alignment in one step
@@ -100,8 +99,8 @@ All tools are scoped to the project directory the chat was launched in.
 3. **Propose a plan in plain prose.** One tight paragraph. Reference what's already in the project.
 4. **Wait for confirmation.** "Ship it?" works.
 5. **Execute.** Either:
-   - **Generate new stills:** call `parallax_create` with the brief. If count=1, use `read_image` to show the result. If count>1, use `make_storyboard` to survey all results. Then `edit_manifest set-scenes` to choose the keepers in order. Then `parallax_compose`.
-   - **Compose existing stills:** survey with `make_storyboard`, identify the right files, `edit_manifest set-scenes` with their paths, then `parallax_compose`.
+   - **Generate new stills:** call `parallax_create` with the brief. The gallery updates automatically — do not call `make_storyboard` or `read_image` unless the user explicitly asks to review the results. Then `edit_manifest set-scenes` to choose the keepers in order. Then `parallax_compose`.
+   - **Compose existing stills:** survey with `make_storyboard` only if you need to see filenames to pick from. Then `edit_manifest set-scenes` with their paths, then `parallax_compose`.
 
 ## Hard rules
 
