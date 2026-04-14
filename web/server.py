@@ -143,19 +143,17 @@ PROJECT_DIR = Path(os.environ.get("PARALLAX_PROJECT_DIR", os.getcwd())).resolve(
 STATIC_DIR = _HERE / "static"
 HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
 
-# When True, every user gets their own subdirectory under PROJECT_DIR.
-# Enabled automatically when the server is network-accessible (PARALLAX_WEB_HOST
-# set) or password-protected. Opt out explicitly with PARALLAX_SINGLE_USER=1
-# for a known single-user local setup.
-_network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
-PER_USER_WORKSPACES = (
-    not bool(os.environ.get("PARALLAX_SINGLE_USER"))
-    and (
-        bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
-        or bool(os.environ.get("PARALLAX_PER_USER_WORKSPACES"))
-        or _network_accessible
-    )
-)
+# Beta always runs with per-user workspaces — every user lives in
+# PROJECT_DIR/parallax/users/<user>/<project>/ regardless of password or
+# network accessibility. Raw media at PROJECT_DIR (the "master dir") is
+# still readable across users and projects via _resolve_project_path.
+# PARALLAX_SINGLE_USER=1 is the only escape hatch, kept for emergencies.
+PER_USER_WORKSPACES = not bool(os.environ.get("PARALLAX_SINGLE_USER"))
+
+# Top-level folder that scopes every parallax-managed directory under
+# PROJECT_DIR. Previously this was the hidden `.parallax/` sibling; in beta
+# it's a visible `parallax/` sibling that holds users/<user>/<project>/.
+WORKSPACE_ROOT_NAME = "parallax"
 
 
 def _sanitize_name(name: str) -> str:
@@ -169,34 +167,48 @@ _sanitize_user = _sanitize_name
 
 
 def _ensure_workspace(workspace: Path) -> None:
-    """Scaffold the canonical project layout in workspace if missing."""
+    """Scaffold the canonical workspace layout if any piece is missing."""
     workspace.mkdir(parents=True, exist_ok=True)
-    for sub in ("stills", "input", "output", "drafts", "audio", ".parallax"):
+    for sub in ("stills", "input", "output", "drafts", "audio", "logs"):
         (workspace / sub).mkdir(exist_ok=True)
+
+
+def _workspace_root() -> Path:
+    """PROJECT_DIR/parallax/ — scoped parallax-managed folder at master dir."""
+    return PROJECT_DIR / WORKSPACE_ROOT_NAME
+
+
+def _users_root() -> Path:
+    """PROJECT_DIR/parallax/users/ — where every user workspace lives."""
+    return _workspace_root() / "users"
 
 
 def _workspace_for(user: Optional[str], project: Optional[str] = None) -> Path:
     """
     Resolve the working directory for a user + project pair.
 
-    Layout:
-      single user mode:     PROJECT_DIR/                          (no isolation)
-      per-user mode:        PROJECT_DIR/<user>/<project>/         (full isolation)
-                            project defaults to "main"
+    New layout (beta):
+        PROJECT_DIR/parallax/users/<user>/<project>/
+    with raw media at PROJECT_DIR itself shared read-only across projects.
 
-    Two browser tabs with different `?project=` values are completely
-    isolated and can run jobs in parallel without manifest collisions.
+    `project` defaults to "main". Two browser tabs with different
+    `?project=` values are isolated and can run jobs in parallel without
+    manifest collisions.
+
+    PARALLAX_SINGLE_USER=1 collapses everything to PROJECT_DIR/parallax/main/
+    for local one-user setups that don't want the users/ nesting.
     """
-    if not PER_USER_WORKSPACES or not user:
-        return PROJECT_DIR
-    user_safe = _sanitize_name(user)
     project_safe = _sanitize_name(project or "main")
-    workspace = (PROJECT_DIR / user_safe / project_safe).resolve()
-    # Safety: must be inside PROJECT_DIR
+    if not PER_USER_WORKSPACES or not user:
+        workspace = (_workspace_root() / project_safe).resolve()
+    else:
+        user_safe = _sanitize_name(user)
+        workspace = (_users_root() / user_safe / project_safe).resolve()
+    # Safety: must be inside PROJECT_DIR/parallax/
     try:
-        workspace.relative_to(PROJECT_DIR)
+        workspace.relative_to(_workspace_root())
     except ValueError:
-        workspace = PROJECT_DIR / "anon" / "main"
+        workspace = _users_root() / "anon" / "main"
     _ensure_workspace(workspace)
     return workspace
 
@@ -245,25 +257,48 @@ class PathError(ValueError):
 
 def _resolve_project_path(user_path: str, workspace: Optional[Path] = None) -> Path:
     """
-    Resolve `user_path` against the workspace (or PROJECT_DIR if no workspace
-    is given) and verify the result stays inside it. Rejects absolute paths
-    that escape, '..' traversal, and symlinks that point outside.
+    Resolve `user_path` relative to a workspace and verify it stays inside
+    the master PROJECT_DIR tree.
+
+    Two concentric sandboxes:
+      - primary:  the per-user workspace (where writes should land)
+      - fallback: PROJECT_DIR itself (the master launch dir, cross-project
+                  shared raw media)
+
+    Relative paths are joined against the workspace first; if that escapes,
+    we fall back to joining against PROJECT_DIR so a project can reference
+    raw files the user dropped at the master dir. Absolute paths and `..`
+    traversal are allowed as long as the final resolved path stays inside
+    PROJECT_DIR.
     """
-    base = workspace or PROJECT_DIR
     if not isinstance(user_path, str) or not user_path:
         raise PathError("path must be a non-empty string")
+    workspace = workspace or PROJECT_DIR
     p = Path(user_path)
     if not p.is_absolute():
-        p = base / p
+        candidate = workspace / p
+        try:
+            resolved = candidate.resolve()
+        except Exception as e:
+            raise PathError(f"could not resolve path: {e}") from e
+        try:
+            resolved.relative_to(workspace)
+            return resolved
+        except ValueError:
+            # Path escapes the workspace — fall back to the master dir so
+            # cross-project shared media is reachable.
+            candidate = PROJECT_DIR / p
+    else:
+        candidate = p
     try:
-        resolved = p.resolve()
+        resolved = candidate.resolve()
     except Exception as e:
         raise PathError(f"could not resolve path: {e}") from e
     try:
-        resolved.relative_to(base)
+        resolved.relative_to(PROJECT_DIR)
     except ValueError as e:
         raise PathError(
-            f"path {user_path!r} escapes workspace {base}"
+            f"path {user_path!r} escapes project {PROJECT_DIR}"
         ) from e
     return resolved
 
@@ -525,7 +560,7 @@ TOOL_SCHEMAS = [
     {
         "name": "edit_manifest",
         "description": (
-            "Edit .parallax/manifest.yaml — the source of truth for what gets rendered. "
+            "Edit cwd/manifest.yaml — the source of truth for what gets rendered. "
             "The manifest has a `scenes` list; each scene is either a still scene "
             "(with `still`, `duration`, optional `motion`) or a video scene (with "
             "`type: video`, `source`, optional `start_s`/`end_s`). Both scene types "
@@ -685,7 +720,7 @@ TOOL_SCHEMAS = [
     {
         "name": "parallax_compose",
         "description": (
-            "Render the project EXACTLY as specified in .parallax/manifest.yaml. "
+            "Render the project EXACTLY as specified in cwd/manifest.yaml. "
             "This is the canonical render path — deterministic, no globbing, no "
             "fallbacks. Compose is one command that does ALL post-processing: "
             "scene clip rendering (Ken Burns for stills, trim+scale for video "

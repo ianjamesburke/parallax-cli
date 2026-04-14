@@ -1,18 +1,22 @@
 """
 Standard Parallax project layout and auto-scaffolding.
 
-Every cwd is a Parallax project. The first time any `parallax` command runs in
-a directory, we create the canonical subdirs and migrate any loose source files
-into `input/`. Subsequent runs are a silent no-op.
+`cwd` here is the *workspace* — in beta that's
+`<launch-dir>/parallax/users/<user>/<project>/`, not the master launch dir.
+The first time a `parallax` command runs in a fresh workspace, we create
+the canonical subdirs and migrate any loose source files into `input/`.
+Subsequent runs are a silent no-op.
 
-Canonical layout:
+Canonical workspace layout:
 
-    <cwd>/
-    ├── input/     # source footage + reference images (user-provided)
-    ├── output/    # finals only — latest deliverable per concept
-    ├── drafts/    # version history: <concept>_v0.0.1.mp4, v0.0.2.mp4, ...
-    ├── stills/    # generated stills from `parallax create`
-    └── .parallax/ # internal state, manifests, concept history
+    <workspace>/
+    ├── manifest.yaml    # project manifest (at workspace root, visible)
+    ├── input/           # project-specific source footage / refs
+    ├── output/          # finals — latest deliverable per concept
+    ├── drafts/          # version history: <concept>_v0.0.1.mp4, ...
+    ├── stills/          # generated stills from `parallax create`
+    ├── audio/           # voiceovers + vo_manifest.json
+    └── logs/            # per-run log files (was `.parallax/logs/` pre-beta)
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from pathlib import Path
 
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".mkv")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
-STANDARD_DIRS = ("input", "output", "drafts", "stills", ".parallax")
+STANDARD_DIRS = ("input", "output", "drafts", "stills", "audio", "logs")
 
 
 def _is_media_loose(p: Path, exts: tuple[str, ...]) -> bool:
@@ -36,14 +40,14 @@ def _is_media_loose(p: Path, exts: tuple[str, ...]) -> bool:
 
 def ensure_project_layout(cwd: Path) -> None:
     """
-    Scaffold the standard Parallax project layout in cwd.
+    Scaffold the standard Parallax workspace layout in cwd.
 
     Idempotent: if all dirs already exist, prints nothing. On first call in a
-    given cwd (detected by absence of `.parallax/`), also migrates loose video
-    and image files from the root into `input/`, announcing each move.
+    given cwd (detected by absence of `logs/`), also migrates loose video and
+    image files from the root into `input/`, announcing each move.
     """
     cwd = Path(cwd).resolve()
-    first_time = not (cwd / ".parallax").exists()
+    first_time = not (cwd / "logs").exists()
 
     created_any = False
     for sub in STANDARD_DIRS:

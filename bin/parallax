@@ -8,9 +8,15 @@ Commands:
     parallax project new <name>   Scaffold ~/Documents/parallax-projects/<name>/.
     parallax projects             List known parallax projects.
 
-Run-time layout (for `parallax run` and `parallax status`):
-    cwd/.parallax/              logs + project output (via PARALLAX_LOG_DIR + PARALLAX_OUTPUT_ROOT)
-    cwd/.parallax/<concept>/manifest.yaml
+Run-time layout:
+    cwd/                    workspace root (in web beta:
+                            <launch-dir>/parallax/users/<user>/<project>/)
+    cwd/manifest.yaml       current project manifest
+    cwd/stills/             generated images
+    cwd/output/             final renders (latest deliverable per concept)
+    cwd/drafts/             version history
+    cwd/audio/              voiceovers + vo_manifest.json
+    cwd/logs/               per-run log files (+ HoP per-concept subdirs)
 """
 
 import argparse
@@ -55,7 +61,7 @@ def _find_clips(cwd: Path) -> list:
 def _synthesize_test_clip(cwd: Path) -> str:
     """In TEST_MODE with no clips, create a 2s black clip so the pipeline has input."""
     import subprocess
-    clip = cwd / ".parallax" / "_synthetic_clip.mp4"
+    clip = cwd / "logs" / "_synthetic_clip.mp4"
     clip.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "color=black:s=320x240:d=2",
@@ -116,20 +122,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         emitter.enable_json(run_id)
 
-    # Auto-scaffold canonical project layout (input/ output/ drafts/ stills/ .parallax/)
-    # and migrate loose media into input/ on first run. Idempotent.
+    # Auto-scaffold canonical workspace layout (input/ output/ drafts/ stills/
+    # audio/ logs/) and migrate loose media into input/ on first run. Idempotent.
     _ensure_project_layout(cwd)
 
-    parallax_dir = cwd / ".parallax"
+    parallax_dir = cwd / "logs"
     parallax_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pin logs and HoP's internal project output under cwd/.parallax/.
-    # The canonical *final* is republished to cwd/output/ at the end of the
+    # Pin logs and HoP's internal project output under cwd/logs/. The
+    # canonical *final* is republished to cwd/output/ at the end of the
     # pipeline via core/project_layout.py (see HoP footage_edit branch).
     os.environ["PARALLAX_LOG_DIR"] = str(parallax_dir)
     os.environ["PARALLAX_OUTPUT_ROOT"] = str(parallax_dir)
 
-    # Install per-run file logging under .parallax/logs/runs/<run_id>/parallax.log
+    # Install per-run file logging under logs/runs/<run_id>/parallax.log
     from core.logging_setup import setup_run_logging
     log_path = setup_run_logging(run_id)
     log = logging.getLogger("parallax.run")
@@ -248,15 +254,21 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
-    parallax_dir = cwd / ".parallax"
-    if not parallax_dir.exists():
-        print("[parallax] no .parallax/ directory in cwd", file=sys.stderr)
-        return 1
-
-    # Look for manifest.yaml in any concept subdir under .parallax/
-    manifests = sorted(parallax_dir.glob("*/manifest.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Prefer the flat workspace manifest (cmd_create / voiceover / compose).
+    # Fall back to per-concept HoP manifests under logs/<concept>/manifest.yaml
+    # for the legacy footage_edit (cmd_run) flow.
+    flat = cwd / "manifest.yaml"
+    parallax_dir = cwd / "logs"
+    manifests: list[Path] = []
+    if flat.exists():
+        manifests.append(flat)
+    if parallax_dir.exists():
+        manifests.extend(
+            sorted(parallax_dir.glob("*/manifest.yaml"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+        )
     if not manifests:
-        print("[parallax] no manifest.yaml found under .parallax/", file=sys.stderr)
+        print("[parallax] no manifest.yaml in cwd or cwd/logs/<concept>/", file=sys.stderr)
         return 1
 
     manifest_path = manifests[0]
@@ -296,9 +308,8 @@ def cmd_create(args: argparse.Namespace) -> int:
     Generate still images from a brief — no footage required.
 
     Creates:
-        cwd/stills/               generated images (PNG) — read by the Plexi viewer
-        cwd/.parallax/            project metadata
-        cwd/.parallax/manifest.yaml
+        cwd/stills/               generated images (PNG)
+        cwd/manifest.yaml         project manifest (scenes + brief)
     """
     import random, string
     cwd = Path.cwd()
@@ -320,9 +331,9 @@ def cmd_create(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         emitter.enable_json(run_id)
 
-    # Pin log dir to cwd/.parallax so logging_setup writes the per-run log file
-    # under the current project.
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    # Pin log dir to cwd/logs so logging_setup writes the per-run log file
+    # under the current workspace.
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     # Auto-scaffold the canonical layout in cwd (idempotent).
     _ensure_project_layout(cwd)
 
@@ -332,13 +343,13 @@ def cmd_create(args: argparse.Namespace) -> int:
     log.info("cmd_create start run_id=%s brief=%r count=%s", run_id, brief, count)
 
     started_at = time.time()
-    emitter.emit("run_started", brief=brief, mode="create", project_dir=str(cwd / ".parallax"))
+    emitter.emit("run_started", brief=brief, mode="create", project_dir=str(cwd))
 
     # TEST_MODE: short-circuit Gemini and produce placeholder stills locally.
     if os.environ.get("TEST_MODE", "").lower() == "true":
         stills_dir = cwd / "stills"
         stills_dir.mkdir(parents=True, exist_ok=True)
-        (cwd / ".parallax").mkdir(parents=True, exist_ok=True)
+        (cwd / "logs").mkdir(parents=True, exist_ok=True)
         concept_id = "".join(random.choices(string.ascii_uppercase, k=3)) + "-" + str(random.randint(1, 999)).zfill(3)
         timestamp = int(time.time())
         generated_names = []
@@ -369,7 +380,7 @@ def cmd_create(args: argparse.Namespace) -> int:
             emitter.emit("still_generated", path=str(still_path), scene=i, prompt=brief)
             print(f"[parallax] test-mode still {i}/{count} -> stills/{filename}")
 
-        manifest_path = cwd / ".parallax" / "manifest.yaml"
+        manifest_path = cwd / "manifest.yaml"
         project_name = cwd.name
         with open(manifest_path, "w") as f:
             f.write(f'project: "{project_name}"\n')
@@ -415,7 +426,7 @@ def cmd_create(args: argparse.Namespace) -> int:
     # stills/ at the project root — this is where the Plexi viewer reads from
     stills_dir = cwd / "stills"
     stills_dir.mkdir(parents=True, exist_ok=True)
-    (cwd / ".parallax").mkdir(parents=True, exist_ok=True)
+    (cwd / "logs").mkdir(parents=True, exist_ok=True)
 
     prompt_parts = [brief]
     if style_ref:
@@ -522,7 +533,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         return 1
 
     # Manifest uses paths relative to cwd — portable across machines
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     project_name = cwd.name
     with open(manifest_path, "w") as f:
         f.write(f'project: "{project_name}"\n')
@@ -537,7 +548,7 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     print()
     print(f"[parallax] generated {len(generated_names)} still(s) → stills/")
-    print(f"[parallax] manifest: .parallax/manifest.yaml")
+    print(f"[parallax] manifest: ./manifest.yaml")
     print(f"[parallax] concept:  {concept_id}")
     print(f"[parallax] next:     parallax animate  (Ken Burns + assemble to output/)")
 
@@ -558,12 +569,12 @@ def cmd_animate(args) -> int:
 
     Reads:   cwd/stills/*.png  (or --stills path)
     Writes:  cwd/output/draft_<timestamp>.mp4
-    Updates: cwd/.parallax/manifest.yaml  (adds output_video field)
+    Updates: cwd/manifest.yaml  (adds output_video field)
     """
     cwd = Path.cwd()
     # sys.path + auto-scaffold before anything else
     sys.path.insert(0, str(REPO_ROOT))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -574,7 +585,7 @@ def cmd_animate(args) -> int:
     setup_run_logging(run_id)
     log = logging.getLogger("parallax.animate")
     started_at = time.time()
-    emitter.emit("run_started", brief="animate", mode="animate", project_dir=str(cwd / ".parallax"))
+    emitter.emit("run_started", brief="animate", mode="animate", project_dir=str(cwd))
 
     stills_dir = cwd / "stills"
     output_dir = cwd / "output"
@@ -636,7 +647,7 @@ def cmd_animate(args) -> int:
         # Name the final with the canonical <concept>_v<version>.mp4 convention.
         # Concept_id is read from the manifest if present; otherwise we mint a
         # timestamp-derived one so every animate run produces a versioned file.
-        manifest_path = cwd / ".parallax" / "manifest.yaml"
+        manifest_path = cwd / "manifest.yaml"
         concept_id = None
         if manifest_path.exists():
             try:
@@ -778,7 +789,7 @@ def cmd_transcribe(args) -> int:
     """
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -789,7 +800,7 @@ def cmd_transcribe(args) -> int:
     setup_run_logging(run_id)
     started_at = time.time()
     emitter.emit("run_started", brief="transcribe", mode="transcribe",
-                 project_dir=str(cwd / ".parallax"))
+                 project_dir=str(cwd))
 
     # Resolve audio path: --audio flag or default
     audio_arg = getattr(args, "audio", None)
@@ -854,7 +865,7 @@ def cmd_transcribe(args) -> int:
     print(f"[whisperx] wrote {vo_manifest_path}")
 
     # Update project manifest if present
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     if manifest_path.exists():
         try:
             import yaml as _yaml
@@ -913,7 +924,7 @@ def cmd_voiceover(args) -> int:
     """
     Generate a voiceover MP3 + word-level timestamps from the manifest.
 
-    Reads `vo_text` from each scene in .parallax/manifest.yaml, concatenates,
+    Reads `vo_text` from each scene in cwd/manifest.yaml, concatenates,
     sends to ElevenLabs convert_with_timestamps. Writes:
       audio/voiceover.mp3
       audio/vo_manifest.json   — word-level timing for align + captions
@@ -927,7 +938,7 @@ def cmd_voiceover(args) -> int:
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
     sys.path.insert(0, str(BUNDLED_SCRIPTS))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -939,9 +950,9 @@ def cmd_voiceover(args) -> int:
     log = logging.getLogger("parallax.voiceover")
     started_at = time.time()
     emitter.emit("run_started", brief="voiceover", mode="voiceover",
-                 project_dir=str(cwd / ".parallax"))
+                 project_dir=str(cwd))
 
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     if not manifest_path.exists():
         msg = f"manifest not found: {manifest_path}"
         emitter.emit("error", message=msg, where="cmd_voiceover.no_manifest")
@@ -1254,7 +1265,7 @@ def cmd_trim_silence(args) -> int:
     """
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -1265,7 +1276,7 @@ def cmd_trim_silence(args) -> int:
     setup_run_logging(run_id)
     started_at = time.time()
     emitter.emit("run_started", brief="trim-silence", mode="trim_silence",
-                 project_dir=str(cwd / ".parallax"))
+                 project_dir=str(cwd))
 
     audio_path = cwd / "audio" / "voiceover.mp3"
     vo_manifest_path = cwd / "audio" / "vo_manifest.json"
@@ -1414,7 +1425,7 @@ def cmd_trim_silence(args) -> int:
             print(f"[parallax] WARNING: vo_manifest rewrite failed: {e}", file=sys.stderr)
 
     # Update project manifest with new duration
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     if manifest_path.exists():
         try:
             import yaml as _yaml
@@ -1448,7 +1459,7 @@ def cmd_align(args) -> int:
     """
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -1459,9 +1470,9 @@ def cmd_align(args) -> int:
     setup_run_logging(run_id)
     started_at = time.time()
     emitter.emit("run_started", brief="align", mode="align",
-                 project_dir=str(cwd / ".parallax"))
+                 project_dir=str(cwd))
 
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     vo_manifest_path = cwd / "audio" / "vo_manifest.json"
     if not manifest_path.exists():
         msg = f"manifest not found: {manifest_path}"
@@ -1579,7 +1590,7 @@ def cmd_align(args) -> int:
 
 def cmd_compose(args) -> int:
     """
-    Manifest-first render. Reads .parallax/manifest.yaml and renders
+    Manifest-first render. Reads cwd/manifest.yaml and renders
     EXACTLY the scenes listed there — no globbing, no fallbacks.
 
     Each scene must have:
@@ -1592,12 +1603,12 @@ def cmd_compose(args) -> int:
       output_motion:     default motion if scenes don't specify one
       output_resolution: default '1080x1920'
 
-    Reads:   cwd/.parallax/manifest.yaml + the stills it references
+    Reads:   cwd/manifest.yaml + the stills it references
     Writes:  cwd/output/<concept_id>_v<version>.mp4
     """
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
-    os.environ["PARALLAX_LOG_DIR"] = str(cwd / ".parallax")
+    os.environ["PARALLAX_LOG_DIR"] = str(cwd / "logs")
     _ensure_project_layout(cwd)
 
     run_id = uuid.uuid4().hex[:8]
@@ -1608,9 +1619,9 @@ def cmd_compose(args) -> int:
     setup_run_logging(run_id)
     log = logging.getLogger("parallax.compose")
     started_at = time.time()
-    emitter.emit("run_started", brief="compose", mode="compose", project_dir=str(cwd / ".parallax"))
+    emitter.emit("run_started", brief="compose", mode="compose", project_dir=str(cwd))
 
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
     if not manifest_path.exists():
         msg = f"manifest not found: {manifest_path}"
         emitter.emit("error", message=msg, where="cmd_compose.read_manifest")
@@ -2049,7 +2060,7 @@ def cmd_compose(args) -> int:
 
 def cmd_manifest_edit(args) -> int:
     """
-    Apply a single edit to .parallax/manifest.yaml.
+    Apply a single edit to cwd/manifest.yaml.
 
     Operations:
       set-scenes <still1[:duration[:motion]]> ...   replace scenes list
@@ -2061,7 +2072,7 @@ def cmd_manifest_edit(args) -> int:
     """
     cwd = Path.cwd()
     _ensure_project_layout(cwd)
-    manifest_path = cwd / ".parallax" / "manifest.yaml"
+    manifest_path = cwd / "manifest.yaml"
 
     import yaml as _yaml
     if manifest_path.exists():
@@ -2554,7 +2565,7 @@ def cmd_project_new(args: argparse.Namespace) -> int:
         print(f"[parallax] ERROR: {proj} already exists", file=sys.stderr)
         return 1
     # Scaffold the canonical Parallax project layout.
-    for sub in (".parallax", "input", "output", "drafts", "stills"):
+    for sub in ("input", "output", "drafts", "stills", "audio", "logs"):
         (proj / sub).mkdir(parents=True, exist_ok=True)
     print(str(proj.resolve()))
     return 0
@@ -2700,7 +2711,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_compose = sub.add_parser(
         "compose",
-        help="render the project EXACTLY as specified in .parallax/manifest.yaml — no globbing",
+        help="render the project EXACTLY as specified in cwd/manifest.yaml — no globbing",
     )
     p_compose.add_argument("--json", action="store_true",
                            help="emit NDJSON events to stdout; human prose goes to stderr")
@@ -2752,7 +2763,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="emit NDJSON events to stdout")
     p_align.set_defaults(func=cmd_align)
 
-    p_manifest = sub.add_parser("manifest", help="edit .parallax/manifest.yaml programmatically")
+    p_manifest = sub.add_parser("manifest", help="edit cwd/manifest.yaml programmatically")
     p_manifest.add_argument(
         "op",
         choices=[
