@@ -2,6 +2,12 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-13 — [CHANGED] Web UI sidebar, update command, install bootstrap
+
+Session focused on parallax-web frontend and CLI tooling. Built a persistent left-sidebar session switcher replacing the history drawer, added video delete (× on hover), replaced trash emoji with minimal × on stills, removed Open in Finder button, and added a Google Drive link stored in localStorage per user. Added `parallax update` CLI command and a daily background update check (git ls-remote, cached in `~/.parallax/.update_check`, prints one-liner to stderr if behind). Added `scripts/install.sh` for curl-pipe bootstrap (brew + python@3.11 + just + ffmpeg + just install). Fixed exit-code-127 bug in `just install-web`: switched from `web/.venv/bin/pip` to `web/.venv/bin/python3 -m pip`; same fix applied in `cmd_update` which now does install steps directly in Python without calling `just`.
+**Progress:** All shipped and pushed — sidebar, delete, Drive link, update cmd, install.sh, 127 fix.
+**Open:** Project sidebar scoping deferred (what "project" means, delete-vs-delete-workspace distinction, live status for backgrounded sessions).
+
 ## 2026-04-13 — [FUTURE] HIGH PRIORITY: real fal.ai video generation
 
 **Status:** Stub only. The CLI has zero working code that calls fal.ai. The
