@@ -43,6 +43,64 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import telemetry  # noqa: E402
+import costs  # noqa: E402
+
+
+def _fal_whoami() -> dict:
+    """
+    Best-effort fetch of the fal account identity if FAL_KEY / FAL_API_KEY is
+    set on the server process. Returns a dict shaped like:
+        {"configured": bool, "identity": Optional[str], "error": Optional[str]}
+    Never raises — network errors, missing key, and bad JSON all collapse
+    to `configured=False` with an error string (when relevant).
+    """
+    key = os.environ.get("FAL_KEY") or os.environ.get("FAL_API_KEY")
+    if not key:
+        return {"configured": False, "identity": None, "error": None}
+
+    # TODO: verify — fal does not publish a single "whoami" endpoint. The
+    # queue API accepts `Authorization: Key <key>`; hitting the root returns
+    # 200 when the key is valid. Once fal documents a real identity route
+    # (or we find it in their dashboard's network tab) wire it up here.
+    import urllib.request
+    import urllib.error
+
+    url = "https://rest.alpha.fal.ai/"  # TODO: verify fal identity route
+    req = urllib.request.Request(url, headers={"Authorization": f"Key {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            body = resp.read(4096)
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception:
+                data = None
+            identity = None
+            if isinstance(data, dict):
+                identity = (
+                    data.get("name")
+                    or data.get("email")
+                    or data.get("user")
+                    or data.get("id")
+                )
+            # Fallback: mask the key itself so the page shows *something*
+            # when fal doesn't return identifying fields.
+            if not identity:
+                masked = key[:6] + "…" + key[-4:] if len(key) > 12 else "****"
+                identity = f"key {masked}"
+            return {"configured": True, "identity": identity, "error": None}
+    except urllib.error.HTTPError as e:
+        # A 401/403 means the key is present but invalid — still "configured".
+        return {
+            "configured": True,
+            "identity": None,
+            "error": f"fal http {e.code}",
+        }
+    except Exception as e:
+        return {
+            "configured": True,
+            "identity": None,
+            "error": f"fal fetch failed: {e}",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1664,6 +1722,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/usage":
             return self._handle_usage()
 
+        if path == "/api/costs":
+            return self._handle_costs_report()
+
+        if path == "/costs":
+            return self._serve_static("costs.html")
+
         if path.startswith("/api/session/") and path.endswith("/history"):
             sid = path[len("/api/session/"):-len("/history")]
             return self._handle_session_history(sid)
@@ -1930,6 +1994,27 @@ class Handler(BaseHTTPRequestHandler):
             "today": today,
             "lifetime": lifetime,
         })
+
+    def _handle_costs_report(self) -> None:
+        """
+        GET /api/costs — full cost breakdown (LLM + image + video) folded
+        from the JSONL event log. Honors ?user= for per-user filtering.
+        Also fetches the fal account identity if FAL_KEY or FAL_API_KEY is
+        set on the server process — that is the only live network call in
+        the handler and it is wrapped in a short timeout.
+        """
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        user_param = qs.get("user", [""])[0].strip() or None
+
+        try:
+            report = costs.build_report(user_param)
+        except Exception as e:
+            return self._write_error(500, f"costs build failed: {e}")
+
+        # Fal whoami — best-effort, stdlib urllib only.
+        report["fal"] = _fal_whoami()
+        return self._write_json(200, report)
 
     # ---- projects (filesystem-backed) -----------------------------------
 
