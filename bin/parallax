@@ -2092,8 +2092,8 @@ def cmd_manifest_edit(args) -> int:
 
 def cmd_update(args) -> int:
     """
-    Pull the latest Parallax from GitHub and re-run just install.
-    Works as long as the repo was cloned (not installed from a tarball).
+    Pull the latest Parallax from GitHub and reinstall.
+    Does the install steps directly in Python — no dependency on `just`.
     """
     import shutil
     import subprocess as sp
@@ -2101,16 +2101,16 @@ def cmd_update(args) -> int:
     print("Parallax update\n" + "=" * 40)
 
     # Verify we're in a git repo
-    result = sp.run(
+    r = sp.run(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
         capture_output=True, text=True,
     )
-    if result.returncode != 0:
+    if r.returncode != 0:
         print("error: repo not found — was Parallax installed via git clone?")
         print(f"  expected repo at: {REPO_ROOT}")
         return 1
 
-    # Pull
+    # --- Pull ------------------------------------------------------------------
     print("pulling from origin/main...")
     try:
         pull = sp.run(
@@ -2125,29 +2125,72 @@ def cmd_update(args) -> int:
         print(f"git pull failed: {e}", file=sys.stderr)
         return 1
 
-    # Re-install via just if available, otherwise fall back to install.sh
-    just_bin = shutil.which("just")
-    if just_bin:
-        print("running just install...")
-        try:
-            r = sp.run([just_bin, "install"], cwd=str(REPO_ROOT))
-            if r.returncode != 0:
-                return r.returncode
-        except Exception as e:
-            print(f"just install failed: {e}", file=sys.stderr)
-            return 1
+    # --- CLI symlink -----------------------------------------------------------
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    symlink = local_bin / "parallax"
+    target = REPO_ROOT / "bin" / "parallax"
+    try:
+        if symlink.is_symlink() or symlink.exists():
+            symlink.unlink()
+        symlink.symlink_to(target)
+        print(f"linked {symlink} -> {target}")
+    except Exception as e:
+        print(f"warning: could not update symlink: {e}", file=sys.stderr)
+
+    # --- Web venv --------------------------------------------------------------
+    # Find Python 3.11+ — prefer the same interpreter running this script if
+    # it's new enough, so we use the venv python that's known to work.
+    python = None
+    if sys.version_info >= (3, 11):
+        python = sys.executable
     else:
-        install_sh = REPO_ROOT / "scripts" / "install.sh"
-        print(f"just not found — running {install_sh}...")
-        try:
-            r = sp.run(["bash", str(install_sh)], cwd=str(REPO_ROOT))
-            if r.returncode != 0:
-                return r.returncode
-        except Exception as e:
-            print(f"install.sh failed: {e}", file=sys.stderr)
+        for candidate in ("python3.12", "python3.11"):
+            found = shutil.which(candidate)
+            if found:
+                python = found
+                break
+
+    if not python:
+        print("error: Python 3.11+ not found — install with: brew install python@3.11",
+              file=sys.stderr)
+        return 1
+
+    venv_dir = REPO_ROOT / "web" / ".venv"
+    req_file = REPO_ROOT / "web" / "requirements.txt"
+
+    print(f"updating web venv at {venv_dir}...")
+    try:
+        r = sp.run([python, "-m", "venv", str(venv_dir)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"venv creation failed:\n{r.stderr}", file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"venv creation failed: {e}", file=sys.stderr)
+        return 1
+
+    # Use the venv's python to run pip — avoids the missing-pip-binary issue.
+    venv_python = venv_dir / "bin" / "python3"
+    try:
+        r = sp.run(
+            [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"pip upgrade failed:\n{r.stderr}", file=sys.stderr)
             return 1
 
-    # Reset the update check cache so we don't immediately nag again
+        r = sp.run(
+            [str(venv_python), "-m", "pip", "install", "-r", str(req_file)],
+            text=True,
+        )
+        if r.returncode != 0:
+            return 1
+    except Exception as e:
+        print(f"pip install failed: {e}", file=sys.stderr)
+        return 1
+
+    # --- Done ------------------------------------------------------------------
     _clear_update_cache()
     print("\nParallax is up to date.")
     return 0
