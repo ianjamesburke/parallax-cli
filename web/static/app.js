@@ -193,7 +193,9 @@ function openStream(sessionId) {
   state.eventSource = es;
 
   es.addEventListener("hello", () => {
-    setStatus("thinking");
+    // Only show thinking bar if we actually just sent a message.
+    // When loading history, state.thinking is false — don't surface the bar.
+    if (state.thinking) setStatus("thinking");
   });
 
   es.addEventListener("assistant_delta", (e) => {
@@ -561,17 +563,19 @@ function renderSidebar() {
     sessionsByProject[proj].push(s);
   }
 
-  // Merge: projects from disk + any orphan session projects not on disk
-  const projectNames = new Set(projects.map((p) => p.name));
+  // Merge: projects from disk + any orphan session projects not on disk.
+  // Work on a local copy — never mutate sidebarState.projects here.
+  const merged = [...projects];
+  const projectNames = new Set(merged.map((p) => p.name));
   for (const proj of Object.keys(sessionsByProject)) {
     if (!projectNames.has(proj)) {
-      projects.push({ name: proj, path: null });
+      merged.push({ name: proj, path: null });
       projectNames.add(proj);
     }
   }
 
   list.innerHTML = "";
-  for (const proj of projects) {
+  for (const proj of merged) {
     const projSessions = sessionsByProject[proj.name] || [];
     const isActive = proj.name === activeProject;
 
