@@ -281,6 +281,34 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     return sessions[:limit]
 
 
+def delete_session(session_id: str) -> int:
+    """
+    Remove all events for `session_id` from the log. Rewrites the file in-place.
+    Returns the number of lines removed.
+    """
+    with _lock:
+        try:
+            lines = LOG_PATH.read_bytes().splitlines(keepends=True)
+        except FileNotFoundError:
+            return 0
+        kept = []
+        removed = 0
+        for line in lines:
+            try:
+                ev = json.loads(line)
+                if ev.get("session_id") == session_id:
+                    removed += 1
+                    continue
+            except Exception:
+                pass
+            kept.append(line)
+        try:
+            LOG_PATH.write_bytes(b"".join(kept))
+        except Exception as e:
+            print(f"telemetry: delete_session write failed: {e}", file=sys.stderr, flush=True)
+        return removed
+
+
 def load_session_events(session_id: str) -> list[dict[str, Any]]:
     """
     Return every event for a single session, in append order, as

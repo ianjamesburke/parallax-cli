@@ -270,6 +270,7 @@ async function sendMessage(text) {
     if (!state.sessionId) {
       state.sessionId = body.session_id;
       openStream(state.sessionId);
+      refreshSidebar();
     }
   } catch (e) {
     appendError(`POST /api/message failed: ${e}`);
@@ -364,7 +365,7 @@ function renderGallery(data) {
         const del = document.createElement("button");
         del.className = "thumb-delete";
         del.title = "Move to Trash";
-        del.textContent = "🗑";
+        del.textContent = "×";
         del.addEventListener("click", async (e) => {
           e.stopPropagation();
           try {
@@ -387,7 +388,6 @@ function renderGallery(data) {
         });
         thumb.appendChild(del);
         thumb.addEventListener("click", () => openLightbox(img.src));
-        thumb.addEventListener("dblclick", () => openInFinder(s.path));
       }
       frag.appendChild(thumb);
     }
@@ -435,26 +435,72 @@ function renderGallery(data) {
       const item = document.createElement("div");
       item.className = "video-item" + (v.path === state.activeVideo ? " active" : "");
       item.innerHTML = `<span class="video-item-icon">▶</span><span class="video-item-name">${escapeHtml(v.name)}</span>`;
+      const vDel = document.createElement("button");
+      vDel.className = "video-item-delete";
+      vDel.title = "Move to Trash";
+      vDel.textContent = "×";
+      vDel.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          const r = await fetch("/api/image", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: v.path }),
+          });
+          if (r.ok) {
+            if (state.activeVideo === v.path) state.activeVideo = null;
+            refreshGallery();
+          } else {
+            const err = await r.json().catch(() => ({}));
+            console.error("video delete failed", err);
+          }
+        } catch (e2) {
+          console.error("video delete failed", e2);
+        }
+      });
+      item.appendChild(vDel);
       item.addEventListener("click", () => {
         state.activeVideo = v.path;
         renderGallery({ project_dir: data.project_dir, stills, videos });
       });
-      item.addEventListener("dblclick", () => openInFinder(v.path));
       vList.appendChild(item);
     }
   }
 }
 
-async function openInFinder(path) {
-  try {
-    await fetch("/api/open_in_finder", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: path || "" }),
-    });
-  } catch (e) {
-    console.error("open_in_finder failed", e);
+// ----- Google Drive link ---------------------------------------------------
+
+const DRIVE_KEY = "parallax_drive_url";
+
+function initDriveBtn() {
+  const link = $("drive-btn");
+  const setBtn = $("drive-set-btn");
+
+  function applyDriveUrl(url) {
+    if (url) {
+      link.href = url;
+      link.style.display = "";
+      setBtn.style.display = "none";
+    } else {
+      link.style.display = "none";
+      setBtn.style.display = "";
+    }
   }
+
+  applyDriveUrl(localStorage.getItem(DRIVE_KEY) || "");
+
+  setBtn.addEventListener("click", () => {
+    const current = localStorage.getItem(DRIVE_KEY) || "";
+    const raw = window.prompt("Paste your Google Drive folder URL:", current);
+    if (raw === null) return; // cancelled
+    const url = raw.trim();
+    if (url) {
+      localStorage.setItem(DRIVE_KEY, url);
+    } else {
+      localStorage.removeItem(DRIVE_KEY);
+    }
+    applyDriveUrl(url);
+  });
 }
 
 // ----- lightbox ------------------------------------------------------------
@@ -468,57 +514,96 @@ function closeLightbox() {
   $("lightbox-img").src = "";
 }
 
-// ----- history drawer ------------------------------------------------------
+// ----- sidebar -------------------------------------------------------------
 
-function relativeTime(ts) {
-  const diff = Math.floor((Date.now() / 1000) - ts);
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 172800) return "yesterday";
-  return `${Math.floor(diff / 86400)}d ago`;
-}
-
-async function toggleHistoryDrawer() {
-  const drawer = $("history-drawer");
-  if (!drawer.classList.contains("hidden")) {
-    drawer.classList.add("hidden");
-    return;
-  }
-  drawer.classList.remove("hidden");
-  await loadHistoryList();
-}
-
-async function loadHistoryList() {
-  const list = $("history-list");
-  list.innerHTML = '<div class="history-empty">Loading...</div>';
+async function refreshSidebar() {
   try {
     const r = await fetch("/api/sessions");
-    if (!r.ok) throw new Error(r.statusText);
+    if (!r.ok) return;
     const data = await r.json();
-    const sessions = data.sessions || [];
-    if (sessions.length === 0) {
-      list.innerHTML = '<div class="history-empty">No previous sessions.</div>';
-      return;
-    }
-    list.innerHTML = "";
-    for (const s of sessions) {
-      const item = document.createElement("div");
-      item.className = "history-item";
-      item.innerHTML = `
-        <div class="history-item-meta">${relativeTime(s.last_activity_at)} · ${s.event_count} events</div>
-        <div class="history-item-preview">${escapeHtml(s.preview || "(no messages)")}</div>
-      `;
-      item.addEventListener("click", () => loadSessionHistory(s.id));
-      list.appendChild(item);
-    }
+    renderSidebar(data.sessions || []);
   } catch (e) {
-    list.innerHTML = `<div class="history-empty">Error: ${escapeHtml(String(e))}</div>`;
+    console.error("sidebar fetch failed", e);
+  }
+}
+
+function renderSidebar(sessions) {
+  const list = $("sidebar-list");
+  if (sessions.length === 0) {
+    list.innerHTML = '<div class="sidebar-empty">No sessions yet.</div>';
+    return;
+  }
+
+  // Group by project
+  const groups = {};
+  for (const s of sessions) {
+    const proj = s.project || "main";
+    if (!groups[proj]) groups[proj] = [];
+    groups[proj].push(s);
+  }
+
+  list.innerHTML = "";
+  for (const [proj, items] of Object.entries(groups)) {
+    const group = document.createElement("div");
+    group.className = "sidebar-group";
+
+    const label = document.createElement("div");
+    label.className = "sidebar-group-label";
+    label.textContent = proj;
+    group.appendChild(label);
+
+    for (const s of items) {
+      const item = document.createElement("div");
+      item.className = "sidebar-item" + (s.id === state.sessionId ? " active" : "");
+      item.dataset.sid = s.id;
+
+      const dot = document.createElement("span");
+      dot.className = "sidebar-item-dot" + (s.live ? " live" : "");
+      item.appendChild(dot);
+
+      const text = document.createElement("span");
+      text.className = "sidebar-item-text";
+      text.textContent = s.preview || "(empty)";
+      item.appendChild(text);
+
+      const del = document.createElement("button");
+      del.className = "sidebar-item-del";
+      del.title = "Delete session";
+      del.textContent = "×";
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await fetch(`/api/session/${s.id}`, { method: "DELETE" });
+          if (state.sessionId === s.id) {
+            // Switched away — clear to a fresh state
+            state.sessionId = null;
+            state.thinking = false;
+            state.dispatchActive = false;
+            setStatus("");
+            updateButtons();
+            messagesEl().innerHTML = "";
+          }
+          refreshSidebar();
+        } catch (err) {
+          console.error("delete session failed", err);
+        }
+      });
+      item.appendChild(del);
+
+      item.addEventListener("click", () => loadSessionHistory(s.id));
+      group.appendChild(item);
+    }
+
+    list.appendChild(group);
   }
 }
 
 async function loadSessionHistory(sessionId) {
-  $("history-drawer").classList.add("hidden");
+  // Reset active session state so the thinking bar and buttons don't carry over
+  state.thinking = false;
+  state.dispatchActive = false;
+  setStatus("");
+  updateButtons();
   try {
     const r = await fetch(`/api/session/${sessionId}/history`);
     if (!r.ok) throw new Error(r.statusText);
@@ -550,6 +635,7 @@ async function loadSessionHistory(sessionId) {
     // Switch session and open stream so the user can continue
     state.sessionId = sessionId;
     openStream(sessionId);
+    refreshSidebar();
   } catch (e) {
     appendError(`failed to load history: ${e}`);
   }
@@ -563,27 +649,6 @@ async function loadSessionHistory(sessionId) {
 // watch a counter tick up while they work.
 function refreshUsage() {}
 
-function openNewProject() {
-  const raw = window.prompt("New project name? (letters, numbers, hyphens, underscores)");
-  if (!raw) return;
-  const name = raw.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
-  if (!name) {
-    alert("Invalid project name — use letters, numbers, hyphens, or underscores.");
-    return;
-  }
-  // Preserve current user if present in URL or cookie
-  const params = new URLSearchParams(window.location.search);
-  let user = params.get("user");
-  if (!user) {
-    const m = document.cookie.match(/parallax_user=([^;]+)/);
-    if (m) user = decodeURIComponent(m[1]);
-  }
-  const query = new URLSearchParams();
-  query.set("project", name);
-  if (user) query.set("user", user);
-  const url = `${window.location.origin}/?${query.toString()}`;
-  window.open(url, "_blank", "noopener");
-}
 
 function refreshProjectBadge() {
   // Read project from URL ?project= or cookie or default to "main"
@@ -707,9 +772,7 @@ function initComposer() {
   });
 
   $("cancel-btn").addEventListener("click", () => cancel());
-  $("open-finder-btn").addEventListener("click", () => openInFinder(""));
-  $("history-btn").addEventListener("click", () => toggleHistoryDrawer());
-  $("new-project-btn").addEventListener("click", () => openNewProject());
+  $("new-session-btn").addEventListener("click", () => startNewSession());
 
   $("lightbox").addEventListener("click", closeLightbox);
   document.addEventListener("keydown", (e) => {
@@ -717,15 +780,37 @@ function initComposer() {
   });
 }
 
+function startNewSession() {
+  // Clear the chat panel and drop the session ID — next send creates a fresh one
+  state.sessionId = null;
+  state.thinking = false;
+  state.dispatchActive = false;
+  if (state.eventSource) {
+    try { state.eventSource.close(); } catch (_) {}
+    state.eventSource = null;
+  }
+  setStatus("");
+  updateButtons();
+  messagesEl().innerHTML = "";
+  $("composer-input").focus();
+  // Update active highlight in sidebar
+  for (const el of document.querySelectorAll(".sidebar-item")) {
+    el.classList.remove("active");
+  }
+}
+
 function init() {
   initComposer();
   initDropZone();
+  initDriveBtn();
   refreshProjectBadge();
   refreshGallery();
+  refreshSidebar();
   refreshUsage();
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
+  setInterval(refreshSidebar, 5000);
   setInterval(refreshUsage, 30000);
 }
 

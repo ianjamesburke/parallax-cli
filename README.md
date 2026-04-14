@@ -11,7 +11,14 @@ AI video agent pipeline. Analyzes footage, makes edit decisions, and renders out
 ## Install
 
 ```sh
-git clone https://github.com/ianjamesburke/parallax-cli
+curl -fsSL https://raw.githubusercontent.com/ianjamesburke/parallax-cli/main/scripts/install.sh | bash
+```
+
+Installs Homebrew, Python 3.11+, `just`, and `ffmpeg` if missing, clones the repo, and wires up the CLI. Idempotent — safe to re-run.
+
+**If you already have the repo cloned:**
+
+```sh
 cd parallax-cli
 just install
 ```
@@ -19,12 +26,6 @@ just install
 `just install` does two things:
 1. Symlinks `bin/parallax` into `~/.local/bin/`
 2. Creates `web/.venv` and installs all web server dependencies
-
-Make sure `~/.local/bin` is on your `PATH`:
-
-```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
-```
 
 ## API Keys
 

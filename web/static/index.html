@@ -8,10 +8,19 @@
   </head>
   <body>
     <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <span class="sidebar-brand">◐</span>
+          <button type="button" class="btn ghost btn-sm" id="new-session-btn" title="New session">+</button>
+        </div>
+        <div class="sidebar-list" id="sidebar-list">
+          <div class="sidebar-empty">No sessions yet.</div>
+        </div>
+      </aside>
+
       <section class="chat">
         <header class="chat-header">
           <div class="brand">
-            <span class="brand-mark">◐</span>
             <span class="brand-name">Parallax</span>
             <span class="brand-sub">Head of Production</span>
           </div>
@@ -19,14 +28,8 @@
             <span class="status-dot" id="status-dot" title="idle"></span>
             <span class="model-name" id="model-name">claude-sonnet-4-6</span>
             <span class="project-badge" id="project-badge" title="active project workspace">main</span>
-            <button type="button" class="btn ghost btn-sm" id="new-project-btn" title="open a new project in a new tab">+ New Project</button>
-            <button type="button" class="btn ghost btn-sm" id="history-btn">History</button>
           </div>
         </header>
-
-        <div class="history-drawer hidden" id="history-drawer">
-          <div class="history-drawer-inner" id="history-list"></div>
-        </div>
 
         <div class="messages" id="messages"></div>
         <div class="thinking-bar hidden" id="thinking-bar">
@@ -54,9 +57,8 @@
       <section class="media">
         <header class="media-header">
           <div class="project-label" id="project-label">—</div>
-          <button type="button" class="btn ghost" id="open-finder-btn">
-            Open in Finder
-          </button>
+          <a class="btn ghost btn-sm" id="drive-btn" href="#" target="_blank" rel="noopener" style="display:none">Drive ↗</a>
+          <button type="button" class="btn ghost btn-sm" id="drive-set-btn" title="Set your Google Drive folder link">Drive…</button>
         </header>
 
         <div class="player-wrap" id="player-wrap">

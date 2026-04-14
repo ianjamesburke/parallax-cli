@@ -1753,6 +1753,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._write_error(500, f"trash failed: {e}")
             return self._write_json(200, {"ok": True, "path": rel})
 
+        if path.startswith("/api/session/"):
+            sid = path[len("/api/session/"):]
+            if not sid:
+                return self._write_error(400, "session_id required")
+            # Cancel any live session first
+            with SESSIONS_LOCK:
+                live = SESSIONS.get(sid)
+            if live:
+                live.cancel_event.set()
+                if live.dispatch_proc:
+                    try:
+                        live.dispatch_proc.kill()
+                    except Exception:
+                        pass
+            removed = telemetry.delete_session(sid)
+            with SESSIONS_LOCK:
+                SESSIONS.pop(sid, None)
+            return self._write_json(200, {"ok": True, "removed": removed})
+
         self._write_error(404, f"not found: {path}")
 
     # ---- upload ----------------------------------------------------------
@@ -1887,21 +1906,38 @@ class Handler(BaseHTTPRequestHandler):
     # ---- session history -------------------------------------------------
 
     def _handle_list_sessions(self) -> None:
-        """GET /api/sessions — last 10 sessions with preview text."""
+        """GET /api/sessions — recent sessions with preview text and live status."""
         try:
-            sessions = telemetry.list_sessions(limit=10)
+            sessions = telemetry.list_sessions(limit=50)
         except Exception as e:
             return self._write_error(500, f"sessions query failed: {e}")
+
+        # Snapshot which sessions are currently live (agent thread alive)
+        with SESSIONS_LOCK:
+            live_ids = {
+                sid for sid, s in SESSIONS.items()
+                if s.agent_thread and s.agent_thread.is_alive()
+            }
 
         sessions_out = []
         for s in sessions:
             preview = (s.get("first_user_message") or "")[:80]
+            sid = s.get("id")
+            # Extract just the project name from the full project_dir path
+            project_dir = s.get("project_dir") or ""
+            try:
+                project_name = Path(project_dir).name if project_dir else "main"
+            except Exception:
+                project_name = "main"
             sessions_out.append({
-                "id": s.get("id"),
+                "id": sid,
                 "started_at": s.get("started_at"),
                 "last_activity_at": s.get("last_activity_at"),
                 "event_count": s.get("event_count", 0),
                 "preview": preview,
+                "project": project_name,
+                "user": s.get("user") or "",
+                "live": sid in live_ids,
             })
 
         return self._write_json(200, {"sessions": sessions_out})
