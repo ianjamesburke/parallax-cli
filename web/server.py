@@ -792,6 +792,11 @@ def _stream_parallax_subprocess(
     Common subprocess runner: spawn parallax, stream NDJSON events back to
     the session SSE channel, return a short summary string.
     """
+    # Run CLI subprocesses with the current (venv) interpreter so all installed
+    # deps (pyyaml, anthropic, etc.) are available — not the system python3 from
+    # the shebang line, which may be missing packages.
+    if cmd and not cmd[0].endswith("python3") and not cmd[0].endswith("python"):
+        cmd = [sys.executable] + cmd
     telemetry.record_event(session.id, "dispatch_start", {"cmd": " ".join(cmd[:3]), "label": label[:200]})
     session.broadcast("dispatch_event", {"phase": "starting", "text": label})
 
