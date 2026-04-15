@@ -2,6 +2,36 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-15 — [CHANGED] V2 command surface added to beta (generate, script, ingest, web)
+
+Added all V2 command groups alongside existing V1 commands — no breakage, addition only.
+V1 commands (`run`, `create`, `animate`, `voiceover`, `transcribe`, `align`, `chat`) remain
+for backward compat; retirement in V3 when V2 is proven stable.
+
+New commands:
+- `generate still|voice|video` — V2 image/audio/video generation group. `still` delegates
+  to existing Gemini path (real mode) or creates a real solid-color PNG via ffmpeg (TEST_MODE).
+  `voice` adapts `cmd_voiceover`. `video` is a stub pointing to fal.ai (not yet built).
+- `script write|rewrite` — write/rewrite scripts via Claude. TEST_MODE returns a deterministic
+  seed-based placeholder so tests are fully offline.
+- `ingest <path>` — transcription + index for video files. `--estimate` dry-runs cost projection
+  (zero API calls). Full WhisperX bulk ingest deferred — single-file path still via `transcribe`.
+- `web` — alias for `chat`. V2 name per spec.
+- `project list` — alias for `projects`. V2 subcommand name.
+- `manifest validate` — new op added to existing manifest command. Validates sequential
+  scene numbers, positive durations, resolution format, fps whitelist, missing stills.
+
+TEST_MODE improvement: `generate still` now writes real PNG files (ffmpeg solid-color) instead
+of the V1 `b"TEST_PLACEHOLDER"` bytes. Downstream `compose` can now actually run on TEST_MODE
+stills without ffmpeg choking on invalid image data.
+
+Two V2 e2e tests added to `test/test_cli.py`:
+- Mode 1: `generate still` — verifies real PNG header + manifest creation.
+- Mode 3: `script write --out` — verifies structured script file written.
+
+**Breaks if:** `parallax generate still "brief"` exits non-zero in TEST_MODE, or `parallax script
+write "brief" --out f.txt` exits non-zero in TEST_MODE — these are now covered by CI.
+
 ## 2026-04-14 — [DECISION] Instrumented logging + pricing table (beta)
 
 Every external provider call (Gemini image, ElevenLabs voiceover) now
