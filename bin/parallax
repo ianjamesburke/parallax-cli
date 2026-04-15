@@ -29,6 +29,13 @@ import time
 import uuid
 from pathlib import Path
 
+# Shared error-path helper. `fail(msg, where=..., exit_code=..., log=...)`
+# emits a structured error event, logs with traceback, prints to stderr,
+# and returns the exit code. Collapses every historical try/except ritual
+# in this module into a one-line return.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.cli_errors import fail  # noqa: E402
+
 PROJECTS_ROOT = Path.home() / "Documents" / "parallax-projects"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Bundled video-production scripts — parallax is self-contained.
@@ -155,11 +162,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             log.info("TEST_MODE: synthesizing placeholder clip")
             clips = [_synthesize_test_clip(cwd)]
         else:
-            print("[parallax] ERROR: no video files found in cwd, ./assets, or ./input", file=sys.stderr)
             print("           supported: " + ", ".join(VIDEO_EXTS), file=sys.stderr)
-            log.error("no video files found in cwd/assets/input")
-            emitter.emit("error", message="no video files found", where="cmd_run.find_clips")
-            return 2
+            return fail(
+                "no video files found in cwd, ./assets, or ./input",
+                where="cmd_run.find_clips", exit_code=2, log=log,
+            )
 
     # Non-interactive: auto-confirm any prompts that slip past TEST_MODE.
     import builtins
@@ -193,10 +200,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         hop.run_id = run_id
         result = hop.receive_job(job)
     except Exception as e:
-        log.exception("pipeline failed: %s", e)
-        emitter.emit("error", message=str(e), where="cmd_run.receive_job")
-        print(f"[parallax] ERROR: pipeline failed: {e}", file=sys.stderr)
-        return 1
+        return fail(f"pipeline failed: {e}", where="cmd_run.receive_job", log=log)
 
     status = result.get("status", "unknown")
     print(f"[parallax] status: {status}")
@@ -428,18 +432,16 @@ def cmd_create(args: argparse.Namespace) -> int:
         from google import genai
         from google.genai import types as genai_types
     except ImportError as e:
-        log.exception("missing dependency")
-        emitter.emit("error", message=f"missing dependency: {e}", where="cmd_create.import")
-        print(f"[parallax] ERROR: missing dependency: {e}", file=sys.stderr)
         print("           install: pip install google-genai", file=sys.stderr)
-        return 1
+        return fail(f"missing dependency: {e}", where="cmd_create.import",
+                    exit_code=2, log=log)
 
     key = get_gemini_key()
     if not key:
-        print(f"[parallax] ERROR: no Gemini API key found.", file=sys.stderr)
-        print(f"           set AI_VIDEO_GEMINI_KEY or GEMINI_API_KEY in your environment.", file=sys.stderr)
-        print(f"           export AI_VIDEO_GEMINI_KEY=\"your-key-here\"", file=sys.stderr)
-        return 1
+        print("           set AI_VIDEO_GEMINI_KEY or GEMINI_API_KEY in your environment.", file=sys.stderr)
+        print('           export AI_VIDEO_GEMINI_KEY="your-key-here"', file=sys.stderr)
+        return fail("no Gemini API key found", where="cmd_create.no_key",
+                    exit_code=2, log=log)
 
     # stills/ at the project root — this is where the Plexi viewer reads from
     stills_dir = cwd / "stills"
@@ -545,10 +547,7 @@ def cmd_create(args: argparse.Namespace) -> int:
             print(f"ERROR: {e}", file=sys.stderr)
 
     if not generated_names:
-        log.error("no images generated")
-        emitter.emit("error", message="no images generated", where="cmd_create")
-        print("[parallax] ERROR: no images generated", file=sys.stderr)
-        return 1
+        return fail("no images generated", where="cmd_create.empty", log=log)
 
     # Manifest uses paths relative to cwd — portable across machines
     manifest_path = cwd / "manifest.yaml"
@@ -694,17 +693,15 @@ def cmd_animate(args) -> int:
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
-                log.error("ffmpeg concat failed rc=%s", result.returncode)
-                emitter.emit("error", message=f"ffmpeg concat failed rc={result.returncode}", where="cmd_animate.assembly")
                 print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"ffmpeg concat failed rc={result.returncode}",
+                    where="cmd_animate.assembly", log=log,
+                )
             print("done")
             emitter.emit("assembly_complete", output_path=str(output_path))
         except Exception as e:
-            log.exception("assembly failed")
-            emitter.emit("error", message=str(e), where="cmd_animate.assembly")
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
+            return fail(f"assembly failed: {e}", where="cmd_animate.assembly", log=log)
 
     # Update manifest with output video path
     if manifest_path.exists():
@@ -828,10 +825,8 @@ def cmd_transcribe(args) -> int:
         audio_path = cwd / "audio" / "voiceover.mp3"
 
     if not audio_path.exists():
-        msg = f"audio not found: {audio_path}"
-        emitter.emit("error", message=msg, where="cmd_transcribe.no_audio")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(f"audio not found: {audio_path}",
+                    where="cmd_transcribe.no_audio", exit_code=2)
 
     language = getattr(args, "language", "en") or "en"
     model = getattr(args, "model", "base.en") or "base.en"
@@ -839,18 +834,12 @@ def cmd_transcribe(args) -> int:
     try:
         transcript, words = _whisperx_transcribe(audio_path, language=language, model=model)
     except ImportError as e:
-        msg = (
-            f"whisperx is not installed: {e}\n"
-            f"           parallax transcription REQUIRES whisperx — there is no fallback.\n"
-            f"           Install with: pip install whisperx"
-        )
-        emitter.emit("error", message=str(e), where="cmd_transcribe.no_whisperx")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        print("           parallax transcription REQUIRES whisperx — no fallback.", file=sys.stderr)
+        print("           Install with: pip install whisperx", file=sys.stderr)
+        return fail(f"whisperx is not installed: {e}",
+                    where="cmd_transcribe.no_whisperx", exit_code=2)
     except Exception as e:
-        emitter.emit("error", message=str(e), where="cmd_transcribe.whisperx_failed")
-        print(f"[parallax] ERROR: whisperx failed: {e}", file=sys.stderr)
-        return 1
+        return fail(f"whisperx failed: {e}", where="cmd_transcribe.whisperx_failed")
 
     # Probe duration
     import subprocess as _sp
@@ -972,10 +961,8 @@ def cmd_voiceover(args) -> int:
 
     manifest_path = cwd / "manifest.yaml"
     if not manifest_path.exists():
-        msg = f"manifest not found: {manifest_path}"
-        emitter.emit("error", message=msg, where="cmd_voiceover.no_manifest")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(f"manifest not found: {manifest_path}",
+                    where="cmd_voiceover.no_manifest", exit_code=2)
 
     import yaml as _yaml
     with open(manifest_path) as f:
@@ -988,8 +975,8 @@ def cmd_voiceover(args) -> int:
         try:
             spec = json.loads(raw)
         except Exception as e:
-            print(f"[parallax] ERROR: --stdin expects JSON: {e}", file=sys.stderr)
-            return 1
+            return fail(f"--stdin expects JSON: {e}",
+                        where="cmd_voiceover.stdin", exit_code=3)
     voice_input = spec.get("voice") or getattr(args, "voice", None)
     model_id = spec.get("model_id") or getattr(args, "model_id", None) or "eleven_v3"
     script_override = spec.get("script")
@@ -1007,12 +994,12 @@ def cmd_voiceover(args) -> int:
         script_text = " ".join(vo_chunks).strip()
 
     if not script_text:
-        msg = ("no script text — set vo_text on each scene via "
-               "`parallax manifest set-vo <scene> \"<text>\"` or pass "
-               "{\"script\": \"...\"} via --stdin")
-        emitter.emit("error", message=msg, where="cmd_voiceover.no_text")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(
+            'no script text — set vo_text on each scene via '
+            '`parallax manifest set-vo <scene> "<text>"` or pass '
+            '{"script": "..."} via --stdin',
+            where="cmd_voiceover.no_text", exit_code=3,
+        )
 
     # Resolve voice — override > manifest.voice > george default
     if not voice_input:
@@ -1053,20 +1040,16 @@ def cmd_voiceover(args) -> int:
             _sp.run(["say", "-o", str(aiff_path), script_text],
                     check=True, capture_output=True, text=True, timeout=120)
         except Exception as e:
-            msg = f"macOS say failed: {e}"
-            emitter.emit("error", message=msg, where="cmd_voiceover.test_mode.say")
-            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-            return 1
+            return fail(f"macOS say failed: {e}",
+                        where="cmd_voiceover.test_mode.say", log=log)
         try:
             _sp.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                      "-i", str(aiff_path),
                      "-codec:a", "libmp3lame", "-qscale:a", "2", str(audio_path)],
                     check=True, capture_output=True, text=True, timeout=120)
         except Exception as e:
-            msg = f"ffmpeg aiff->mp3 failed: {e}"
-            emitter.emit("error", message=msg, where="cmd_voiceover.test_mode.ffmpeg")
-            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-            return 1
+            return fail(f"ffmpeg aiff->mp3 failed: {e}",
+                        where="cmd_voiceover.test_mode.ffmpeg", log=log)
         try:
             aiff_path.unlink()
         except Exception:
@@ -1136,23 +1119,20 @@ def cmd_voiceover(args) -> int:
         from elevenlabs.client import ElevenLabs
         from elevenlabs.types import VoiceSettings
     except ImportError as e:
-        msg = f"elevenlabs not installed: {e}. Run: pip install elevenlabs"
-        emitter.emit("error", message=msg, where="cmd_voiceover.import")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(f"elevenlabs not installed: {e}. Run: pip install elevenlabs",
+                    where="cmd_voiceover.import", exit_code=2, log=log)
     try:
         from api_config import get_elevenlabs_key
     except ImportError as e:
-        emitter.emit("error", message=str(e), where="cmd_voiceover.api_config")
-        print(f"[parallax] ERROR: api_config import failed: {e}", file=sys.stderr)
-        return 1
+        return fail(f"api_config import failed: {e}",
+                    where="cmd_voiceover.api_config", exit_code=2, log=log)
 
     key = get_elevenlabs_key()
     if not key:
-        msg = "no ElevenLabs API key. Set ELEVENLABS_API_KEY or AI_VIDEO_ELEVENLABS_KEY."
-        emitter.emit("error", message=msg, where="cmd_voiceover.no_key")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(
+            "no ElevenLabs API key. Set ELEVENLABS_API_KEY or AI_VIDEO_ELEVENLABS_KEY.",
+            where="cmd_voiceover.no_key", exit_code=2,
+        )
 
     audio_dir = cwd / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -1180,10 +1160,9 @@ def cmd_voiceover(args) -> int:
         )
         audio_bytes = b"".join(audio_iter)
     except Exception as e:
-        msg = f"ElevenLabs call failed: {e}"
-        emitter.emit("error", message=msg, where="cmd_voiceover.api_call")
-        print(f"FAILED\n[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        print("FAILED", file=sys.stderr)
+        return fail(f"ElevenLabs call failed: {e}",
+                    where="cmd_voiceover.api_call", log=log)
 
     audio_path.write_bytes(audio_bytes)
     print(f"done ({len(audio_bytes):,} bytes)")
@@ -1213,18 +1192,14 @@ def cmd_voiceover(args) -> int:
         try:
             transcript, words = _whisperx_transcribe(audio_path)
         except ImportError as e:
-            print(
-                f"[parallax] ERROR: whisperx not installed — install with: pip install whisperx\n"
-                f"           parallax has NO transcription fallback. WhisperX is required.\n"
-                f"           ({e})",
-                file=sys.stderr,
-            )
-            emitter.emit("error", message="whisperx missing", where="cmd_voiceover.transcribe")
-            return 1
+            print("           install with: pip install whisperx", file=sys.stderr)
+            print("           parallax has NO transcription fallback — whisperx is required.",
+                  file=sys.stderr)
+            return fail(f"whisperx not installed: {e}",
+                        where="cmd_voiceover.transcribe", exit_code=2)
         except Exception as e:
-            print(f"[parallax] ERROR: whisperx failed: {e}", file=sys.stderr)
-            emitter.emit("error", message=str(e), where="cmd_voiceover.transcribe")
-            return 1
+            return fail(f"whisperx failed: {e}",
+                        where="cmd_voiceover.transcribe", log=log)
 
         # Probe duration via ffprobe
         import subprocess as _sp
@@ -1315,10 +1290,10 @@ def cmd_trim_silence(args) -> int:
     audio_path = cwd / "audio" / "voiceover.mp3"
     vo_manifest_path = cwd / "audio" / "vo_manifest.json"
     if not audio_path.exists():
-        msg = f"voiceover not found at {audio_path} — run `parallax voiceover` first"
-        emitter.emit("error", message=msg, where="cmd_trim_silence.missing_audio")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(
+            f"voiceover not found at {audio_path} — run `parallax voiceover` first",
+            where="cmd_trim_silence.missing_audio", exit_code=2,
+        )
 
     import subprocess as _sp
     import re as _re
@@ -1335,8 +1310,8 @@ def cmd_trim_silence(args) -> int:
         )
         original_dur = float(json.loads(probe.stdout)["format"]["duration"])
     except Exception as e:
-        print(f"[parallax] ERROR: ffprobe failed: {e}", file=sys.stderr)
-        return 1
+        return fail(f"ffprobe failed: {e}",
+                    where="cmd_trim_silence.ffprobe")
 
     print(f"[parallax] detecting silences (>{MIN_SILENCE}s, <{THRESHOLD_DB}dB)...", end=" ", flush=True)
     detect = _sp.run(
@@ -1398,9 +1373,7 @@ def cmd_trim_silence(args) -> int:
         )
         if result.returncode != 0 or not out_path.exists():
             msg = (result.stderr or "ffmpeg trim failed").strip()[-500:]
-            emitter.emit("error", message=msg, where="cmd_trim_silence.ffmpeg")
-            print(f"[parallax] ERROR: ffmpeg failed\n{msg}", file=sys.stderr)
-            return 1
+            return fail(msg, where="cmd_trim_silence.ffmpeg")
 
         # Replace the original
         out_path.replace(audio_path)
@@ -1509,16 +1482,13 @@ def cmd_align(args) -> int:
     manifest_path = cwd / "manifest.yaml"
     vo_manifest_path = cwd / "audio" / "vo_manifest.json"
     if not manifest_path.exists():
-        msg = f"manifest not found: {manifest_path}"
-        emitter.emit("error", message=msg, where="cmd_align.no_manifest")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(f"manifest not found: {manifest_path}",
+                    where="cmd_align.no_manifest", exit_code=2)
     if not vo_manifest_path.exists():
-        msg = (f"vo_manifest not found at {vo_manifest_path} — "
-               f"run `parallax voiceover` first")
-        emitter.emit("error", message=msg, where="cmd_align.no_vo_manifest")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(
+            f"vo_manifest not found at {vo_manifest_path} — run `parallax voiceover` first",
+            where="cmd_align.no_vo_manifest", exit_code=2,
+        )
 
     import yaml as _yaml
     with open(manifest_path) as f:
@@ -1657,27 +1627,25 @@ def cmd_compose(args) -> int:
 
     manifest_path = cwd / "manifest.yaml"
     if not manifest_path.exists():
-        msg = f"manifest not found: {manifest_path}"
-        emitter.emit("error", message=msg, where="cmd_compose.read_manifest")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        print(f"           run `parallax create` first or write a manifest.yaml", file=sys.stderr)
-        return 1
+        print("           run `parallax create` first or write a manifest.yaml",
+              file=sys.stderr)
+        return fail(f"manifest not found: {manifest_path}",
+                    where="cmd_compose.read_manifest", exit_code=2)
 
     try:
         import yaml as _yaml
         with open(manifest_path) as f:
             manifest = _yaml.safe_load(f) or {}
     except Exception as e:
-        emitter.emit("error", message=str(e), where="cmd_compose.parse_manifest")
-        print(f"[parallax] ERROR: failed to parse manifest: {e}", file=sys.stderr)
-        return 1
+        return fail(f"failed to parse manifest: {e}",
+                    where="cmd_compose.parse_manifest", log=log)
 
     scenes = manifest.get("scenes") or []
     if not scenes:
-        msg = "manifest has no scenes — add a `scenes:` list with `still` and `duration` per entry"
-        emitter.emit("error", message=msg, where="cmd_compose.no_scenes")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(
+            "manifest has no scenes — add a `scenes:` list with `still` and `duration` per entry",
+            where="cmd_compose.no_scenes", exit_code=3,
+        )
 
     default_motion = manifest.get("output_motion") or "zoom_drift_right"
     resolution = manifest.get("output_resolution") or "1080x1920"
@@ -1696,26 +1664,24 @@ def cmd_compose(args) -> int:
     resolved_scenes = []
     for i, scene in enumerate(scenes, 1):
         if not isinstance(scene, dict):
-            msg = f"scene {i}: must be a mapping"
-            emitter.emit("error", message=msg, where="cmd_compose.validate")
-            print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-            return 1
+            return fail(f"scene {i}: must be a mapping",
+                        where="cmd_compose.validate", exit_code=3)
 
         scene_type = scene.get("type") or ("video" if scene.get("source") else "still")
 
         if scene_type == "video":
             source_rel = scene.get("source") or scene.get("video")
             if not source_rel:
-                msg = f"scene {i}: video scene requires `source` (path to mp4/mov)"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"scene {i}: video scene requires `source` (path to mp4/mov)",
+                    where="cmd_compose.validate", exit_code=3,
+                )
             source_path = (cwd / source_rel).resolve()
             if not source_path.exists():
-                msg = f"scene {i}: video source not found: {source_rel}"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"scene {i}: video source not found: {source_rel}",
+                    where="cmd_compose.validate", exit_code=2,
+                )
             start_s = scene.get("start_s")
             end_s = scene.get("end_s")
             duration = scene.get("duration")
@@ -1724,9 +1690,10 @@ def cmd_compose(args) -> int:
                 if end_s is not None: end_s = float(end_s)
                 if duration is not None: duration = float(duration)
             except (TypeError, ValueError):
-                msg = f"scene {i}: start_s/end_s/duration must be numbers"
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"scene {i}: start_s/end_s/duration must be numbers",
+                    where="cmd_compose.validate", exit_code=3,
+                )
             # Compute effective duration: prefer explicit, else end_s-start_s, else full clip
             if duration is None and start_s is not None and end_s is not None:
                 duration = end_s - start_s
@@ -1743,35 +1710,29 @@ def cmd_compose(args) -> int:
             # still scene
             still_rel = scene.get("still")
             if not still_rel:
-                msg = f"scene {i}: still scene requires `still` (path)"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(f"scene {i}: still scene requires `still` (path)",
+                            where="cmd_compose.validate", exit_code=3)
             still_path = (cwd / still_rel).resolve()
             if not still_path.exists():
-                msg = f"scene {i}: still not found: {still_rel}"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(f"scene {i}: still not found: {still_rel}",
+                            where="cmd_compose.validate", exit_code=2)
             duration = scene.get("duration")
             if duration is None:
-                msg = f"scene {i}: still scene requires `duration`"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(f"scene {i}: still scene requires `duration`",
+                            where="cmd_compose.validate", exit_code=3)
             try:
                 duration = float(duration)
             except (TypeError, ValueError):
-                msg = f"scene {i}: duration must be a number, got {duration!r}"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"scene {i}: duration must be a number, got {duration!r}",
+                    where="cmd_compose.validate", exit_code=3,
+                )
             motion = scene.get("motion") or default_motion
             if motion not in valid_motions:
-                msg = f"scene {i}: invalid motion {motion!r}. Valid: {sorted(valid_motions)}"
-                emitter.emit("error", message=msg, where="cmd_compose.validate")
-                print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-                return 1
+                return fail(
+                    f"scene {i}: invalid motion {motion!r}. Valid: {sorted(valid_motions)}",
+                    where="cmd_compose.validate", exit_code=3,
+                )
             resolved_scenes.append({
                 "index": i,
                 "type": "still",
@@ -1788,10 +1749,8 @@ def cmd_compose(args) -> int:
 
     ken_burns_script = BUNDLED_SCRIPTS / "ken-burns.py"
     if not ken_burns_script.exists():
-        msg = f"ken-burns.py not found at {ken_burns_script}"
-        emitter.emit("error", message=msg, where="cmd_compose.script_missing")
-        print(f"[parallax] ERROR: {msg}", file=sys.stderr)
-        return 1
+        return fail(f"ken-burns.py not found at {ken_burns_script}",
+                    where="cmd_compose.script_missing", exit_code=2)
 
     output_dir = cwd / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1825,9 +1784,8 @@ def cmd_compose(args) -> int:
                     )
                     if result.returncode != 0:
                         print(f"FAILED\n{result.stderr.strip()}", file=sys.stderr)
-                        emitter.emit("error", message=f"ken-burns failed for scene {scene['index']}",
-                                     where="cmd_compose.ken_burns")
-                        return 1
+                        return fail(f"ken-burns failed for scene {scene['index']}",
+                                    where="cmd_compose.ken_burns", log=log)
                 else:
                     # video scene: trim + scale + pad to target resolution
                     if scene.get("start_s") is not None:
@@ -1862,16 +1820,14 @@ def cmd_compose(args) -> int:
                     result = _sp.run(cmd, capture_output=True, text=True, timeout=300)
                     if result.returncode != 0:
                         print(f"FAILED\n{result.stderr.strip()[-500:]}", file=sys.stderr)
-                        emitter.emit("error", message=f"video scene {scene['index']} failed",
-                                     where="cmd_compose.video_scene")
-                        return 1
+                        return fail(f"video scene {scene['index']} failed",
+                                    where="cmd_compose.video_scene", log=log)
                 clip_paths.append(str(clip_path))
                 emitter.emit("still_generated", path=str(clip_path), scene=scene["index"])
                 print("done")
             except Exception as e:
-                emitter.emit("error", message=str(e), where=f"cmd_compose.scene_{scene['index']}")
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 1
+                return fail(str(e),
+                            where=f"cmd_compose.scene_{scene['index']}", log=log)
 
         from core.project_layout import next_version, update_latest_symlink
         version = next_version(cwd, concept_id)
@@ -1890,15 +1846,12 @@ def cmd_compose(args) -> int:
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
-                emitter.emit("error", message=f"ffmpeg concat failed rc={result.returncode}",
-                             where="cmd_compose.assembly")
                 print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
-                return 1
+                return fail(f"ffmpeg concat failed rc={result.returncode}",
+                            where="cmd_compose.assembly", log=log)
             print("done")
         except Exception as e:
-            emitter.emit("error", message=str(e), where="cmd_compose.assembly")
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
+            return fail(str(e), where="cmd_compose.assembly", log=log)
 
         # ── Audio mux ────────────────────────────────────────────────────────
         # If manifest.voiceover.audio_file exists, mux it into the silent video.
@@ -1919,23 +1872,18 @@ def cmd_compose(args) -> int:
                     capture_output=True, text=True, timeout=300,
                 )
                 if result.returncode != 0:
-                    emitter.emit("error", message=f"ffmpeg mux failed rc={result.returncode}",
-                                 where="cmd_compose.mux")
                     print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
-                    return 1
+                    return fail(f"ffmpeg mux failed rc={result.returncode}",
+                                where="cmd_compose.mux", log=log)
                 print("done")
                 emitter.emit("audio_muxed", audio_file=vo_rel, output_path=str(output_path))
             except Exception as e:
-                emitter.emit("error", message=str(e), where="cmd_compose.mux")
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 1
+                return fail(str(e), where="cmd_compose.mux", log=log)
         else:
             try:
                 _sp.run(["cp", str(silent_path), str(output_path)], check=True)
             except Exception as e:
-                emitter.emit("error", message=str(e), where="cmd_compose.copy")
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 1
+                return fail(str(e), where="cmd_compose.copy", log=log)
 
         # ── Headline overlay ─────────────────────────────────────────────────
         # If manifest.headline is set, generate a PNG via generate-caption.py
