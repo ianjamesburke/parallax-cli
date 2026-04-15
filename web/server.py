@@ -143,16 +143,26 @@ PROJECT_DIR = Path(os.environ.get("PARALLAX_PROJECT_DIR", os.getcwd())).resolve(
 STATIC_DIR = _HERE / "static"
 HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
 
-# Beta always runs with per-user workspaces — every user lives in
-# PROJECT_DIR/parallax/users/<user>/<project>/ regardless of password or
-# network accessibility. Raw media at PROJECT_DIR (the "master dir") is
-# still readable across users and projects via _resolve_project_path.
-# PARALLAX_SINGLE_USER=1 is the only escape hatch, kept for emergencies.
-PER_USER_WORKSPACES = not bool(os.environ.get("PARALLAX_SINGLE_USER"))
+# Per-user workspaces are off by default — a local dev run collapses to
+# PROJECT_DIR/parallax/<project>/ with no users/<name>/ nesting, which is
+# the simple case and matches the single-operator office-computer
+# deployment. Flip on explicitly for multi-user scenarios via
+# PARALLAX_PER_USER_WORKSPACES=1, or implicitly when the server is
+# network-accessible (PARALLAX_WEB_HOST) or password-protected.
+_network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
+PER_USER_WORKSPACES = (
+    not bool(os.environ.get("PARALLAX_SINGLE_USER"))
+    and (
+        bool(os.environ.get("PARALLAX_PER_USER_WORKSPACES"))
+        or bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
+        or _network_accessible
+    )
+)
 
 # Top-level folder that scopes every parallax-managed directory under
 # PROJECT_DIR. Previously this was the hidden `.parallax/` sibling; in beta
-# it's a visible `parallax/` sibling that holds users/<user>/<project>/.
+# it's a visible `parallax/` sibling that holds <project>/ subdirs (or
+# users/<user>/<project>/ when PER_USER_WORKSPACES is on).
 WORKSPACE_ROOT_NAME = "parallax"
 
 
@@ -398,6 +408,24 @@ class Session:
         # tool calls can auto-inject them even if Claude forgets to set the
         # `ref` arg. Cleared when the user explicitly deselects refs.
         self.selected_refs: list[str] = []
+        # Hydrate this session's Anthropic `messages` list from the
+        # project's on-disk chat.jsonl so a page reload keeps conversational
+        # context. Without this, every new tab would talk to Claude with a
+        # blank history even though the chat transcript is right there on
+        # disk.
+        try:
+            self._hydrate_from_chat_log()
+        except Exception as e:
+            print(f"session hydrate failed: {e}", file=sys.stderr, flush=True)
+        # Build the display_log too so /api/session history endpoints stay
+        # useful as a fallback, but the frontend now reads /api/chat directly
+        # for replay — this is just backfill.
+        for turn in (_load_chat_history(self.workspace) or []):
+            self.display_log.append({
+                "kind": f"{turn.get('role', 'user')}_message" if turn.get("role") == "user" else "assistant_text",
+                "data": {"text": turn.get("text") or ""},
+                "ts": turn.get("ts") or time.time(),
+            })
         telemetry.create_session(session_id, str(self.workspace), MODEL, user=self.user)
 
     # ---- SSE fan-out ------------------------------------------------------
@@ -428,6 +456,29 @@ class Session:
 
     def push_display(self, kind: str, data: Any) -> None:
         self.display_log.append({"kind": kind, "data": data, "ts": time.time()})
+
+    # ---- chat.jsonl hydration --------------------------------------------
+
+    def _hydrate_from_chat_log(self) -> None:
+        """
+        Load the project's on-disk chat.jsonl into `self.messages` so the
+        very first /api/message POST in a freshly-opened session already
+        has the full project history as context. Only text turns are
+        loaded; tool calls aren't replayed since they're stored in the
+        per-session telemetry, not chat.jsonl.
+        """
+        turns = _load_chat_history(self.workspace)
+        if not turns:
+            return
+        for turn in turns:
+            role = turn.get("role")
+            text = turn.get("text") or ""
+            if not text or role not in ("user", "assistant"):
+                continue
+            self.messages.append({
+                "role": role,
+                "content": [{"type": "text", "text": text}],
+            })
 
 
 SESSIONS: dict[str, Session] = {}
@@ -1407,6 +1458,54 @@ def _execute_tool_calls(
     return results
 
 
+def _chat_log_path(workspace: Path) -> Path:
+    """`<workspace>/chat.jsonl` — one append-only chat transcript per project."""
+    return workspace / "chat.jsonl"
+
+
+def _append_chat_turn(workspace: Path, role: str, text: str) -> None:
+    """
+    Append one chat turn to the project's chat.jsonl. Per-project, append
+    only, best-effort. Each line is `{"role", "text", "ts"}`. Used for
+    reload persistence — tool calls and dispatch events are deliberately
+    NOT logged here, only the human-readable user/assistant turns.
+    """
+    if not text:
+        return
+    try:
+        path = _chat_log_path(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"role": role, "text": text, "ts": time.time()},
+            ensure_ascii=False,
+        ) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"chat.jsonl write failed: {e}", file=sys.stderr, flush=True)
+
+
+def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
+    """Read `<workspace>/chat.jsonl` into a list of turn dicts. [] if missing."""
+    path = _chat_log_path(workspace)
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    out.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"chat.jsonl read failed: {e}", file=sys.stderr, flush=True)
+    return out
+
+
 def run_agent_turn(session: Session, user_text: str) -> None:
     """Agent loop body — runs in a background thread per POST /api/message."""
     try:
@@ -1422,6 +1521,8 @@ def run_agent_turn(session: Session, user_text: str) -> None:
     session.messages.append({"role": "user", "content": user_content})
     session.push_display("user_message", {"text": user_text})
     telemetry.record_event(session.id, "user_message", {"text": user_text})
+    # Persist to project-scoped chat.jsonl so a reload keeps the convo.
+    _append_chat_turn(session.workspace, "user", user_text)
 
     hop_prompt = _load_hop_prompt()
 
@@ -1486,6 +1587,7 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             telemetry.record_event(
                 session.id, "assistant_text", {"text": joined}
             )
+            _append_chat_turn(session.workspace, "assistant", joined)
 
         # Update tokens + cost in telemetry.
         try:
@@ -1813,6 +1915,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/servers":
             return self._write_json(200, {"servers": registry.list_servers()})
+
+        if path == "/api/chat":
+            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
+            return self._write_json(200, {
+                "workspace": str(workspace),
+                "project": workspace.name,
+                "turns": _load_chat_history(workspace),
+            })
 
         if path.startswith("/api/session/") and path.endswith("/history"):
             sid = path[len("/api/session/"):-len("/history")]

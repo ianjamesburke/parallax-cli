@@ -10,10 +10,15 @@ Fast — no LLM calls, no TEST MODE pipeline. Just the HTML/JSON contract.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# Force per-user layout on so the seeded workspace lands under
+# parallax/users/<u>/<p>/ — matches what the test expects.
+os.environ["PARALLAX_PER_USER_WORKSPACES"] = "1"
 
 from playwright.sync_api import sync_playwright
 

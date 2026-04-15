@@ -54,21 +54,27 @@ def main() -> int:
             video = wait_for_output_video(SCRATCH_DIR, timeout_s=420.0)
             print(f"[test] OK: video produced -> {video} ({video.stat().st_size:,} bytes)")
 
-            # Layout assertions — the new nested workspace must exist and
-            # the master dir root must stay clean (only parallax/ + the
-            # screenshot that lands there after this block).
+            # Default single-user layout assertions — the flat workspace
+            # must exist at parallax/main/ and the master dir root must
+            # stay clean (only parallax/ + the test screenshot). The
+            # layout_e2e test covers the per-user nested variant.
             rel = video.relative_to(SCRATCH_DIR)
             parts = rel.parts
             assert parts[0] == "parallax", f"video not under parallax/: {rel}"
-            assert parts[1] == "users", f"video not under users/: {rel}"
-            assert parts[3] == "main", f"project should be 'main': {rel}"
-            assert parts[4] == "output", f"fourth dir should be output/: {rel}"
-            print(f"[test] layout OK: {'/'.join(parts[:5])}/")
+            assert parts[1] == "main", f"project should be 'main': {rel}"
+            assert parts[2] == "output", f"third dir should be output/: {rel}"
+            print(f"[test] layout OK: {'/'.join(parts[:3])}/")
 
             workspace = video.parent.parent
             for sub in ("stills", "input", "output", "drafts", "audio", "logs"):
                 assert (workspace / sub).is_dir(), f"missing workspace subdir: {sub}"
+            # Chat transcript should be on disk since we sent a real message.
+            chat_log = workspace / "chat.jsonl"
+            assert chat_log.is_file(), f"chat.jsonl missing at {chat_log}"
+            chat_bytes = chat_log.stat().st_size
+            assert chat_bytes > 0, f"chat.jsonl empty"
             print(f"[test] workspace scaffold OK: {workspace}")
+            print(f"[test] chat.jsonl persisted: {chat_bytes:,} bytes")
 
             shot = SCRATCH_DIR / "baseline_final.png"
             page.screenshot(path=str(shot), full_page=True)

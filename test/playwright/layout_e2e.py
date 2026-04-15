@@ -27,6 +27,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -42,6 +43,11 @@ if str(_HERE) not in sys.path:
 from _helpers import start_server, stop_server  # noqa: E402
 
 SCRATCH_DIR = Path("/tmp/parallax-beta-e2e-layout")
+
+# Flip the per-user layout on for this test specifically — the default
+# changed to opt-in, but layout_e2e is the regression gate for the users/
+# nesting, so we force it on via the env var.
+os.environ["PARALLAX_PER_USER_WORKSPACES"] = "1"
 
 
 def _get(url: str) -> tuple[int, bytes]:

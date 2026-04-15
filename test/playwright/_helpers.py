@@ -40,6 +40,9 @@ def start_server(scratch_dir: Path) -> tuple[subprocess.Popen, str]:
     env = os.environ.copy()
     env["PARALLAX_WEB_NO_BROWSER"] = "1"
     env["PARALLAX_SKIP_CLARIFICATIONS"] = "1"
+    # Default to single-user layout for tests. Opt-in via PARALLAX_PER_USER_WORKSPACES
+    # for the layout_e2e test that specifically asserts nested users/ dirs.
+    env.setdefault("PARALLAX_PER_USER_WORKSPACES", "")
     # Force the parallax_web child to emit stdout unbuffered, otherwise its
     # "parallax-web: url = ..." line sits in a 4KB pipe buffer forever and
     # this helper hangs waiting for a URL that never arrives.

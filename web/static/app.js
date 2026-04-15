@@ -125,17 +125,49 @@ function appendToolResult(ev) {
   scrollToBottom();
 }
 
+// Event-kind noise filter: by default, only terminal phases (done / error)
+// land in the chat as a strip. Everything in between (starting, run_started,
+// request_intended, cost_estimated, still_generated, etc.) updates the
+// status bar at the top but doesn't spam the chat. Toggle verbose mode via
+// localStorage.parallax_debug = "1" in devtools when you actually want to
+// see every event.
+function _debugDispatchEnabled() {
+  try {
+    return localStorage.getItem("parallax_debug") === "1";
+  } catch (_) { return false; }
+}
+
+// Phases we'll always surface as a chat strip — the rest are treated as
+// status-only updates.
+const DISPATCH_CHAT_PHASES = new Set(["done", "error", "starting"]);
+
 function appendDispatchEvent(ev) {
+  const phase = ev.phase || "";
+  const isTerminal = phase === "done" || phase === "error";
+
+  // Always keep the status side-effects — the top status bar should still
+  // reflect that something is dispatching.
+  if (isTerminal) {
+    state.dispatchActive = false;
+    refreshGallery();
+  } else {
+    state.dispatchActive = true;
+    setStatus("dispatching");
+  }
+
+  // Decide whether to render the strip into the chat.
+  const shouldRender = _debugDispatchEnabled() || DISPATCH_CHAT_PHASES.has(phase);
+  if (!shouldRender) return;
+
+  hideWelcome();
   const el = document.createElement("div");
   el.className = "dispatch-strip";
-  if (ev.phase === "done") el.classList.add("done");
-  if (ev.phase === "error") el.classList.add("error");
+  if (phase === "done") el.classList.add("done");
+  if (phase === "error") el.classList.add("error");
 
-  // Clean label: no [parallax] prefix, and a single leading dot character
-  // for the active state, a check for done, X for error.
   let marker = "·";
-  if (ev.phase === "done") marker = "✓";
-  if (ev.phase === "error") marker = "!";
+  if (phase === "done") marker = "✓";
+  if (phase === "error") marker = "!";
 
   const markerEl = document.createElement("span");
   markerEl.className = "dispatch-marker";
@@ -144,18 +176,11 @@ function appendDispatchEvent(ev) {
 
   const textEl = document.createElement("span");
   textEl.className = "dispatch-text";
-  textEl.textContent = ev.text || ev.phase || "";
+  textEl.textContent = ev.text || phase;
   el.appendChild(textEl);
 
   messagesEl().appendChild(el);
   scrollToBottom();
-  if (ev.phase === "done" || ev.phase === "error") {
-    state.dispatchActive = false;
-    refreshGallery();
-  } else {
-    state.dispatchActive = true;
-    setStatus("dispatching");
-  }
 }
 
 function appendError(message) {
@@ -223,8 +248,12 @@ function openStream(sessionId) {
 
   es.addEventListener("agent_done", (e) => {
     finalizeAssistantMsg();
-    if (!state.dispatchActive) setStatus("");
+    // Hard clear every "something is running" flag. Previously we'd leave
+    // the thinking bar on whenever dispatchActive was still true from a
+    // stale prior run — that's the bug the user caught.
     state.thinking = false;
+    state.dispatchActive = false;
+    setStatus("");
     updateButtons();
     refreshGallery();
     refreshUsage();
@@ -543,11 +572,31 @@ function updateRefBar() {
   }
 }
 
-// ----- welcome hide --------------------------------------------------------
+// ----- welcome card --------------------------------------------------------
+
+const WELCOME_HTML = `
+  <div class="welcome" id="welcome">
+    <div class="welcome-title">Welcome to Parallax</div>
+    <div class="welcome-sub">A short-form video studio driven by natural language.</div>
+    <ul class="welcome-list">
+      <li><b>Brief the Head of Production.</b> Describe what you want — a 3-scene Ken Burns ad, a character study, a mood piece — and it handles stills, voiceover, pacing, and final render.</li>
+      <li><b>Upload reference images</b> via the gallery on the right. They're selected as references by default, so the next generation uses them image-to-image via Gemini.</li>
+      <li><b>Type "TEST MODE" anywhere in your brief</b> to run the full pipeline without spending API credits — placeholder stills + macOS voice.</li>
+      <li><b>Projects</b> live under <code>parallax/&lt;project&gt;/</code>. Create one via the <b>+</b> in the sidebar; files at the launch-dir root are shared across every project.</li>
+    </ul>
+  </div>`;
 
 function hideWelcome() {
   const w = $("welcome");
   if (w) w.remove();
+}
+
+function showWelcomeIfEmpty() {
+  const m = messagesEl();
+  // Only show if there's no prior content and no welcome already there.
+  if (m.children.length > 0 && $("welcome")) return;
+  if (m.children.length > 0) return;
+  m.insertAdjacentHTML("afterbegin", WELCOME_HTML);
 }
 
 // ----- lightbox ------------------------------------------------------------
@@ -620,33 +669,30 @@ function renderSidebar() {
   }
 
   list.innerHTML = "";
+  const currentProject = new URL(window.location.href).searchParams.get("project") || "main";
+
   for (const proj of merged) {
-    const projSessions = sessionsByProject[proj.name] || [];
-    const isActive = proj.name === activeProject;
+    const isActive = proj.name === currentProject;
 
-    const group = document.createElement("div");
-    group.className = "sidebar-group" + (isActive ? " open" : "");
-
-    // Project label row — click to expand/collapse, × to delete
-    const label = document.createElement("div");
-    label.className = "sidebar-group-label" + (isActive ? " active" : "");
+    // Flat project row — no nested sessions. One chat per project, loaded
+    // from <workspace>/chat.jsonl on click.
+    const row = document.createElement("div");
+    row.className = "sidebar-project-row" + (isActive ? " active" : "");
 
     const labelText = document.createElement("span");
-    labelText.className = "sidebar-group-label-text";
+    labelText.className = "sidebar-project-name";
     labelText.textContent = proj.name;
-    label.appendChild(labelText);
+    row.appendChild(labelText);
 
-    // Delete button — refuses to delete the active project or `main` to
-    // avoid locking the user out of their default workspace.
+    // Delete button — refuses to delete the active project or `main`.
     if (proj.name !== "main") {
       const del = document.createElement("button");
-      del.className = "sidebar-group-del";
+      del.className = "sidebar-project-del";
       del.title = "Delete project";
       del.textContent = "×";
       del.addEventListener("click", async (e) => {
         e.stopPropagation();
-        const current = new URL(window.location.href).searchParams.get("project") || "main";
-        if (proj.name === current) {
+        if (proj.name === currentProject) {
           appendError(
             `can't delete the active project "${proj.name}". Switch to another project first.`
           );
@@ -654,8 +700,8 @@ function renderSidebar() {
         }
         if (!window.confirm(
           `Delete project "${proj.name}"?\n\n` +
-          `This removes parallax/users/<you>/${proj.name}/ and every still, ` +
-          `voiceover, draft, output, and log inside it. ` +
+          `This removes parallax/${proj.name}/ and every still, voiceover, ` +
+          `draft, output, log, and chat transcript inside it. ` +
           `Raw media at the master dir is not touched.`
         )) return;
         try {
@@ -667,87 +713,83 @@ function renderSidebar() {
             appendError(`failed to delete project: ${err.error || r.statusText}`);
             return;
           }
-          if (sidebarState.activeProject === proj.name) {
-            sidebarState.activeProject = null;
-          }
           refreshSidebar();
         } catch (err) {
           appendError(`failed to delete project: ${err}`);
         }
       });
-      label.appendChild(del);
+      row.appendChild(del);
     }
 
-    label.addEventListener("click", () => {
-      if (sidebarState.activeProject === proj.name) {
-        sidebarState.activeProject = null;
+    // Click the row → switch project, update URL, reload chat.
+    row.addEventListener("click", async () => {
+      if (proj.name === currentProject) return;
+      const url = new URL(window.location.href);
+      if (proj.name === "main") {
+        url.searchParams.delete("project");
       } else {
-        sidebarState.activeProject = proj.name;
-        // Switch URL to this project so next message lands here
-        const url = new URL(window.location.href);
-        if (proj.name === "main") {
-          url.searchParams.delete("project");
-        } else {
-          url.searchParams.set("project", proj.name);
-        }
-        window.history.pushState({}, "", url);
-        refreshProjectBadge();
+        url.searchParams.set("project", proj.name);
       }
-      renderSidebar();
+      window.history.pushState({}, "", url);
+      refreshProjectBadge();
+      // Drop the in-memory session ID so the next message opens a fresh
+      // server-side session that hydrates from the new project's chat.jsonl.
+      state.sessionId = null;
+      state.thinking = false;
+      state.dispatchActive = false;
+      if (state.eventSource) {
+        try { state.eventSource.close(); } catch (_) {}
+        state.eventSource = null;
+      }
+      setStatus("");
+      updateButtons();
+      await loadProjectChat();
+      refreshSidebar();
+      refreshGallery();
     });
-    group.appendChild(label);
 
-    // Session list — only visible when project is expanded
-    if (isActive) {
-      if (projSessions.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "sidebar-item sidebar-item-empty";
-        empty.textContent = "No sessions yet.";
-        group.appendChild(empty);
-      }
-      for (const s of projSessions) {
-        const item = document.createElement("div");
-        item.className = "sidebar-item" + (s.id === state.sessionId ? " active" : "");
-        item.dataset.sid = s.id;
+    list.appendChild(row);
+  }
+}
 
-        const dot = document.createElement("span");
-        dot.className = "sidebar-item-dot" + (s.live ? " live" : "");
-        item.appendChild(dot);
+async function loadProjectChat() {
+  // Fetch the current workspace's chat.jsonl and replay it. Called on
+  // page load and on every sidebar project switch.
+  state.thinking = false;
+  state.dispatchActive = false;
+  setStatus("");
+  updateButtons();
+  messagesEl().innerHTML = "";
+  state.currentAssistantEl = null;
 
-        const text = document.createElement("span");
-        text.className = "sidebar-item-text";
-        text.textContent = s.preview || "(empty)";
-        item.appendChild(text);
+  const params = new URLSearchParams(window.location.search);
+  const qs = new URLSearchParams();
+  for (const k of ["user", "project"]) {
+    const v = params.get(k);
+    if (v) qs.set(k, v);
+  }
+  const url = "/api/chat" + (qs.toString() ? "?" + qs.toString() : "");
+  let data = { turns: [] };
+  try {
+    const r = await fetch(url);
+    if (r.ok) data = await r.json();
+  } catch (e) {
+    console.error("loadProjectChat failed", e);
+  }
 
-        const del = document.createElement("button");
-        del.className = "sidebar-item-del";
-        del.title = "Delete session";
-        del.textContent = "×";
-        del.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          try {
-            await fetch(`/api/session/${s.id}`, { method: "DELETE" });
-            if (state.sessionId === s.id) {
-              state.sessionId = null;
-              state.thinking = false;
-              state.dispatchActive = false;
-              setStatus("");
-              updateButtons();
-              messagesEl().innerHTML = "";
-            }
-            refreshSidebar();
-          } catch (err) {
-            console.error("delete session failed", err);
-          }
-        });
-        item.appendChild(del);
-
-        item.addEventListener("click", () => loadSessionHistory(s.id));
-        group.appendChild(item);
-      }
+  const turns = data.turns || [];
+  if (turns.length === 0) {
+    // Fresh / empty project — show the welcome card.
+    showWelcomeIfEmpty();
+    return;
+  }
+  for (const t of turns) {
+    if (t.role === "user") {
+      appendUserMsg(t.text || "");
+    } else if (t.role === "assistant") {
+      appendAssistantDelta(t.text || "");
+      finalizeAssistantMsg();
     }
-
-    list.appendChild(group);
   }
 }
 
@@ -968,15 +1010,23 @@ function initComposer() {
 }
 
 async function startNewSession() {
-  // Ask for a project name — this creates a real folder on disk (Drive-backed)
+  // + button creates a brand new project folder on disk and switches into
+  // it. The new project starts empty so the welcome card is visible on
+  // first load.
   const raw = window.prompt("Project name:", "");
   if (raw === null) return; // user cancelled
 
   const name = raw.trim().replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "") || "main";
 
-  // Create the folder on disk via the server
+  // URL query the server wants for ?user=/?project=.
+  const curParams = new URLSearchParams(window.location.search);
+  const qs = new URLSearchParams({ project: name });
+  const curUser = curParams.get("user");
+  if (curUser) qs.set("user", curUser);
+
+  // Create the folder on disk.
   try {
-    const r = await fetch("/api/projects", {
+    const r = await fetch("/api/projects?" + qs.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -991,7 +1041,7 @@ async function startNewSession() {
     return;
   }
 
-  // Update the URL so sessions land in this project
+  // Update the URL so subsequent messages land in this project.
   const url = new URL(window.location.href);
   if (name === "main") {
     url.searchParams.delete("project");
@@ -1001,10 +1051,7 @@ async function startNewSession() {
   window.history.pushState({}, "", url);
   refreshProjectBadge();
 
-  // Expand this project in the sidebar
-  sidebarState.activeProject = name;
-
-  // Clear the chat panel and drop the session ID — next send creates a fresh one
+  // Clear the chat panel and drop the session ID — next send creates a fresh one.
   state.sessionId = null;
   state.thinking = false;
   state.dispatchActive = false;
@@ -1015,10 +1062,29 @@ async function startNewSession() {
   setStatus("");
   updateButtons();
   messagesEl().innerHTML = "";
+  // Fresh project → show the welcome card in the new chat.
+  showWelcomeIfEmpty();
   $("composer-input").focus();
 
   // Refresh sidebar so the new folder appears
   refreshSidebar();
+  refreshGallery();
+}
+
+async function openProjectInFinder() {
+  try {
+    const r = await fetch("/api/open_in_finder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      appendError(`finder open failed: ${err.error || r.statusText}`);
+    }
+  } catch (e) {
+    appendError(`finder open failed: ${e}`);
+  }
 }
 
 function init() {
@@ -1028,6 +1094,12 @@ function init() {
   refreshGallery();
   refreshSidebar();
   refreshUsage();
+  // Load this project's on-disk chat transcript on page load so reload
+  // keeps the conversation. Empty transcript → welcome card.
+  loadProjectChat();
+  // Wire the new Finder button in the header.
+  const finderBtn = document.getElementById("finder-btn");
+  if (finderBtn) finderBtn.addEventListener("click", openProjectInFinder);
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
