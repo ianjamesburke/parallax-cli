@@ -2029,10 +2029,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._write_error(400, str(e))
             else:
                 target = workspace
+            # Refuse to launch Finder against a path that doesn't exist —
+            # `open` swallows the error and the user sees nothing.
+            if not target.exists():
+                return self._write_error(
+                    404, f"path does not exist: {target}",
+                )
             try:
-                subprocess.run(["open", str(target)], check=False)
+                result = subprocess.run(
+                    ["open", str(target)],
+                    capture_output=True, text=True, timeout=5,
+                )
             except Exception as e:
                 return self._write_error(500, f"open failed: {e}")
+            if result.returncode != 0:
+                err = (result.stderr or "").strip() or f"open exit {result.returncode}"
+                return self._write_error(500, f"open failed: {err}")
             return self._write_json(200, {"ok": True, "path": str(target)})
 
         self._write_error(404, f"not found: {path}")

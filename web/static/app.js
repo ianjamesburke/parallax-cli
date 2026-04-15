@@ -1045,8 +1045,18 @@ async function startNewSession() {
 }
 
 async function openProjectInFinder() {
+  // Forward ?user= / ?project= from the current URL so the server opens
+  // THIS tab's workspace, not the default "main". Without this the POST
+  // had no query string and every click opened `parallax/main/`.
+  const cur = new URLSearchParams(window.location.search);
+  const qs = new URLSearchParams();
+  for (const k of ["user", "project"]) {
+    const v = cur.get(k);
+    if (v) qs.set(k, v);
+  }
+  const url = "/api/open_in_finder" + (qs.toString() ? "?" + qs.toString() : "");
   try {
-    const r = await fetch("/api/open_in_finder", {
+    const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
