@@ -2,6 +2,19 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-15 — [CHANGED] generate voice --engine say + Mode 2 e2e test
+
+Added macOS `say` as a first-class voice engine option. `parallax generate voice --engine say`
+calls `say -v <voice>` (free, offline, no API key) and converts AIFF→MP3 via ffmpeg.
+TEST_MODE on macOS now defaults to `say` when available — output is real speech, not silence.
+Falls back to silent stub on non-macOS or if `say` is missing.
+
+Mode 2 Ken Burns Draft e2e test added: `generate still` → `compose` → verify real MP4.
+This is the first test that exercises the full ffmpeg render path against TEST_MODE stills.
+
+**Breaks if:** `parallax generate voice --engine say "hello"` exits non-zero on macOS with ffmpeg
+installed, or if Mode 2 test fails because `compose` can't read the stub PNG from `generate still`.
+
 ## 2026-04-15 — [CHANGED] V2 command surface added to beta (generate, script, ingest, web)
 
 Added all V2 command groups alongside existing V1 commands — no breakage, addition only.
