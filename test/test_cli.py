@@ -172,6 +172,65 @@ def test_v2_script_write_produces_script():
         return failures
 
 
+# ── Test 6: V2 Mode 2 — Ken Burns draft (generate still → compose → MP4) ──────
+
+def test_v2_mode2_ken_burns_draft():
+    """`generate still` → `compose` → verify real MP4 in output/."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+
+        # Step 1: generate still — produces PNG + manifest.yaml
+        r1 = _run_cli(["generate", "still", "luxury spa, serene visuals, soft light"], cwd=cwd)
+        failures = []
+        if r1.returncode != 0:
+            failures.append(f"generate still exit={r1.returncode}")
+            failures.append(f"stdout={r1.stdout[-500:]}")
+            failures.append(f"stderr={r1.stderr[-500:]}")
+            return failures
+
+        stills_dir = cwd / "stills"
+        if not stills_dir.is_dir():
+            failures.append("no stills/ directory after generate still")
+            return failures
+
+        pngs = list(stills_dir.glob("*.png"))
+        if not pngs:
+            failures.append("no PNG files in stills/ after generate still")
+            return failures
+
+        manifest = cwd / "manifest.yaml"
+        if not manifest.exists():
+            failures.append("no manifest.yaml after generate still")
+            return failures
+
+        # Step 2: compose — Ken Burns render against the stub PNG
+        r2 = _run_cli(["compose"], cwd=cwd)
+        if r2.returncode != 0:
+            failures.append(f"compose exit={r2.returncode}")
+            failures.append(f"stdout={r2.stdout[-500:]}")
+            failures.append(f"stderr={r2.stderr[-500:]}")
+            return failures
+
+        # Step 3: verify output MP4
+        output_dir = cwd / "output"
+        if not output_dir.is_dir():
+            failures.append("no output/ directory after compose")
+            return failures
+
+        mp4s = list(output_dir.glob("*.mp4"))
+        if not mp4s:
+            failures.append(
+                f"no MP4 in output/ after compose; "
+                f"stdout={r2.stdout[-500:]!r} stderr={r2.stderr[-500:]!r}"
+            )
+        else:
+            size = mp4s[0].stat().st_size
+            if size <= 1000:
+                failures.append(f"MP4 too small ({size} bytes) — expected real ffmpeg output")
+
+        return failures
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -180,6 +239,7 @@ TESTS = [
     ("run produces manifest under .parallax/", test_run_produces_manifest),
     ("V2 Mode 1: generate still creates real PNG", test_v2_generate_still_creates_png),
     ("V2 Mode 3: script write produces structured script", test_v2_script_write_produces_script),
+    ("V2 Mode 2: Ken Burns draft — generate still → compose → MP4", test_v2_mode2_ken_burns_draft),
 ]
 
 
