@@ -2779,7 +2779,65 @@ def cmd_generate_voice(args: argparse.Namespace) -> int:
     audio_dir = cwd / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
-    if test_mode:
+    engine = getattr(args, "engine", "elevenlabs")
+    voice = getattr(args, "voice", None) or "Samantha"
+
+    # Determine whether to use macOS `say`
+    use_say = (
+        engine == "say"
+        or (test_mode and sys.platform == "darwin" and _sp.which("say"))
+    )
+
+    if use_say:
+        if sys.platform != "darwin" or not _sp.which("say"):
+            print(
+                "[parallax] WARNING: --engine say requires macOS with `say` installed; "
+                "falling back to silent stub.",
+                file=sys.stderr,
+            )
+            use_say = False
+
+    if use_say:
+        import uuid as _uuid
+        aiff_path = Path(f"/tmp/parallax-vo-{_uuid.uuid4().hex}.aiff")
+        out_path = audio_dir / "voiceover.mp3"
+        try:
+            _sp.run(
+                ["say", "-v", voice, "-o", str(aiff_path), script_text],
+                capture_output=True, check=True, timeout=60,
+            )
+        except Exception as e:
+            print(
+                f"[parallax] WARNING: `say` failed ({e}); falling back to silent stub.",
+                file=sys.stderr,
+            )
+            use_say = False
+        if use_say:
+            try:
+                _sp.run(
+                    ["ffmpeg", "-i", str(aiff_path), "-y", str(out_path)],
+                    capture_output=True, check=True, timeout=30,
+                )
+                print(f"[parallax] say TTS → audio/voiceover.mp3 (voice: {voice})")
+            except Exception as e:
+                print(
+                    f"[parallax] WARNING: ffmpeg AIFF→MP3 failed ({e}); falling back to silent stub.",
+                    file=sys.stderr,
+                )
+                use_say = False
+            finally:
+                try:
+                    aiff_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if use_say:
+                return 0
+
+    # Fallback: silent stub for test_mode when say was unavailable or failed,
+    # or when --engine say was requested but say/ffmpeg failed.
+    # In real ElevenLabs mode (test_mode=False, engine="elevenlabs"), skip this block.
+    needs_stub = test_mode or (engine == "say" and not use_say)
+    if needs_stub:
         # Silent WAV stub — duration estimated at 150 WPM
         word_count = len(script_text.split())
         duration_s = max(1.0, word_count / 150.0 * 60.0)
@@ -2787,7 +2845,7 @@ def cmd_generate_voice(args: argparse.Namespace) -> int:
         try:
             _sp.run(
                 ["ffmpeg", "-f", "lavfi", "-i",
-                 f"anullsrc=r=44100:cl=mono",
+                 "anullsrc=r=44100:cl=mono",
                  "-t", str(duration_s), "-y", str(out_path)],
                 capture_output=True, check=True, timeout=15,
             )
@@ -3358,7 +3416,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen_voice.add_argument("--from-manifest", dest="from_manifest", action="store_true",
                              help="read vo_text from manifest scenes instead of inline script")
     p_gen_voice.add_argument("--voice", default=None,
-                             help="voice name or ElevenLabs voice ID")
+                             help="voice name or ElevenLabs voice ID (default for say: Samantha)")
+    p_gen_voice.add_argument(
+        "--engine",
+        choices=["elevenlabs", "say"],
+        default="elevenlabs",
+        help=(
+            "TTS engine to use. "
+            "'elevenlabs' = cloud API (requires API key, see ELEVENLABS_API_KEY). "
+            "'say' = macOS built-in TTS, free, no API key. Good for drafts. "
+            "Run `say -v ?` for available voices."
+        ),
+    )
     p_gen_voice.add_argument("--json", action="store_true",
                              help="emit NDJSON events to stdout")
     p_gen_voice.set_defaults(func=cmd_generate_voice)
