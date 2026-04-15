@@ -11,39 +11,26 @@ step() { echo ""; echo "▶ $*"; }
 ok()   { echo "  ✓ $*"; }
 fail() { echo "  ✗ $*"; exit 1; }
 
-# ---- Homebrew ---------------------------------------------------------------
-step "Checking Homebrew"
-if ! command -v brew &>/dev/null; then
-    echo "  installing Homebrew..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for the rest of this script (Apple Silicon path)
-    if [ -f /opt/homebrew/bin/brew ]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    fi
+# ---- uv ----------------------------------------------------------------------
+step "Checking uv"
+if ! command -v uv &>/dev/null; then
+    echo "  installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
 fi
-ok "brew $(brew --version | head -1)"
-
-# ---- Python 3.11+ -----------------------------------------------------------
-step "Checking Python 3.11+"
-PYTHON=""
-for cmd in python3.12 python3.11; do
-    if command -v "$cmd" &>/dev/null; then
-        PYTHON=$(command -v "$cmd")
-        break
-    fi
-done
-if [ -z "$PYTHON" ]; then
-    echo "  installing python@3.11 via brew..."
-    brew install python@3.11
-    PYTHON=$(brew --prefix python@3.11)/bin/python3.11
-fi
-PY_VERSION=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}')")
-ok "Python $PY_VERSION at $PYTHON"
+ok "uv $(uv --version)"
 
 # ---- just -------------------------------------------------------------------
 step "Checking just"
 if ! command -v just &>/dev/null; then
     echo "  installing just via brew..."
+    if ! command -v brew &>/dev/null; then
+        echo "  Homebrew not found — installing..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        if [ -f /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+    fi
     brew install just
 fi
 ok "just $(just --version)"
@@ -52,13 +39,19 @@ ok "just $(just --version)"
 step "Checking ffmpeg"
 if ! command -v ffmpeg &>/dev/null; then
     echo "  installing ffmpeg via brew..."
+    if ! command -v brew &>/dev/null; then
+        echo "  Homebrew not found — installing..."
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        if [ -f /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+    fi
     brew install ffmpeg
 fi
 ok "ffmpeg $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')"
 
 # ---- Clone or update repo ---------------------------------------------------
 step "Setting up repository"
-# If we're already running from inside the repo, skip clone
 REPO_ROOT=""
 if git -C "$(pwd)" rev-parse --show-toplevel &>/dev/null; then
     TOP=$(git -C "$(pwd)" rev-parse --show-toplevel)
@@ -81,7 +74,7 @@ if [ -z "$REPO_ROOT" ]; then
 fi
 
 # ---- Install ----------------------------------------------------------------
-step "Running just install"
+step "Installing (uv sync + CLI wrapper)"
 cd "$REPO_ROOT"
 just install
 
@@ -104,5 +97,5 @@ echo "  export ANTHROPIC_API_KEY=sk-ant-..."
 echo "  export AI_VIDEO_GEMINI_KEY=AIza..."
 echo "  export ELEVENLABS_API_KEY=sk_..."
 echo ""
-echo " Then: cd <your-project> && parallax chat"
+echo " Then: cd <your-project> && parallax status"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,0 +1,21 @@
+[project]
+name = "parallax-cli"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "sse-starlette>=1.8.0",
+    "pydantic>=2.0",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "elevenlabs>=1.0",
+    "google-genai>=0.3",
+]
+
+[project.optional-dependencies]
+whisperx = ["whisperx"]
+
+[tool.uv]
+dev-dependencies = []

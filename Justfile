@@ -23,54 +23,42 @@ start env_file=".env":
     echo "binding to 0.0.0.0 (LAN-exposed)"
     parallax chat
 
-# Install everything: CLI symlink + web venv
-install: install-cli install-web
+# Install everything: sync deps + install CLI wrapper
+install: sync install-cli
 
-# Install the parallax CLI by symlinking bin/parallax into ~/.local/bin
-install-cli:
-    mkdir -p "$HOME/.local/bin"
-    ln -sfn "$(pwd)/bin/parallax" "$HOME/.local/bin/parallax"
-    @echo "linked $HOME/.local/bin/parallax -> $(pwd)/bin/parallax"
-    @echo "ensure $HOME/.local/bin is on your PATH"
-
-# Set up the web server venv and install its dependencies (requires Python 3.11+)
-install-web:
+# Sync all dependencies via uv (creates/updates .venv)
+sync:
     #!/usr/bin/env bash
     set -e
-    PYTHON=""
-    for candidate in python3.12 python3.11; do
-        if command -v "$candidate" &>/dev/null; then
-            PYTHON=$(command -v "$candidate")
-            break
-        fi
-    done
-    if [ -z "$PYTHON" ]; then
-        if command -v python3 &>/dev/null; then
-            PYTHON=$(command -v python3)
-        fi
+    if ! command -v uv &>/dev/null; then
+        echo "uv not found — installing..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
     fi
-    if [ -z "$PYTHON" ]; then
-        echo "error: Python 3.11+ not found — install with: brew install python@3.11"
-        exit 1
-    fi
-    PYVER=$("$PYTHON" -c "import sys; print(sys.version_info >= (3,11))")
-    if [ "$PYVER" != "True" ]; then
-        echo "error: Python 3.11+ required, found $("$PYTHON" --version)"
-        echo "install with: brew install python@3.11"
-        exit 1
-    fi
-    "$PYTHON" -m venv web/.venv
-    # Use the venv's python to run pip — avoids missing pip-binary issues
-    web/.venv/bin/python3 -m pip install --quiet --upgrade pip
-    web/.venv/bin/python3 -m pip install -r web/requirements.txt
-    echo "web venv ready at web/.venv ($(web/.venv/bin/python3 --version))"
+    uv sync
+    echo "deps synced into .venv ($(uv run python --version))"
+
+# Install the parallax CLI wrapper into ~/.local/bin
+# Removes any old symlink first, then writes a real bash wrapper so .venv python is always used.
+install-cli:
+    #!/usr/bin/env bash
+    set -e
+    REPO="$(pwd)"
+    DEST="$HOME/.local/bin/parallax"
+    mkdir -p "$HOME/.local/bin"
+    # Remove old symlink or file — critical if a symlink exists, writing through it overwrites the target
+    rm -f "$DEST"
+    printf '#!/usr/bin/env bash\nexec "%s/.venv/bin/python" "%s/bin/parallax" "$@"\n' "$REPO" "$REPO" > "$DEST"
+    chmod +x "$DEST"
+    echo "installed $DEST → $REPO/bin/parallax (via .venv)"
+    echo "ensure $HOME/.local/bin is on your PATH"
 
 # Run the CLI smoke tests
 test-cli:
-    TEST_MODE=true python3 test/test_cli.py
+    TEST_MODE=true uv run python test/test_cli.py
 
 # Run the full test suite
 test:
-    TEST_MODE=true python3 test/test_manifest_first.py
-    TEST_MODE=true python3 test/test_manifest_validator.py
-    TEST_MODE=true python3 test/test_cli.py
+    TEST_MODE=true uv run python test/test_manifest_first.py
+    TEST_MODE=true uv run python test/test_manifest_validator.py
+    TEST_MODE=true uv run python test/test_cli.py
