@@ -2,6 +2,109 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-14 — [DECISION] Instrumented logging + pricing table (beta)
+
+Every external provider call (Gemini image, ElevenLabs voiceover) now
+emits `request_intended` + `cost_estimated` events via `core/instrumented.py`
+before dispatching, reading rates from `core/pricing.py`. Real-mode and
+TEST_MODE emit the same shape, so TEST MODE doubles as a dry-run cost
+estimator and the costs page can fold projected spend alongside actual.
+
+**Why this shape:** parallax had ~100 scattered `TEST_MODE` branches and
+zero structured capture of what was being requested — neither real nor
+test runs were auditable. A provider-interface refactor is the right
+long-term move, but I scoped down to a two-function helper that the
+existing CLI can call from inline. Same observable events; no big-bang
+rewrite. The two helpers are deliberately tiny so they can be lifted
+into a `plexi_harness` package later without dragging parallax internals
+with them.
+
+**Rejected:** full `ImageGenerator`/`TTS` provider abstraction (too much
+for one session, regression-heavy), runtime pricing fetches (no provider
+publishes a stable identity/pricing endpoint, and a network call per
+dispatch is a latency bomb). `core/pricing.py` carries a `LAST_VERIFIED`
+date instead — update the file quarterly.
+
+## 2026-04-14 — [DECISION] beta layout: flatten `.parallax/` → `parallax/users/<user>/<project>/`
+
+Breaking path change on the `beta` branch. Hidden `.parallax/` at cwd
+root is gone; everything parallax-managed now lives at a visible
+`parallax/users/<user>/<project>/` nested workspace. Raw media at the
+launch dir root is shared across every user/project via a two-tier
+sandbox in `_resolve_project_path(read_fallback=True)`: writes target
+the per-user workspace, but relative reads fall through to PROJECT_DIR
+when the workspace-side path doesn't exist.
+
+**Why:** the old layout had three problems — the hidden dotdir was
+invisible to users browsing their projects, the per-user mode was
+gated on network-access/password flags (so local dev never triggered
+it), and raw uploaded media lived inside a specific project with no
+way to share across variations. The new layout makes the filesystem
+structure legible, always nests per-user, and lets the user drop raw
+files at the master dir once and reference them from any project.
+
+**Rejected:** writing a migrator from old to new layout (beta is a new
+branch, users still on main keep the old layout; a migrator would
+double the code paths we'd have to maintain), keeping `.parallax/` but
+adding a `users/` subdir (still hides the nested work from casual
+inspection). `~/.parallax/` paths in the user's HOME (events log,
+update cache, server registry) are unchanged — those are global,
+cross-project state and don't need the visibility fix.
+
+## 2026-04-14 — [FIX] Reference image prepend regression in /api/message
+
+`POST /api/message` used to prepend `[Reference images selected: ...]`
+to the user turn so Claude could see selected refs and pass them into
+`parallax_create(ref=[...])`. An earlier TEST MODE trigger edit in the
+same handler silently removed the block — the Edit call replaced the
+whole `session = get_or_create_session(...)` + prepend block with just
+the trigger check, and the prepend was lost. Result: refs went
+straight to the floor; Gemini got a text-only brief.
+
+**Root cause:** I wrote the Edit `old_string` / `new_string` too wide
+and didn't re-read the removed lines to verify what I was discarding.
+Restored the prepend AND went further — `Session.selected_refs` now
+persists per message, and `tool_parallax_create` auto-injects them
+into the `ref` arg whenever Claude forgets to set it explicitly.
+
+**What NOT to do next time:** on Edit calls that delete surrounding
+code as a side effect, grep for any feature tag in the removed region
+before running the tool. The regression would have been caught by a
+pre-edit `grep -n reference_images web/server.py`.
+
+## 2026-04-14 — [GOTCHA] Python pipe buffering + `PARALLAX_BIN` override for tests
+
+The baseline Playwright test hung for ~15 minutes on its first run
+because `parallax chat` spawns `python -m parallax_web` without `-u`
+and its `print("parallax-web: url = ...")` line sits in a 4KB stdout
+buffer forever when the parent pipes stdout. Fix: set
+`PYTHONUNBUFFERED=1` in the child env — `start_server()` in
+`test/playwright/_helpers.py` now does this by default.
+
+**Separately:** `shutil.which("parallax")` resolves to
+`~/.local/bin/parallax` which symlinks to the *main* worktree's
+`bin/parallax`. A test that launches a worktree's server ends up
+invoking main's CLI binary, so any CLI changes on a feature branch are
+silently bypassed. Added `PARALLAX_BIN` env var override to
+`_find_parallax_bin()` so tests can pin the binary, and the shared
+test helper sets it automatically.
+
+**What NOT to do next time:** trust `print()` to line-buffer on a
+piped subprocess, or trust PATH resolution inside a worktree.
+
+## 2026-04-14 — [CHANGED] Server registry at `~/.parallax/servers.json`
+
+`web/registry.py` records `{pid, cwd, host, port, user, started_at}`
+for every running parallax-web process at home-dir scope. Each server
+registers on startup and deregisters on normal exit / SIGINT / SIGTERM
+via `install_shutdown_hooks()`; readers auto-prune entries whose pid
+is dead. `GET /api/servers` exposes the live list.
+
+**Why home-dir, not project-dir:** the user wanted multi-server +
+cross-workspace discovery. A per-project file would only see one
+server at a time; a home-dir list spans every launch dir. Aligns with
+the existing `~/.parallax/events.jsonl` telemetry log.
+
 ## 2026-04-13 — [CHANGED] Web UI sidebar, update command, install bootstrap
 
 Session focused on parallax-web frontend and CLI tooling. Built a persistent left-sidebar session switcher replacing the history drawer, added video delete (× on hover), replaced trash emoji with minimal × on stills, removed Open in Finder button, and added a Google Drive link stored in localStorage per user. Added `parallax update` CLI command and a daily background update check (git ls-remote, cached in `~/.parallax/.update_check`, prints one-liner to stderr if behind). Added `scripts/install.sh` for curl-pipe bootstrap (brew + python@3.11 + just + ffmpeg + just install). Fixed exit-code-127 bug in `just install-web`: switched from `web/.venv/bin/pip` to `web/.venv/bin/python3 -m pip`; same fix applied in `cmd_update` which now does install steps directly in Python without calling `just`.
