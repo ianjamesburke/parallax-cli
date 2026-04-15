@@ -122,6 +122,8 @@ MODEL_PRICES = {
 
 def _model_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     price = MODEL_PRICES.get(model) or MODEL_PRICES.get("claude-sonnet-4-6")
+    if price is None:
+        return 0.0
     return (
         (input_tokens / 1_000_000.0) * price["input"]
         + (output_tokens / 1_000_000.0) * price["output"]
@@ -1384,8 +1386,8 @@ def run_agent_turn(session: Session, user_text: str) -> None:
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=hop_prompt,
-                tools=TOOL_SCHEMAS,
-                messages=session.messages,
+                tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
+                messages=session.messages,  # type: ignore[arg-type]
             ) as stream:
                 for event in stream:
                     if session.cancel_event.is_set():
@@ -1420,9 +1422,9 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             elif btype == "tool_use":
                 tu = {
                     "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
+                    "id": getattr(block, "id", ""),
+                    "name": getattr(block, "name", ""),
+                    "input": getattr(block, "input", {}),
                 }
                 blocks.append(tu)
                 tool_uses.append(tu)
