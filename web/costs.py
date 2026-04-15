@@ -3,13 +3,16 @@ costs.py — read the parallax JSONL event log and fold it into a cost report.
 
 Pure / side-effect free: takes an optional user filter, reads
 ~/.parallax/events.jsonl via `telemetry._iter_events()`, and returns a dict
-with four top-level sections:
+with five top-level sections:
 
     {
       "fal": {...},          # header — fal account identity (populated by caller)
       "llm": {...},          # LLM costs from session_touch events
-      "image": {...},        # image-generation costs from dispatch_event events
+      "image": {...},        # image-generation costs from still_generated events
       "video": {...},        # voiceover / compose costs from dispatch_event events
+      "projected": {...},    # NEW: cost_estimated events (real + test) folded
+                             # by provider/model — lets the dashboard show
+                             # "would-have-cost" alongside actual spend.
       "generated_at": <ts>,
       "user_filter": "<user>" | None,
     }
@@ -41,26 +44,28 @@ except ImportError:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Pricing constants
+# Pricing constants — sourced from core/pricing.py so real and test runs
+# agree on a single rate table. The fallback literals below are only used
+# when core/pricing.py is unavailable (e.g. verification scripts that run
+# without the repo root on sys.path).
 # ---------------------------------------------------------------------------
-# All prices are placeholders. Update them once billing is actually audited.
-# Leave the `# TODO: verify pricing` comment on every constant so a future
-# reader knows these are not authoritative.
+try:
+    from core import pricing as _pricing  # type: ignore
+    IMAGE_MODEL_NAME = "gemini-3.1-flash-image-preview"
+    IMAGE_USD_PER_IMAGE = float(
+        (_pricing.GEMINI.get(IMAGE_MODEL_NAME) or {}).get("per_image") or 0.04
+    )
+    _VO_MODEL = "eleven_v3"
+    VOICEOVER_USD_PER_CHAR = float(
+        (_pricing.ELEVENLABS.get(_VO_MODEL) or {}).get("per_char") or 0.00003
+    )
+except Exception:  # pragma: no cover — script-style fallback
+    IMAGE_MODEL_NAME = "gemini-3.1-flash-image-preview"
+    IMAGE_USD_PER_IMAGE = 0.04
+    VOICEOVER_USD_PER_CHAR = 0.00003
 
-# Gemini 3.1 flash image preview (the only image model parallax currently
-# dispatches). Priced per image.
-IMAGE_USD_PER_IMAGE = 0.04  # TODO: verify pricing
-
-# ElevenLabs voiceover — billed per character. Parallax only records
-# word_count, so we approximate char_count ≈ word_count * 5.
-VOICEOVER_USD_PER_CHAR = 0.00003  # TODO: verify pricing
-VOICEOVER_CHARS_PER_WORD = 5  # rough average English word length incl. spaces
-
-# Ken Burns / compose step — a ffmpeg-only local operation. Zero marginal
-# cost until we move it to a paid renderer.
-COMPOSE_USD_PER_RUN = 0.0  # TODO: verify pricing
-
-IMAGE_MODEL_NAME = "gemini-3.1-flash-image-preview"
+VOICEOVER_CHARS_PER_WORD = 5  # rough English word length incl. spaces
+COMPOSE_USD_PER_RUN = 0.0     # ffmpeg-only local step, no marginal API cost
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +335,97 @@ def _build_video_section(events: list[dict[str, Any]], user_sessions: Optional[s
     }
 
 
+def _build_projected_section(
+    events: list[dict[str, Any]],
+    user_sessions: Optional[set[str]],
+) -> dict[str, Any]:
+    """
+    Fold `cost_estimated` events into projected-spend totals.
+
+    These events are emitted by core/instrumented.py on BOTH real and TEST
+    MODE dispatches, carrying the would-be provider cost regardless of
+    whether the API was actually called. The dashboard uses this section
+    to show two things side-by-side: the actual spend (session_touch /
+    image / video sections above) and what the runs *would have* cost in
+    a hypothetical no-stub world.
+
+    Groups by (provider, model, test_mode) so TEST MODE dry runs are
+    visible but don't inflate the real-spend total. The caller can sum
+    whichever split they want.
+    """
+    real_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    test_buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    real_total = 0.0
+    test_total = 0.0
+
+    for ev in events:
+        if ev.get("kind") != "dispatch_event":
+            continue
+        if user_sessions is not None and ev.get("session_id") not in user_sessions:
+            continue
+        payload = _safe_payload(ev)
+        if payload.get("type") != "cost_estimated":
+            continue
+        provider = str(payload.get("provider") or "unknown")
+        model = str(payload.get("model") or "unknown")
+        try:
+            usd = float(payload.get("usd") or 0.0)
+        except (TypeError, ValueError):
+            usd = 0.0
+        try:
+            qty = int(payload.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        unit = str(payload.get("unit") or "")
+        is_test = _is_test_mode(payload)
+
+        buckets = test_buckets if is_test else real_buckets
+        key = (provider, model)
+        b = buckets.get(key)
+        if b is None:
+            b = {
+                "provider": provider,
+                "model": model,
+                "unit": unit,
+                "quantity": 0,
+                "usd": 0.0,
+                "count": 0,
+            }
+            buckets[key] = b
+        b["quantity"] += qty
+        b["usd"] += usd
+        b["count"] += 1
+        if is_test:
+            test_total += usd
+        else:
+            real_total += usd
+
+    def _flatten(bs: dict) -> list[dict[str, Any]]:
+        out = []
+        for b in bs.values():
+            out.append({
+                "provider": b["provider"],
+                "model": b["model"],
+                "unit": b["unit"],
+                "quantity": b["quantity"],
+                "call_count": b["count"],
+                "usd": round(b["usd"], 6),
+            })
+        out.sort(key=lambda x: x["usd"], reverse=True)
+        return out
+
+    return {
+        "real": {
+            "entries": _flatten(real_buckets),
+            "total_cost_usd": round(real_total, 6),
+        },
+        "test_mode": {
+            "entries": _flatten(test_buckets),
+            "total_cost_usd": round(test_total, 6),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -391,6 +487,15 @@ def build_report(user: Optional[str]) -> dict[str, Any]:
                  "compose": {"count": 0, "total_cost_usd": 0.0},
                  "total_cost_usd": 0.0}
 
+    try:
+        projected = _build_projected_section(events, user_sessions)
+    except Exception as e:
+        errors.append(f"projected section: {e}")
+        projected = {
+            "real": {"entries": [], "total_cost_usd": 0.0},
+            "test_mode": {"entries": [], "total_cost_usd": 0.0},
+        }
+
     # The "fal" section is populated by the HTTP handler (it needs network
     # access). We stub it here so the shape is stable when callers use this
     # module directly from a script.
@@ -410,6 +515,7 @@ def build_report(user: Optional[str]) -> dict[str, Any]:
         "llm": llm,
         "image": image,
         "video": video,
+        "projected": projected,
         "grand_total_usd": grand_total,
         "errors": errors,
     }

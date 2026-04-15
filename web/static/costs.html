@@ -327,6 +327,46 @@
         return html;
       }
 
+      function projectedTable(bucket, label) {
+        const entries = (bucket && bucket.entries) || [];
+        const total = bucket && bucket.total_cost_usd || 0;
+        if (!entries.length) {
+          return `
+            <div class="sub-label">${label} · ${fmtUSD(total)}</div>
+            <table class="cost-table">
+              <tbody>
+                <tr><td class="empty" colspan="5">no ${label} runs</td></tr>
+              </tbody>
+            </table>`;
+        }
+        const rows = entries
+          .map(
+            (e) => `
+          <tr>
+            <td>${e.provider || "?"}</td>
+            <td>${e.model || "?"}</td>
+            <td class="num">${fmtInt(e.call_count)}</td>
+            <td class="num">${fmtInt(e.quantity)} ${e.unit || ""}</td>
+            <td class="cost">${fmtUSD(e.usd)}</td>
+          </tr>`,
+          )
+          .join("");
+        return `
+          <div class="sub-label">${label} · ${fmtUSD(total)}</div>
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Calls</th>
+                <th>Units</th>
+                <th>Projected</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      }
+
       function videoTable(video) {
         const vo = video.voiceover || {};
         const cp = video.compose || {};
@@ -443,6 +483,25 @@
               )}</span>
             </h2>
             ${videoTable(report.video)}
+          </section>
+
+          <section class="cost-section">
+            <h2>
+              Projected spend
+              <span class="section-total">${fmtUSD(
+                (report.projected?.real?.total_cost_usd || 0) +
+                (report.projected?.test_mode?.total_cost_usd || 0),
+              )}</span>
+            </h2>
+            <div class="pricing-note">
+              Fold of <code>cost_estimated</code> events emitted by
+              <code>core/instrumented.py</code> — every dispatch logs its
+              projected provider cost before running. TEST MODE runs show
+              "would have cost" so dry-runs double as a cost estimator.
+              Pricing from <code>core/pricing.py</code>.
+            </div>
+            ${projectedTable(report.projected?.real, "real runs")}
+            ${projectedTable(report.projected?.test_mode, "test mode")}
           </section>
 
           ${errsHtml}

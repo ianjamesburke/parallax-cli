@@ -345,8 +345,26 @@ def cmd_create(args: argparse.Namespace) -> int:
     started_at = time.time()
     emitter.emit("run_started", brief=brief, mode="create", project_dir=str(cwd))
 
+    _test_mode_active = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    # Structured request + cost events fire for BOTH the real and test
+    # branches with identical shape — TEST MODE doubles as a dry-run cost
+    # estimator, and the costs page folds these as projected spend.
+    try:
+        from core.instrumented import log_image_generation
+        log_image_generation(
+            model="gemini-3.1-flash-image-preview",
+            count=count,
+            brief=brief,
+            aspect_ratio=aspect_ratio,
+            ref_images=ref_images,
+            test_mode=_test_mode_active,
+        )
+    except Exception as _e:
+        log.warning("instrumented.log_image_generation failed: %s", _e)
+
     # TEST_MODE: short-circuit Gemini and produce placeholder stills locally.
-    if os.environ.get("TEST_MODE", "").lower() == "true":
+    if _test_mode_active:
         stills_dir = cwd / "stills"
         stills_dir.mkdir(parents=True, exist_ok=True)
         (cwd / "logs").mkdir(parents=True, exist_ok=True)
@@ -1004,9 +1022,25 @@ def cmd_voiceover(args) -> int:
     voice_id = VOICE_SHORTCUTS.get(voice_input.lower(), voice_input)
     voice_name = voice_input.title() if voice_input.lower() in VOICE_SHORTCUTS else voice_input
 
+    _test_mode_vo = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    # Structured request + cost events fire for both real and test paths
+    # so the costs page can fold projected voiceover spend.
+    try:
+        from core.instrumented import log_voiceover
+        log_voiceover(
+            model=model_id,
+            voice_id=voice_id,
+            voice_name=voice_name,
+            script_text=script_text,
+            test_mode=_test_mode_vo,
+        )
+    except Exception as _e:
+        log.warning("instrumented.log_voiceover failed: %s", _e)
+
     # TEST_MODE: macOS `say` + ffmpeg for a real mp3, fake word timings so
     # cmd_align's prefix matching still works (words come from the actual script).
-    if os.environ.get("TEST_MODE", "").lower() == "true":
+    if _test_mode_vo:
         import subprocess as _sp
         audio_dir = cwd / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
