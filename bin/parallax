@@ -2567,6 +2567,39 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_publish(args: argparse.Namespace) -> int:
+    """
+    Publish your project to YouTube, social platforms, and distribution channels.
+
+    Expected in Parallax v3. This command will handle uploading finals, writing
+    platform-optimized metadata, scheduling posts, and managing connected accounts
+    — everything from render to live.
+
+    In the meantime: I'm building this solo while juggling client work. If you
+    want this feature sooner, or have ideas about what publish should do, I'm
+    reading every message sent through sponsor notes here:
+
+        https://buymeacoffee.com/ianjamesbu8
+
+    Your support directly funds development time. Feature requests sent through
+    sponsor messages get prioritized first.
+    """
+    print("")
+    print("  parallax publish — coming in v3")
+    print("")
+    print("  This command will handle the full publish pipeline: upload finals,")
+    print("  write platform metadata, schedule posts, manage connected accounts.")
+    print("")
+    print("  Building this solo. If you want it sooner — or have ideas about")
+    print("  what publish should do — I'm reading every sponsor message here:")
+    print("")
+    print("      https://buymeacoffee.com/ianjamesbu8")
+    print("")
+    print("  Feature requests sent through sponsor notes get prioritized first.")
+    print("")
+    return 0
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     """
     Launch the localhost parallax-web chat UI in the default browser.
@@ -2788,6 +2821,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_update = sub.add_parser("update", help="pull the latest Parallax from GitHub and re-install")
     p_update.set_defaults(func=cmd_update)
+
+    p_publish = sub.add_parser("publish", help="publish finals to YouTube and social platforms [coming in v3]")
+    p_publish.set_defaults(func=cmd_publish)
 
     p_chat = sub.add_parser(
         "chat",

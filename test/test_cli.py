@@ -10,7 +10,6 @@ All tests set TEST_MODE=true so no external API calls are made.
 
 import os
 import sys
-import shutil
 import subprocess
 import tempfile
 import traceback
@@ -69,7 +68,7 @@ def test_project_new_creates_structure():
             failures.append(f"exit={r.returncode}, stderr={r.stderr!r}")
             return failures
         proj = fake_home / "Documents" / "parallax-projects" / name
-        for sub in (".parallax", "assets", "stills", "output"):
+        for sub in ("input", "output", "stills", "audio", "logs"):
             if not (proj / sub).is_dir():
                 failures.append(f"missing subdir: {sub}")
         # stdout may show /private/var/... (macOS) while proj is /var/... — compare resolved.
@@ -81,7 +80,7 @@ def test_project_new_creates_structure():
 # ── Test 3: `parallax run "test brief"` ────────────────────────────────────────
 
 def test_run_produces_manifest():
-    """`parallax run` under TEST_MODE exits 0 and creates a manifest under cwd/.parallax/."""
+    """`parallax run` under TEST_MODE exits 0 and creates a manifest under cwd/logs/<concept>/."""
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         r = _run_cli(["run", "test brief"], cwd=cwd)
@@ -92,9 +91,9 @@ def test_run_produces_manifest():
             failures.append(f"stderr={r.stderr[-2000:]}")
             return failures
 
-        parallax_dir = cwd / ".parallax"
+        parallax_dir = cwd / "logs"
         if not parallax_dir.is_dir():
-            failures.append("no .parallax/ created")
+            failures.append("no logs/ created")
             return failures
 
         manifests = list(parallax_dir.glob("*/manifest.yaml"))
