@@ -1771,52 +1771,50 @@ class Handler(BaseHTTPRequestHandler):
     def _get_request_user(self) -> str:
         """
         Resolve the requesting user in priority order:
-          1. 'user' query param in the current request URL  (live override)
-          2. 'parallax_user' cookie (set on first visit)
-          3. $USER env var (server process owner)
+          1. 'user' query param in the current request URL
+          2. $USER env var (server process owner)
+
+        No cookie fallback — cookies are HttpOnly so the frontend can't
+        clear them, which means a stale `parallax_user` cookie from a
+        previous load would leak into every subsequent request and the
+        user couldn't escape it without closing the tab. The frontend's
+        apiUrl() helper always sends an explicit ?user=/?project=, so
+        the cookie path is dead weight AND a footgun.
         """
-        # Live query param wins so users can switch identities mid-session
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         user_param = qs.get("user", [""])[0].strip()
         if user_param:
             return user_param
-        # Then cookie
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            part = part.strip()
-            if part.startswith("parallax_user="):
-                val = part[len("parallax_user="):].strip()
-                if val:
-                    return val
+        # Cookie fallback removed — see docstring.
         return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
 
     def _get_request_project(self) -> str:
         """
-        Resolve the requesting project (workspace subdirectory) in priority order:
-          1. 'project' query param  (live override)
-          2. 'parallax_project' cookie
-          3. 'main' (default)
+        Resolve the requesting project in priority order:
+          1. 'project' query param
+          2. 'main' (default)
+
+        No cookie fallback — see _get_request_user() for the rationale.
+        Frontend apiUrl() sends `?project=` on every project-scoped fetch,
+        so the server never has to guess.
         """
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         proj_param = qs.get("project", [""])[0].strip()
         if proj_param:
             return proj_param
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            part = part.strip()
-            if part.startswith("parallax_project="):
-                val = part[len("parallax_project="):].strip()
-                if val:
-                    return val
         return "main"
 
     def _maybe_set_user_cookie(self) -> list:
         """
-        If the request has ?user= or ?project= params, return Set-Cookie
-        header values to persist them. Returns an empty list if no params present.
+        Dead code retained for binary compat with old callers. Cookies
+        are no longer part of the auth/routing story — the frontend
+        sends explicit ?user=/?project= on every request. This method
+        returns an empty list so _write_json and friends still work.
         """
+        return []
+        # Legacy path below — unreachable, kept for reference only.
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         cookies = []

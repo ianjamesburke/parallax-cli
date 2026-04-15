@@ -32,16 +32,20 @@ const $ = (id) => document.getElementById(id);
 // Finder button opening main when the tab was sitting in Womp, uploads
 // landing in the wrong project, etc.
 //
+// ALWAYS appends `?project=` — even if the tab URL has no project param,
+// we send an explicit `?project=main`. Otherwise the server's cookie
+// fallback chain can keep returning a stale `parallax_project` cookie
+// from a previous load, which the frontend can't clear because it's
+// HttpOnly. Explicit beats implicit.
+//
 // Use this for every fetch whose backend handler calls _workspace_for().
 // Global routes (/api/servers, /api/costs, /api/cancel) don't need it.
 function apiUrl(path) {
   const cur = new URLSearchParams(window.location.search);
   const qs = new URLSearchParams();
-  for (const k of ["user", "project"]) {
-    const v = cur.get(k);
-    if (v) qs.set(k, v);
-  }
-  if (!qs.toString()) return path;
+  qs.set("project", cur.get("project") || "main");
+  const user = cur.get("user");
+  if (user) qs.set("user", user);
   return path + (path.includes("?") ? "&" : "?") + qs.toString();
 }
 
