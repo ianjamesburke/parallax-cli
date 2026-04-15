@@ -2074,9 +2074,10 @@ async def api_upload(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"form parse failed: {e}")
 
-    upload_file = form.get("file")
-    if upload_file is None:
+    _upload_raw = form.get("file")
+    if _upload_raw is None or isinstance(_upload_raw, str):
         raise HTTPException(status_code=400, detail="no file field in upload")
+    upload_file = _upload_raw
 
     try:
         file_data = await upload_file.read()
