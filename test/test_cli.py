@@ -103,12 +103,83 @@ def test_run_produces_manifest():
         return failures
 
 
+# ── Test 4: V2 Mode 1 — `parallax generate still` ─────────────────────────────
+
+def test_v2_generate_still_creates_png():
+    """`parallax generate still` in TEST_MODE creates a real PNG and a manifest."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        r = _run_cli(["generate", "still", "cold brew coffee brand, moody lighting"], cwd=cwd)
+        failures = []
+        if r.returncode != 0:
+            failures.append(f"exit={r.returncode}")
+            failures.append(f"stdout={r.stdout[-1000:]}")
+            failures.append(f"stderr={r.stderr[-1000:]}")
+            return failures
+
+        stills_dir = cwd / "stills"
+        if not stills_dir.is_dir():
+            failures.append("no stills/ directory created")
+            return failures
+
+        pngs = list(stills_dir.glob("*.png"))
+        if not pngs:
+            failures.append("no PNG files in stills/")
+        else:
+            # Verify real PNG (not just a placeholder byte string)
+            png_bytes = pngs[0].read_bytes()
+            if len(png_bytes) < 100:
+                failures.append(f"PNG too small ({len(png_bytes)} bytes) — expected a real image")
+            if not png_bytes.startswith(b"\x89PNG"):
+                failures.append("file does not have a PNG header")
+
+        manifest = cwd / "manifest.yaml"
+        if not manifest.exists():
+            failures.append("no manifest.yaml created")
+
+        return failures
+
+
+# ── Test 5: V2 Mode 3 — `parallax script write` ────────────────────────────────
+
+def test_v2_script_write_produces_script():
+    """`parallax script write` in TEST_MODE writes a structured script to --out file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        out_file = cwd / "script.txt"
+        r = _run_cli(
+            ["script", "write", "a 30-second ad for a dog grooming business", "--out", str(out_file)],
+            cwd=cwd,
+        )
+        failures = []
+        if r.returncode != 0:
+            failures.append(f"exit={r.returncode}")
+            failures.append(f"stderr={r.stderr[-500:]}")
+            return failures
+
+        if not out_file.exists():
+            failures.append("--out file not created")
+            return failures
+
+        content = out_file.read_text()
+        if len(content.strip()) < 50:
+            failures.append(f"script too short ({len(content)} chars)")
+        if "Scene" not in content and "scene" not in content:
+            failures.append("expected 'Scene' in script content")
+        if "Brief" not in content and "brief" not in content.lower():
+            failures.append("expected brief echo in script content")
+
+        return failures
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 TESTS = [
     ("projects lists or prints friendly message", test_projects_lists_or_friendly_message),
     ("project new creates structure", test_project_new_creates_structure),
     ("run produces manifest under .parallax/", test_run_produces_manifest),
+    ("V2 Mode 1: generate still creates real PNG", test_v2_generate_still_creates_png),
+    ("V2 Mode 3: script write produces structured script", test_v2_script_write_produces_script),
 ]
 
 
