@@ -24,6 +24,27 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+// ----- workspace-scoped URL helper ----------------------------------------
+
+// Every project-scoped API route MUST carry ?user=/?project= forwarded
+// from the current browser URL. Without it the server falls through to
+// the default "main" workspace — that's the class of bug that had the
+// Finder button opening main when the tab was sitting in Womp, uploads
+// landing in the wrong project, etc.
+//
+// Use this for every fetch whose backend handler calls _workspace_for().
+// Global routes (/api/servers, /api/costs, /api/cancel) don't need it.
+function apiUrl(path) {
+  const cur = new URLSearchParams(window.location.search);
+  const qs = new URLSearchParams();
+  for (const k of ["user", "project"]) {
+    const v = cur.get(k);
+    if (v) qs.set(k, v);
+  }
+  if (!qs.toString()) return path;
+  return path + (path.includes("?") ? "&" : "?") + qs.toString();
+}
+
 // ----- status dot ----------------------------------------------------------
 
 const STATUS_LABELS = {
@@ -295,7 +316,7 @@ async function sendMessage(text) {
   }
 
   try {
-    const r = await fetch("/api/message", {
+    const r = await fetch(apiUrl("/api/message"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: state.sessionId, text, reference_images: refImages }),
@@ -344,7 +365,7 @@ function updateButtons() {
 
 async function refreshGallery() {
   try {
-    const r = await fetch("/api/gallery");
+    const r = await fetch(apiUrl("/api/gallery"));
     if (!r.ok) return;
     const data = await r.json();
     renderGallery(data);
@@ -417,7 +438,7 @@ function renderGallery(data) {
         del.addEventListener("click", async (e) => {
           e.stopPropagation();
           try {
-            const r = await fetch("/api/image", {
+            const r = await fetch(apiUrl("/api/image"), {
               method: "DELETE",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ path: s.path }),
@@ -531,7 +552,7 @@ function renderGallery(data) {
       vDel.addEventListener("click", async (e) => {
         e.stopPropagation();
         try {
-          const r = await fetch("/api/image", {
+          const r = await fetch(apiUrl("/api/image"), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ path: v.path }),
@@ -622,10 +643,42 @@ const sidebarState = {
 
 async function refreshSidebar() {
   try {
-    const r = await fetch("/api/projects");
+    // /api/projects is global in single-user mode but user-scoped when
+    // PER_USER_WORKSPACES is on, so forward ?user= too.
+    const r = await fetch(apiUrl("/api/projects"));
     if (!r.ok) return;
     const data = await r.json();
     sidebarState.projects = data.projects || [];
+
+    // Stale-URL guard: if ?project=X points at something that no longer
+    // exists on disk (deleted in Finder, wiped across a server restart,
+    // ghost from a previous run), snap back to main and reload the chat.
+    // Without this the tab gets stuck aiming at a dead workspace and
+    // every project-scoped fetch errors out until the user manually
+    // edits the URL.
+    const params = new URLSearchParams(window.location.search);
+    const currentProject = params.get("project");
+    if (currentProject && currentProject !== "main") {
+      const exists = sidebarState.projects.some((p) => p.name === currentProject);
+      if (!exists) {
+        console.warn(`project "${currentProject}" missing — snapping to main`);
+        const url = new URL(window.location.href);
+        url.searchParams.delete("project");
+        window.history.replaceState({}, "", url);
+        state.sessionId = null;
+        state.thinking = false;
+        state.dispatchActive = false;
+        if (state.eventSource) {
+          try { state.eventSource.close(); } catch (_) {}
+          state.eventSource = null;
+        }
+        setStatus("");
+        updateButtons();
+        refreshProjectBadge();
+        await loadProjectChat();
+      }
+    }
+
     renderSidebar();
   } catch (e) {
     console.error("sidebar fetch failed", e);
@@ -678,9 +731,10 @@ function renderSidebar() {
           `Raw media at the master dir is not touched.`
         )) return;
         try {
-          const r = await fetch(`/api/projects/${encodeURIComponent(proj.name)}`, {
-            method: "DELETE",
-          });
+          const r = await fetch(
+            apiUrl(`/api/projects/${encodeURIComponent(proj.name)}`),
+            { method: "DELETE" },
+          );
           if (!r.ok) {
             const err = await r.json().catch(() => ({}));
             appendError(`failed to delete project: ${err.error || r.statusText}`);
@@ -735,16 +789,9 @@ async function loadProjectChat() {
   messagesEl().innerHTML = "";
   state.currentAssistantEl = null;
 
-  const params = new URLSearchParams(window.location.search);
-  const qs = new URLSearchParams();
-  for (const k of ["user", "project"]) {
-    const v = params.get(k);
-    if (v) qs.set(k, v);
-  }
-  const url = "/api/chat" + (qs.toString() ? "?" + qs.toString() : "");
   let data = { turns: [] };
   try {
-    const r = await fetch(url);
+    const r = await fetch(apiUrl("/api/chat"));
     if (r.ok) data = await r.json();
   } catch (e) {
     console.error("loadProjectChat failed", e);
@@ -849,17 +896,11 @@ function refreshProjectBadge() {
 
   // Forward ?user= / ?project= to the header links so opening /manifest
   // or /costs from the chat lands in the same workspace the user is in.
-  const forwarded = new URLSearchParams();
-  for (const k of ["user", "project"]) {
-    const v = params.get(k);
-    if (v) forwarded.set(k, v);
-  }
-  const suffix = forwarded.toString() ? "?" + forwarded.toString() : "";
   for (const id of ["manifest-link", "costs-link"]) {
     const el = document.getElementById(id);
     if (el) {
       const base = el.getAttribute("href").split("?")[0];
-      el.href = base + suffix;
+      el.href = apiUrl(base);
     }
   }
 }
@@ -870,7 +911,7 @@ async function uploadFile(file) {
   const form = new FormData();
   form.append("file", file, file.name);
   try {
-    const r = await fetch("/api/upload", { method: "POST", body: form });
+    const r = await fetch(apiUrl("/api/upload"), { method: "POST", body: form });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ error: r.statusText }));
       appendError(`upload failed: ${err.error || r.statusText}`);
@@ -1045,18 +1086,8 @@ async function startNewSession() {
 }
 
 async function openProjectInFinder() {
-  // Forward ?user= / ?project= from the current URL so the server opens
-  // THIS tab's workspace, not the default "main". Without this the POST
-  // had no query string and every click opened `parallax/main/`.
-  const cur = new URLSearchParams(window.location.search);
-  const qs = new URLSearchParams();
-  for (const k of ["user", "project"]) {
-    const v = cur.get(k);
-    if (v) qs.set(k, v);
-  }
-  const url = "/api/open_in_finder" + (qs.toString() ? "?" + qs.toString() : "");
   try {
-    const r = await fetch(url, {
+    const r = await fetch(apiUrl("/api/open_in_finder"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
