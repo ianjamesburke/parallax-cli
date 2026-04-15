@@ -193,20 +193,28 @@ def _users_root() -> Path:
     return _workspace_root() / "users"
 
 
-def _workspace_for(user: Optional[str], project: Optional[str] = None) -> Path:
+def _workspace_for(
+    user: Optional[str],
+    project: Optional[str] = None,
+    scaffold: bool = False,
+) -> Path:
     """
-    Resolve the working directory for a user + project pair.
+    Resolve the working directory for a user + project pair. Pure path
+    computation by default — pass `scaffold=True` only when the caller
+    is about to WRITE to the workspace. Without that flag a GET handler
+    can safely compute the workspace path without accidentally creating
+    a ghost folder on disk.
 
     New layout (beta):
-        PROJECT_DIR/parallax/users/<user>/<project>/
-    with raw media at PROJECT_DIR itself shared read-only across projects.
+        PROJECT_DIR/parallax/<project>/                  (single-user default)
+        PROJECT_DIR/parallax/users/<user>/<project>/     (per-user mode)
+
+    Raw media at PROJECT_DIR itself is shared read-only across projects
+    via _resolve_project_path's read_fallback.
 
     `project` defaults to "main". Two browser tabs with different
     `?project=` values are isolated and can run jobs in parallel without
     manifest collisions.
-
-    PARALLAX_SINGLE_USER=1 collapses everything to PROJECT_DIR/parallax/main/
-    for local one-user setups that don't want the users/ nesting.
     """
     project_safe = _sanitize_name(project or "main")
     if not PER_USER_WORKSPACES or not user:
@@ -219,7 +227,8 @@ def _workspace_for(user: Optional[str], project: Optional[str] = None) -> Path:
         workspace.relative_to(_workspace_root())
     except ValueError:
         workspace = _users_root() / "anon" / "main"
-    _ensure_workspace(workspace)
+    if scaffold:
+        _ensure_workspace(workspace)
     return workspace
 
 PARALLAX_CANDIDATES = (
@@ -390,7 +399,10 @@ class Session:
         self.id = session_id
         self.user = user or os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
         self.project = project or "main"
-        self.workspace = _workspace_for(self.user, self.project)
+        # Session creation is the write boundary — the very next thing
+        # that happens is an append to chat.jsonl + a dispatch subprocess
+        # that writes into the workspace. So scaffold eagerly here.
+        self.workspace = _workspace_for(self.user, self.project, scaffold=True)
         self.messages: list[dict[str, Any]] = []  # Anthropic messages format
         self.display_log: list[dict[str, Any]] = []  # normalized for /api/session
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
@@ -2208,7 +2220,11 @@ class Handler(BaseHTTPRequestHandler):
         if not safe_name or safe_name in (".", ".."):
             return self._write_error(400, "invalid filename")
 
-        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
+        # Upload is a write boundary — scaffold so all canonical subdirs
+        # exist, not just input/. The inline mkdir below is belt-and-suspenders.
+        workspace = _workspace_for(
+            self._get_request_user(), self._get_request_project(), scaffold=True,
+        )
         input_dir = workspace / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
         target = input_dir / safe_name
@@ -2371,9 +2387,8 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             return self._write_error(400, "name is required")
         user = self._get_request_user()
-        workspace = _workspace_for(user, name)
         try:
-            _ensure_workspace(workspace)
+            workspace = _workspace_for(user, name, scaffold=True)
         except Exception as e:
             return self._write_error(500, f"failed to create project: {e}")
         return self._write_json(200, {"name": name, "path": str(workspace)})
@@ -2619,6 +2634,16 @@ def preflight() -> None:
 def main() -> int:
     preflight()
     telemetry.init_db()
+
+    # Eagerly scaffold the default workspace in single-user mode so the
+    # sidebar has something to list on first load. In per-user mode we
+    # don't know who the default user is at startup, so each user's
+    # workspace is scaffolded lazily by the first request that touches it.
+    if not PER_USER_WORKSPACES:
+        try:
+            _ensure_workspace(_workspace_for(None, "main"))
+        except Exception as e:
+            print(f"parallax-web: default workspace scaffold failed: {e}", file=sys.stderr)
 
     port = find_free_port()
     host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")

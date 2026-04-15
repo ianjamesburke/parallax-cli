@@ -612,28 +612,20 @@ function closeLightbox() {
 
 // ----- sidebar -------------------------------------------------------------
 
-// Projects come from the filesystem (Drive folders on disk).
-// Sessions are nested under the active project.
+// Sidebar is a pure projection of what's on disk at PROJECT_DIR/parallax/.
+// No session merging, no telemetry lookups, no hidden cache — the server's
+// /api/projects endpoint reads the filesystem every time, and we poll it
+// on a short interval so a delete in Finder disappears almost immediately.
 const sidebarState = {
-  projects: [],       // [{name, path}] from /api/projects
-  sessions: [],       // from /api/sessions
-  activeProject: null, // currently selected project name
+  projects: [],  // [{name, path}] straight from /api/projects
 };
 
 async function refreshSidebar() {
   try {
-    const [projRes, sessRes] = await Promise.all([
-      fetch("/api/projects"),
-      fetch("/api/sessions"),
-    ]);
-    if (projRes.ok) {
-      const data = await projRes.json();
-      sidebarState.projects = data.projects || [];
-    }
-    if (sessRes.ok) {
-      const data = await sessRes.json();
-      sidebarState.sessions = data.sessions || [];
-    }
+    const r = await fetch("/api/projects");
+    if (!r.ok) return;
+    const data = await r.json();
+    sidebarState.projects = data.projects || [];
     renderSidebar();
   } catch (e) {
     console.error("sidebar fetch failed", e);
@@ -642,36 +634,17 @@ async function refreshSidebar() {
 
 function renderSidebar() {
   const list = $("sidebar-list");
-  const { projects, sessions, activeProject } = sidebarState;
+  const { projects } = sidebarState;
 
-  if (projects.length === 0 && sessions.length === 0) {
+  if (projects.length === 0) {
     list.innerHTML = '<div class="sidebar-empty">No projects yet. Hit + to create one.</div>';
     return;
-  }
-
-  // Build session lookup by project name
-  const sessionsByProject = {};
-  for (const s of sessions) {
-    const proj = s.project || "main";
-    if (!sessionsByProject[proj]) sessionsByProject[proj] = [];
-    sessionsByProject[proj].push(s);
-  }
-
-  // Merge: projects from disk + any orphan session projects not on disk.
-  // Work on a local copy — never mutate sidebarState.projects here.
-  const merged = [...projects];
-  const projectNames = new Set(merged.map((p) => p.name));
-  for (const proj of Object.keys(sessionsByProject)) {
-    if (!projectNames.has(proj)) {
-      merged.push({ name: proj, path: null });
-      projectNames.add(proj);
-    }
   }
 
   list.innerHTML = "";
   const currentProject = new URL(window.location.href).searchParams.get("project") || "main";
 
-  for (const proj of merged) {
+  for (const proj of projects) {
     const isActive = proj.name === currentProject;
 
     // Flat project row — no nested sessions. One chat per project, loaded
@@ -1103,7 +1076,9 @@ function init() {
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
-  setInterval(refreshSidebar, 5000);
+  // Short poll so Finder deletions + creates are reflected almost
+  // immediately. 2s is cheap — /api/projects is a bare iterdir.
+  setInterval(refreshSidebar, 2000);
   setInterval(refreshUsage, 30000);
 }
 
