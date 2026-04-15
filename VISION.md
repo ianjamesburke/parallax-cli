@@ -1,8 +1,8 @@
 # Parallax
 
-Parallax is a CLI-first video production tool. The goal is simple and absolute: handle everything involved with making a video, from raw footage to published content, driven by a single manifest and a clean command namespace.
+Parallax is the definitive CLI for AI-assisted video production. The goal is absolute: handle every stage of making a video — from raw footage to published content — through a single manifest and a clean command namespace. Not a GUI tool, not a cloud platform, not a wrapper around someone else's editor. A first-class CLI that a human or an agent can drive from brief to publish with no lock-in to any single AI provider.
 
-No GUI required. No proprietary timeline. No vendor lock-in to any one AI provider. Just a tool that a human or an agent can drive end-to-end.
+**Parallax is also a skill.** The CLI is designed to be fully agent-operable — structured output, machine-readable help text, `--json` NDJSON on every command, predictable exit codes, and `TEST_MODE` for offline pipeline verification. `SKILL.md` at the repo root is the agent's operating manual and stays synchronized with the current command surface. The external skill at `~/.agents/skills/parallax/` wraps that contract for Claude Code invocation.
 
 ## The Horizon
 
