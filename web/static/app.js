@@ -1092,18 +1092,74 @@ async function openProjectInFinder() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      appendError(`finder open failed: ${err.error || r.statusText}`);
+    if (r.ok) return;
+    // 404 means the current ?project= points at a missing workspace.
+    // Snap to main and try again once — otherwise the Finder click is
+    // a dead-end for anyone who lands in a stale URL.
+    if (r.status === 404) {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("project") && url.searchParams.get("project") !== "main") {
+        url.searchParams.delete("project");
+        window.history.replaceState({}, "", url);
+        refreshProjectBadge();
+        refreshSidebar();
+        await loadProjectChat();
+        const retry = await fetch(apiUrl("/api/open_in_finder"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (retry.ok) return;
+      }
     }
+    const err = await r.json().catch(() => ({}));
+    appendError(`finder open failed: ${err.error || r.statusText}`);
   } catch (e) {
     appendError(`finder open failed: ${e}`);
   }
 }
 
-function init() {
+// ----- stale URL guard -----------------------------------------------------
+
+// Before any user interaction, verify that the tab's ?project= actually
+// exists on disk. If not, rewrite the URL to main. This runs BEFORE
+// loadProjectChat() / refreshGallery() / the Finder button is wired, so
+// a stale param from a previous server run can't cause a 404 storm.
+async function snapStaleProjectToMain() {
+  const params = new URLSearchParams(window.location.search);
+  const currentProject = params.get("project");
+  if (!currentProject || currentProject === "main") return;
+  try {
+    const r = await fetch(apiUrl("/api/projects"));
+    if (!r.ok) return;
+    const data = await r.json();
+    const projects = data.projects || [];
+    const exists = projects.some((p) => p.name === currentProject);
+    if (!exists) {
+      console.warn(`project "${currentProject}" missing — snapping to main`);
+      const url = new URL(window.location.href);
+      url.searchParams.delete("project");
+      window.history.replaceState({}, "", url);
+    }
+  } catch (e) {
+    console.error("stale project check failed", e);
+  }
+}
+
+async function init() {
   initComposer();
   initDropZone();
+  // Wire the Finder button early but the click handler is gated on the
+  // stale-URL snap-back below — any click before the page finishes
+  // initializing is harmless because openProjectInFinder always reads
+  // window.location fresh via apiUrl().
+  const finderBtn = document.getElementById("finder-btn");
+  if (finderBtn) finderBtn.addEventListener("click", openProjectInFinder);
+
+  // Snap BEFORE loading chat / gallery so everything points at a valid
+  // workspace on first render.
+  await snapStaleProjectToMain();
+
   refreshProjectBadge();
   refreshGallery();
   refreshSidebar();
@@ -1111,9 +1167,7 @@ function init() {
   // Load this project's on-disk chat transcript on page load so reload
   // keeps the conversation. Empty transcript → welcome card.
   loadProjectChat();
-  // Wire the new Finder button in the header.
-  const finderBtn = document.getElementById("finder-btn");
-  if (finderBtn) finderBtn.addEventListener("click", openProjectInFinder);
+
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
