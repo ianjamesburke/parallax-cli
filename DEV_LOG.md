@@ -2,6 +2,16 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-15 — [CHANGED] web/server.py: Flask → FastAPI
+
+Replaced stdlib http.server with FastAPI + uvicorn. SSE streaming now uses sse-starlette
+EventSourceResponse (proper async, no manual write/flush). All request bodies are Pydantic
+models. Auto-generated OpenAPI docs available at /docs.
+
+**Breaks if:** `parallax web` fails to start, SSE stream from /api/stream/<id> stops
+delivering incremental tokens, or any existing frontend fetch call gets a 422
+instead of the expected response shape.
+
 ## 2026-04-15 — [CHANGED] generate voice --engine say + Mode 2 e2e test
 
 Added macOS `say` as a first-class voice engine option. `parallax generate voice --engine say`

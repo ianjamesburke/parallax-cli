@@ -3,10 +3,10 @@ server.py — parallax-web: localhost HTTP + SSE chat server backed by
 the Anthropic SDK and a custom tool-use agent loop.
 
 Design:
-    - stdlib http.server for routing + SSE (no Flask/FastAPI)
+    - FastAPI + uvicorn for routing, SSE, and static files
     - `anthropic` SDK for the model, streaming via client.messages.stream(...)
     - One agent thread per session, fed from POST /api/message
-    - SSE fan-out via a per-session queue.Queue read by GET /api/stream/<id>
+    - SSE fan-out via sse-starlette EventSourceResponse + per-session queue.Queue
     - SQLite telemetry via telemetry.py
     - Gallery: stills/ and output/ + drafts/, mtime-sorted
 
@@ -16,6 +16,7 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
@@ -24,7 +25,6 @@ import queue
 import re
 import shutil
 import socket
-import socketserver
 import subprocess
 import sys
 import threading
@@ -32,11 +32,16 @@ import time
 import traceback
 import uuid
 import webbrowser
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from typing import Any, List, Optional
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 # Local package imports
 _HERE = Path(__file__).resolve().parent
@@ -60,10 +65,6 @@ def _fal_whoami() -> dict:
     if not key:
         return {"configured": False, "identity": None, "error": None}
 
-    # TODO: verify — fal does not publish a single "whoami" endpoint. The
-    # queue API accepts `Authorization: Key <key>`; hitting the root returns
-    # 200 when the key is valid. Once fal documents a real identity route
-    # (or we find it in their dashboard's network tab) wire it up here.
     import urllib.request
     import urllib.error
 
@@ -84,14 +85,11 @@ def _fal_whoami() -> dict:
                     or data.get("user")
                     or data.get("id")
                 )
-            # Fallback: mask the key itself so the page shows *something*
-            # when fal doesn't return identifying fields.
             if not identity:
                 masked = key[:6] + "…" + key[-4:] if len(key) > 12 else "****"
                 identity = f"key {masked}"
             return {"configured": True, "identity": identity, "error": None}
     except urllib.error.HTTPError as e:
-        # A 401/403 means the key is present but invalid — still "configured".
         return {
             "configured": True,
             "identity": None,
@@ -112,9 +110,6 @@ def _fal_whoami() -> dict:
 MODEL = os.environ.get("PARALLAX_WEB_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = 16384
 
-# USD per million tokens. Used to compute per-session cost from usage deltas.
-# Numbers track Anthropic's public pricing. Prompt-cache pricing would be
-# different but we don't emit cache_control blocks yet.
 MODEL_PRICES = {
     "claude-sonnet-4-6":   {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-5":   {"input": 3.00, "output": 15.00},
@@ -131,6 +126,8 @@ def _model_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
         (input_tokens / 1_000_000.0) * price["input"]
         + (output_tokens / 1_000_000.0) * price["output"]
     )
+
+
 MAX_TEXT_FILE_BYTES = 256 * 1024
 ALLOWED_IMAGE_MIMES = {
     "image/png",
@@ -143,12 +140,6 @@ PROJECT_DIR = Path(os.environ.get("PARALLAX_PROJECT_DIR", os.getcwd())).resolve(
 STATIC_DIR = _HERE / "static"
 HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
 
-# Per-user workspaces are off by default — a local dev run collapses to
-# PROJECT_DIR/parallax/<project>/ with no users/<name>/ nesting, which is
-# the simple case and matches the single-operator office-computer
-# deployment. Flip on explicitly for multi-user scenarios via
-# PARALLAX_PER_USER_WORKSPACES=1, or implicitly when the server is
-# network-accessible (PARALLAX_WEB_HOST) or password-protected.
 _network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
 PER_USER_WORKSPACES = (
     not bool(os.environ.get("PARALLAX_SINGLE_USER"))
@@ -159,10 +150,6 @@ PER_USER_WORKSPACES = (
     )
 )
 
-# Top-level folder that scopes every parallax-managed directory under
-# PROJECT_DIR. Previously this was the hidden `.parallax/` sibling; in beta
-# it's a visible `parallax/` sibling that holds <project>/ subdirs (or
-# users/<user>/<project>/ when PER_USER_WORKSPACES is on).
 WORKSPACE_ROOT_NAME = "parallax"
 
 
@@ -184,12 +171,10 @@ def _ensure_workspace(workspace: Path) -> None:
 
 
 def _workspace_root() -> Path:
-    """PROJECT_DIR/parallax/ — scoped parallax-managed folder at master dir."""
     return PROJECT_DIR / WORKSPACE_ROOT_NAME
 
 
 def _users_root() -> Path:
-    """PROJECT_DIR/parallax/users/ — where every user workspace lives."""
     return _workspace_root() / "users"
 
 
@@ -199,22 +184,11 @@ def _workspace_for(
     scaffold: bool = False,
 ) -> Path:
     """
-    Resolve the working directory for a user + project pair. Pure path
-    computation by default — pass `scaffold=True` only when the caller
-    is about to WRITE to the workspace. Without that flag a GET handler
-    can safely compute the workspace path without accidentally creating
-    a ghost folder on disk.
+    Resolve the working directory for a user + project pair.
 
     New layout (beta):
         PROJECT_DIR/parallax/<project>/                  (single-user default)
         PROJECT_DIR/parallax/users/<user>/<project>/     (per-user mode)
-
-    Raw media at PROJECT_DIR itself is shared read-only across projects
-    via _resolve_project_path's read_fallback.
-
-    `project` defaults to "main". Two browser tabs with different
-    `?project=` values are isolated and can run jobs in parallel without
-    manifest collisions.
     """
     project_safe = _sanitize_name(project or "main")
     if not PER_USER_WORKSPACES or not user:
@@ -222,7 +196,6 @@ def _workspace_for(
     else:
         user_safe = _sanitize_name(user)
         workspace = (_users_root() / user_safe / project_safe).resolve()
-    # Safety: must be inside PROJECT_DIR/parallax/
     try:
         workspace.relative_to(_workspace_root())
     except ValueError:
@@ -230,6 +203,7 @@ def _workspace_for(
     if scaffold:
         _ensure_workspace(workspace)
     return workspace
+
 
 PARALLAX_CANDIDATES = (
     os.path.expanduser("~/.local/bin/parallax"),
@@ -240,9 +214,6 @@ PARALLAX_CANDIDATES = (
 
 
 def _find_parallax_bin() -> Optional[str]:
-    # Explicit override wins — lets tests / worktrees point at a specific
-    # binary without relying on PATH order (e.g. when ~/.local/bin/parallax
-    # symlinks to main while you're developing in a worktree).
     override = os.environ.get("PARALLAX_BIN")
     if override and os.path.isfile(override) and os.access(override, os.X_OK):
         return override
@@ -282,22 +253,6 @@ def _resolve_project_path(
     """
     Resolve `user_path` relative to a workspace and verify it stays inside
     the master PROJECT_DIR tree.
-
-    Two concentric sandboxes:
-      - primary:  the per-user workspace (where writes should land)
-      - fallback: PROJECT_DIR itself (the master launch dir, for cross-
-                  project shared raw media)
-
-    Relative paths are joined against the workspace first. If the resolved
-    path escapes the workspace (`..`), we fall back to joining against
-    PROJECT_DIR. When `read_fallback=True` the caller is doing a read, so
-    we also fall through to PROJECT_DIR when the workspace-side path is
-    valid but the file does not exist — that's how raw media at the master
-    dir becomes visible from any per-user project. For writes, leave
-    `read_fallback=False` so new files always land inside the workspace.
-
-    Absolute paths and `..` traversal are allowed only if the final
-    resolved path stays inside PROJECT_DIR.
     """
     if not isinstance(user_path, str) or not user_path:
         raise PathError("path must be a non-empty string")
@@ -314,7 +269,7 @@ def _resolve_project_path(
             resolved.relative_to(workspace)
             if not read_fallback or resolved.exists():
                 return resolved
-            escaped = True  # fall through to PROJECT_DIR for a read
+            escaped = True
         except ValueError:
             escaped = True
         if escaped:
@@ -335,7 +290,7 @@ def _resolve_project_path(
 
 
 # ---------------------------------------------------------------------------
-# Event formatting for dispatch NDJSON (ported from parallax-app/chat.py)
+# Event formatting for dispatch NDJSON
 # ---------------------------------------------------------------------------
 
 
@@ -390,48 +345,25 @@ def format_dispatch_event(evt: dict) -> str:
 
 
 class Session:
-    """
-    Per-session state: chat history, SSE subscribers, cancel flag, dispatch
-    bookkeeping. One instance per session_id.
-    """
-
     def __init__(self, session_id: str, user: Optional[str] = None, project: Optional[str] = None) -> None:
         self.id = session_id
         self.user = user or os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
         self.project = project or "main"
-        # Session creation is the write boundary — the very next thing
-        # that happens is an append to chat.jsonl + a dispatch subprocess
-        # that writes into the workspace. So scaffold eagerly here.
         self.workspace = _workspace_for(self.user, self.project, scaffold=True)
-        self.messages: list[dict[str, Any]] = []  # Anthropic messages format
-        self.display_log: list[dict[str, Any]] = []  # normalized for /api/session
+        self.messages: list[dict[str, Any]] = []
+        self.display_log: list[dict[str, Any]] = []
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
         self.cancel_event = threading.Event()
         self.agent_thread: Optional[threading.Thread] = None
         self.dispatch_proc: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
         self.created_at = time.time()
-        # Session-sticky test mode — tripped by the user typing "TEST MODE"
-        # (case-insensitive) in their message. Once on, stays on for the
-        # lifetime of the session and every subprocess runs with TEST_MODE=true.
         self.test_mode = False
-        # Session-sticky reference images — the frontend sends these with
-        # every /api/message POST. Populated per message so `parallax_create`
-        # tool calls can auto-inject them even if Claude forgets to set the
-        # `ref` arg. Cleared when the user explicitly deselects refs.
         self.selected_refs: list[str] = []
-        # Hydrate this session's Anthropic `messages` list from the
-        # project's on-disk chat.jsonl so a page reload keeps conversational
-        # context. Without this, every new tab would talk to Claude with a
-        # blank history even though the chat transcript is right there on
-        # disk.
         try:
             self._hydrate_from_chat_log()
         except Exception as e:
             print(f"session hydrate failed: {e}", file=sys.stderr, flush=True)
-        # Build the display_log too so /api/session history endpoints stay
-        # useful as a fallback, but the frontend now reads /api/chat directly
-        # for replay — this is just backfill.
         for turn in (_load_chat_history(self.workspace) or []):
             self.display_log.append({
                 "kind": f"{turn.get('role', 'user')}_message" if turn.get("role") == "user" else "assistant_text",
@@ -439,8 +371,6 @@ class Session:
                 "ts": turn.get("ts") or time.time(),
             })
         telemetry.create_session(session_id, str(self.workspace), MODEL, user=self.user)
-
-    # ---- SSE fan-out ------------------------------------------------------
 
     def subscribe(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=512)
@@ -461,24 +391,12 @@ class Session:
             try:
                 q.put_nowait(evt)
             except queue.Full:
-                # drop — client is too slow, they'll re-sync on refresh
                 pass
-
-    # ---- display log ------------------------------------------------------
 
     def push_display(self, kind: str, data: Any) -> None:
         self.display_log.append({"kind": kind, "data": data, "ts": time.time()})
 
-    # ---- chat.jsonl hydration --------------------------------------------
-
     def _hydrate_from_chat_log(self) -> None:
-        """
-        Load the project's on-disk chat.jsonl into `self.messages` so the
-        very first /api/message POST in a freshly-opened session already
-        has the full project history as context. Only text turns are
-        loaded; tool calls aren't replayed since they're stored in the
-        per-session telemetry, not chat.jsonl.
-        """
         turns = _load_chat_history(self.workspace)
         if not turns:
             return
@@ -502,8 +420,6 @@ def get_or_create_session(session_id: Optional[str], user: Optional[str] = None,
     with SESSIONS_LOCK:
         if session_id and session_id in SESSIONS:
             existing = SESSIONS[session_id]
-            # Reject if the session belongs to a different user — don't let one
-            # user resume another's session, even with a valid session_id.
             if PER_USER_WORKSPACES and user and existing.user != user:
                 print(
                     f"session {session_id}: user mismatch (owner={existing.user!r}, "
@@ -631,7 +547,7 @@ TOOL_SCHEMAS = [
                 "ref": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Reference image paths (relative to project root) for image-to-image generation. Use this when the user wants a new image based on one they uploaded.",
+                    "description": "Reference image paths (relative to project root) for image-to-image generation.",
                 },
             },
             "required": ["brief"],
@@ -646,20 +562,18 @@ TOOL_SCHEMAS = [
             "`type: video`, `source`, optional `start_s`/`end_s`). Both scene types "
             "support `vo_text`.\n\n"
             "Operations:\n"
-            "  set-scenes — replace the still scenes list. `values` is a list of specs in the form "
-            "'still_path:duration:motion'. Example: ['stills/a.png:3:zoom_in']\n"
-            "  add-scene — append one still scene. `values` is ['still_path']. Use `duration`/`motion` fields.\n"
-            "  add-video-scene — append a video scene. `values` is ['video_path']. Use `start_s`/`end_s`/`duration` fields.\n"
+            "  set-scenes — replace the still scenes list.\n"
+            "  add-scene — append one still scene.\n"
+            "  add-video-scene — append a video scene.\n"
             "  remove-scene — `values` is ['<number>'].\n"
             "  reorder — `values` is ['1,3,2'] (comma-separated scene numbers).\n"
-            "  set-vo — set the voiceover text for a scene. `values` is ['<scene_number>', '<vo text>']\n"
-            "  set-voice — pick the voiceover voice. `values` is ['<voice_name_or_id>']. "
-            "Shortcuts: george, rachel, domi, bella, antoni, arnold.\n"
-            "  set-headline — set a static headline overlay for the whole video. `values` is ['<headline text>']\n"
+            "  set-vo — set the voiceover text for a scene.\n"
+            "  set-voice — pick the voiceover voice.\n"
+            "  set-headline — set a static headline overlay for the whole video.\n"
             "  clear-headline — remove the headline overlay.\n"
-            "  enable-captions / disable-captions — toggle word-by-word caption burn in compose.\n"
-            "  set — set an arbitrary top-level key. `values` is ['<key>', '<value>'].\n"
-            "  show — print the current manifest. No values.\n\n"
+            "  enable-captions / disable-captions — toggle word-by-word caption burn.\n"
+            "  set — set an arbitrary top-level key.\n"
+            "  show — print the current manifest.\n\n"
             "ALWAYS use this tool to change the manifest. NEVER ask the user to edit YAML manually."
         ),
         "input_schema": {
@@ -712,12 +626,7 @@ TOOL_SCHEMAS = [
             "Generate an ElevenLabs voiceover AND auto-transcribe with WhisperX. "
             "Reads `vo_text` from each scene in the manifest, concatenates, and "
             "synthesizes the audio. Then automatically runs WhisperX phoneme-level "
-            "forced alignment to produce precise word-level timestamps, saved to "
-            "audio/vo_manifest.json. The WhisperX pass is mandatory and not "
-            "configurable — there is no other transcription path in parallax.\n\n"
-            "BEFORE calling this: each scene that should have spoken audio must "
-            "have a `vo_text` field set via edit_manifest set-vo. Optionally set "
-            "the voice via edit_manifest set-voice or pass it directly here.\n\n"
+            "forced alignment to produce precise word-level timestamps.\n\n"
             "Voice shortcuts: george, rachel, domi, bella, antoni, arnold.\n\n"
             "Output: audio/voiceover.mp3 + audio/vo_manifest.json (whisperx)."
         ),
@@ -743,12 +652,8 @@ TOOL_SCHEMAS = [
         "name": "parallax_transcribe",
         "description": (
             "Run WhisperX phoneme-level forced alignment on an audio file. "
-            "THE SINGULAR transcription path in parallax — there is no fallback "
-            "and no other backend. Every audio that needs word-level timestamps "
-            "MUST go through this command.\n\n"
-            "Use this when you need to re-transcribe an existing audio file (e.g. "
-            "after manual edits or trim-silence). For new voiceovers, parallax_voiceover "
-            "already auto-runs WhisperX so you don't need to call this separately."
+            "THE SINGULAR transcription path in parallax.\n\n"
+            "Use this when you need to re-transcribe an existing audio file."
         ),
         "input_schema": {
             "type": "object",
@@ -773,8 +678,7 @@ TOOL_SCHEMAS = [
         "description": (
             "Remove silent gaps from audio/voiceover.mp3 and rewrite "
             "vo_manifest.json word timestamps proportionally. Run AFTER "
-            "parallax_voiceover and BEFORE parallax_align. Optional — only use "
-            "if the voiceover has noticeable dead air."
+            "parallax_voiceover and BEFORE parallax_align."
         ),
         "input_schema": {
             "type": "object",
@@ -785,12 +689,8 @@ TOOL_SCHEMAS = [
         "name": "parallax_align",
         "description": (
             "Align each scene's duration to its vo_text word timing. Reads "
-            "audio/vo_manifest.json (WhisperX-derived), matches scene vo_text "
-            "first words to spoken words, and rewrites scene durations so the "
-            "visual timing exactly matches when the words are spoken. Run AFTER "
-            "voiceover (and trim-silence if used) and BEFORE compose.\n\n"
-            "This is the 'retie the manifest' step that makes scene cuts land "
-            "on sentence boundaries automatically."
+            "audio/vo_manifest.json, matches scene vo_text first words to spoken "
+            "words, and rewrites scene durations. Run AFTER voiceover and BEFORE compose."
         ),
         "input_schema": {
             "type": "object",
@@ -801,14 +701,7 @@ TOOL_SCHEMAS = [
         "name": "parallax_compose",
         "description": (
             "Render the project EXACTLY as specified in cwd/manifest.yaml. "
-            "This is the canonical render path — deterministic, no globbing, no "
-            "fallbacks. Compose is one command that does ALL post-processing: "
-            "scene clip rendering (Ken Burns for stills, trim+scale for video "
-            "scenes), concat, audio mux (if voiceover exists), headline overlay "
-            "(if manifest.headline is set), word-by-word caption burn (if "
-            "manifest.captions.enabled is true).\n\n"
-            "Always run edit_manifest first to set the scenes. For polished "
-            "videos with audio, run voiceover → align → compose in that order. "
+            "Always run edit_manifest first to set the scenes. "
             "Output: an mp4 in output/, plus output/latest.mp4 symlink."
         ),
         "input_schema": {
@@ -892,11 +785,6 @@ def tool_read_file(path: str, workspace: Optional[Path] = None) -> dict:
 
 
 def _sniff_image_mime(head: bytes) -> Optional[str]:
-    """
-    Detect the actual image format from the file header. Extensions lie —
-    Gemini sometimes returns JPEG bytes saved as .png, and Anthropic's API
-    rejects mime/content mismatches with a hard 400.
-    """
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):
@@ -909,12 +797,6 @@ def _sniff_image_mime(head: bytes) -> Optional[str]:
 
 
 def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
-    """
-    Returns a dict with either {"error": ...} or
-    {"image_block": {...}, "path": ..., "mime": ...}.
-    The image_block is a valid Anthropic image content block (source.type=base64).
-    Mime type is sniffed from the file header, not the extension.
-    """
     base = workspace or PROJECT_DIR
     try:
         resolved = _resolve_project_path(path, workspace=base)
@@ -928,8 +810,6 @@ def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
         raw = resolved.read_bytes()
     except Exception as e:
         return {"error": f"read failed: {e}"}
-
-    # Sniff the actual format from magic bytes; fall back to extension.
     mime = _sniff_image_mime(raw[:16])
     if mime is None:
         ext_mime, _ = mimetypes.guess_type(str(resolved))
@@ -966,17 +846,10 @@ def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
 
 
 def _clean_subprocess_env() -> dict:
-    """
-    Build an env dict that strips the parent process's venv so the parallax
-    CLI runs in its own installed Python (where its dependencies live).
-    Without this, a venv-launched server poisons every subprocess with a
-    Python interpreter that doesn't have parallax's deps.
-    """
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
-    # Rebuild PATH: strip any path that looks like a venv bin
     path_parts = env.get("PATH", "").split(":")
     cleaned = [p for p in path_parts if "/venv/" not in p and "/.venv/" not in p and "/virtualenvs/" not in p]
     if cleaned:
@@ -990,13 +863,6 @@ def _stream_parallax_subprocess(
     stdin_payload: Optional[str],
     label: str,
 ) -> str:
-    """
-    Common subprocess runner: spawn parallax, stream NDJSON events back to
-    the session SSE channel, return a short summary string.
-    """
-    # Run CLI subprocesses with the current (venv) interpreter so all installed
-    # deps (pyyaml, anthropic, etc.) are available — not the system python3 from
-    # the shebang line, which may be missing packages.
     if cmd and not cmd[0].endswith("python3") and not cmd[0].endswith("python"):
         cmd = [sys.executable] + cmd
     telemetry.record_event(session.id, "dispatch_start", {"cmd": " ".join(cmd[:3]), "label": label[:200]})
@@ -1113,17 +979,8 @@ def tool_parallax_create(
     bin_path = _find_parallax_bin()
     if bin_path is None:
         return "parallax CLI binary not found on PATH"
-    # Auto-inject session.selected_refs when the model forgets to. The
-    # user's intent is "use what I selected in the gallery", so if the tool
-    # call ships without a ref list we fill it in from the session. Claude
-    # can still override by passing an explicit empty list [] plus text
-    # like "ignore the selected references" — but nothing in the prompt
-    # contract encourages that, so in practice this closes the gap.
     if not ref and session.selected_refs:
         ref = list(session.selected_refs)
-    # Validate any reference paths — reads allowed to fall through to the
-    # master dir (read_fallback=True) so a project can point at raw media
-    # at the launch root.
     resolved_refs = []
     if ref:
         for r in ref:
@@ -1217,10 +1074,6 @@ def tool_edit_manifest(
     start_s: Optional[float] = None,
     end_s: Optional[float] = None,
 ) -> dict:
-    """
-    Edit the manifest by shelling out to `parallax manifest <op> ...` from
-    the user's workspace. Returns {"output": str, "error": Optional[str]}.
-    """
     bin_path = _find_parallax_bin()
     if bin_path is None:
         return {"error": "parallax CLI binary not found on PATH"}
@@ -1273,10 +1126,6 @@ def _lazy_client():
 def _execute_tool_calls(
     session: Session, tool_uses: list[dict]
 ) -> list[dict]:
-    """
-    Run each tool_use block and return a list of tool_result content blocks
-    suitable for the next user turn.
-    """
     results: list[dict] = []
     for tu in tool_uses:
         name = tu.get("name")
@@ -1338,10 +1187,6 @@ def _execute_tool_calls(
                     else:
                         script = _HERE.parent / "tools" / "storyboard.py"
                         try:
-                            # Use the venv's Python (sys.executable). Runtime
-                            # deps like Pillow must be installed in the venv
-                            # via web/requirements.txt — do NOT side-step the
-                            # venv by reaching out to system python.
                             result = subprocess.run(
                                 [sys.executable, str(script), str(dir_path), "--max", str(max_img)],
                                 capture_output=True, text=True, timeout=30,
@@ -1471,17 +1316,10 @@ def _execute_tool_calls(
 
 
 def _chat_log_path(workspace: Path) -> Path:
-    """`<workspace>/chat.jsonl` — one append-only chat transcript per project."""
     return workspace / "chat.jsonl"
 
 
 def _append_chat_turn(workspace: Path, role: str, text: str) -> None:
-    """
-    Append one chat turn to the project's chat.jsonl. Per-project, append
-    only, best-effort. Each line is `{"role", "text", "ts"}`. Used for
-    reload persistence — tool calls and dispatch events are deliberately
-    NOT logged here, only the human-readable user/assistant turns.
-    """
     if not text:
         return
     try:
@@ -1498,7 +1336,6 @@ def _append_chat_turn(workspace: Path, role: str, text: str) -> None:
 
 
 def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
-    """Read `<workspace>/chat.jsonl` into a list of turn dicts. [] if missing."""
     path = _chat_log_path(workspace)
     if not path.is_file():
         return []
@@ -1528,12 +1365,10 @@ def run_agent_turn(session: Session, user_text: str) -> None:
         session.broadcast("agent_done", {"ok": False})
         return
 
-    # Append user turn.
     user_content: list[dict] = [{"type": "text", "text": user_text}]
     session.messages.append({"role": "user", "content": user_content})
     session.push_display("user_message", {"text": user_text})
     telemetry.record_event(session.id, "user_message", {"text": user_text})
-    # Persist to project-scoped chat.jsonl so a reload keeps the convo.
     _append_chat_turn(session.workspace, "user", user_text)
 
     hop_prompt = _load_hop_prompt()
@@ -1573,7 +1408,6 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             session.broadcast("agent_done", {"ok": False})
             return
 
-        # Unpack final message content into serializable blocks for history.
         blocks: list[dict] = []
         text_chunks: list[str] = []
         tool_uses: list[dict] = []
@@ -1601,7 +1435,6 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             )
             _append_chat_turn(session.workspace, "assistant", joined)
 
-        # Update tokens + cost in telemetry.
         try:
             usage = getattr(final, "usage", None)
             if usage is not None:
@@ -1634,7 +1467,6 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             session.broadcast("agent_done", {"ok": True})
             return
 
-        # Run the tools and feed the results back.
         tool_results = _execute_tool_calls(session, tool_uses)
         session.messages.append({"role": "user", "content": tool_results})
 
@@ -1714,891 +1546,686 @@ def list_gallery(workspace: Optional[Path] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+_PASSWORD = os.environ.get("PARALLAX_WEB_PASSWORD", "")
+
+
+def _check_auth(request: Request) -> bool:
+    if not _PASSWORD:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        _, password = decoded.split(":", 1)
+        return password == _PASSWORD
+    except Exception:
+        return False
+
+
+def _require_auth(request: Request) -> None:
+    if not _check_auth(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": 'Basic realm="Parallax"'},
+        )
+
+
+def _get_user(request: Request) -> str:
+    user_param = request.query_params.get("user", "").strip()
+    if user_param:
+        return user_param
+    return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+
+
+def _get_project(request: Request) -> str:
+    proj_param = request.query_params.get("project", "").strip()
+    if proj_param:
+        return proj_param
+    return "main"
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request bodies
 # ---------------------------------------------------------------------------
 
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def handle_error(self, request, client_address):
-        # Suppress connection resets — these are normal when the browser
-        # closes a tab or refreshes while an SSE stream is open.
-        import sys
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
-            return
-        super().handle_error(request, client_address)
+class MessageRequest(BaseModel):
+    text: str
+    session_id: Optional[str] = None
+    reference_images: Optional[List[str]] = None
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "parallax-web/0.1"
+class CancelRequest(BaseModel):
+    session_id: str
 
-    # Silence the default request-logger noise.
-    def log_message(self, format: str, *args: Any) -> None:
-        if os.environ.get("PARALLAX_WEB_VERBOSE"):
-            super().log_message(format, *args)
 
-    # ---- auth + user identity --------------------------------------------
+class OpenInFinderRequest(BaseModel):
+    path: Optional[str] = None
 
-    _PASSWORD = os.environ.get("PARALLAX_WEB_PASSWORD", "")
 
-    def _check_auth(self) -> bool:
-        """Return True if auth passes (or no password is configured)."""
-        if not self._PASSWORD:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Basic "):
-            return False
+class DeleteImageRequest(BaseModel):
+    path: str
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app + lifespan
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    telemetry.init_db()
+    if not PER_USER_WORKSPACES:
         try:
-            decoded = base64.b64decode(auth[6:]).decode("utf-8")
-            _, password = decoded.split(":", 1)
-            return password == self._PASSWORD
-        except Exception:
-            return False
-
-    def _require_auth(self) -> bool:
-        """Send 401 and return False if auth fails."""
-        if self._check_auth():
-            return True
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Parallax"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-        return False
-
-    def _get_request_user(self) -> str:
-        """
-        Resolve the requesting user in priority order:
-          1. 'user' query param in the current request URL
-          2. $USER env var (server process owner)
-
-        No cookie fallback — cookies are HttpOnly so the frontend can't
-        clear them, which means a stale `parallax_user` cookie from a
-        previous load would leak into every subsequent request and the
-        user couldn't escape it without closing the tab. The frontend's
-        apiUrl() helper always sends an explicit ?user=/?project=, so
-        the cookie path is dead weight AND a footgun.
-        """
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        user_param = qs.get("user", [""])[0].strip()
-        if user_param:
-            return user_param
-        # Cookie fallback removed — see docstring.
-        return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
-
-    def _get_request_project(self) -> str:
-        """
-        Resolve the requesting project in priority order:
-          1. 'project' query param
-          2. 'main' (default)
-
-        No cookie fallback — see _get_request_user() for the rationale.
-        Frontend apiUrl() sends `?project=` on every project-scoped fetch,
-        so the server never has to guess.
-        """
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        proj_param = qs.get("project", [""])[0].strip()
-        if proj_param:
-            return proj_param
-        return "main"
-
-    def _maybe_set_user_cookie(self) -> list:
-        """
-        Dead code retained for binary compat with old callers. Cookies
-        are no longer part of the auth/routing story — the frontend
-        sends explicit ?user=/?project= on every request. This method
-        returns an empty list so _write_json and friends still work.
-        """
-        return []
-        # Legacy path below — unreachable, kept for reference only.
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        cookies = []
-        user_param = qs.get("user", [""])[0].strip()
-        if user_param:
-            safe = "".join(c for c in user_param if c.isalnum() or c in "-_")[:32]
-            if safe:
-                cookies.append(f"parallax_user={safe}; Path=/; SameSite=Strict; HttpOnly")
-        project_param = qs.get("project", [""])[0].strip()
-        if project_param:
-            safe = "".join(c for c in project_param if c.isalnum() or c in "-_")[:32]
-            if safe:
-                cookies.append(f"parallax_project={safe}; Path=/; SameSite=Strict; HttpOnly")
-        return cookies
-
-    # ---- helpers ---------------------------------------------------------
-
-    def _write_json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except Exception:
-            pass
-
-    def _write_error(self, status: int, message: str) -> None:
-        self._write_json(status, {"error": message})
-
-    def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or "0")
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else {}
+            _ensure_workspace(_workspace_for(None, "main"))
         except Exception as e:
-            print(f"http: bad json body: {e}", file=sys.stderr, flush=True)
-            return {}
-
-    # ---- routing ---------------------------------------------------------
-
-    def do_GET(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/" or path == "":
-            # Serve index and set user/project cookies if either was passed
-            cookies = self._maybe_set_user_cookie()
-            if cookies:
-                static_path = STATIC_DIR / "index.html"
-                try:
-                    body = static_path.read_bytes()
-                except Exception as e:
-                    return self._write_error(500, str(e))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                for c in cookies:
-                    self.send_header("Set-Cookie", c)
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except Exception:
-                    pass
-                return
-            return self._serve_static("index.html")
-
-        if path.startswith("/static/"):
-            rel = path[len("/static/"):]
-            return self._serve_static(rel)
-
-        if path.startswith("/media/"):
-            rel = path[len("/media/"):]
-            return self._serve_project_file(rel)
-
-        if path == "/api/gallery":
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            return self._write_json(200, list_gallery(workspace=workspace))
-
-        if path == "/api/sessions":
-            return self._handle_list_sessions()
-
-        if path == "/api/projects":
-            return self._handle_list_projects()
-
-        if path == "/api/usage":
-            return self._handle_usage()
-
-        if path == "/api/costs":
-            return self._handle_costs_report()
-
-        if path == "/costs":
-            return self._serve_static("costs.html")
-
-        if path == "/api/manifest":
-            return self._handle_manifest_report()
-
-        if path == "/manifest":
-            return self._serve_static("manifest.html")
-
-        if path == "/api/servers":
-            return self._write_json(200, {"servers": registry.list_servers()})
-
-        if path == "/api/chat":
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            return self._write_json(200, {
-                "workspace": str(workspace),
-                "project": workspace.name,
-                "turns": _load_chat_history(workspace),
-            })
-
-        if path.startswith("/api/session/") and path.endswith("/history"):
-            sid = path[len("/api/session/"):-len("/history")]
-            return self._handle_session_history(sid)
-
-        if path.startswith("/api/session/"):
-            sid = path[len("/api/session/"):]
-            s = SESSIONS.get(sid)
-            if s is None:
-                return self._write_json(
-                    200, {"session_id": sid, "log": telemetry.load_session_events(sid)}
-                )
-            return self._write_json(
-                200, {"session_id": sid, "log": s.display_log}
-            )
-
-        if path.startswith("/api/stream/"):
-            sid = path[len("/api/stream/"):]
-            return self._serve_sse(sid)
-
-        self._write_error(404, f"not found: {path}")
-
-    def do_POST(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/api/message":
-            body = self._read_json_body()
-            text = (body.get("text") or "").strip()
-            if not text:
-                return self._write_error(400, "text is required")
-            sid = body.get("session_id")
-            user = self._get_request_user()
-            project = self._get_request_project()
-            session = get_or_create_session(
-                sid if isinstance(sid, str) else None,
-                user=user, project=project,
-            )
-            # Capture selected reference images on the session so
-            # tool_parallax_create can auto-inject them even if Claude
-            # doesn't set `ref` explicitly. Also prepend a visible hint to
-            # the user turn so the model knows refs are in play.
-            ref_images = body.get("reference_images")
-            if isinstance(ref_images, list):
-                session.selected_refs = [str(p) for p in ref_images if p]
-            if session.selected_refs:
-                paths_str = ", ".join(session.selected_refs)
-                text = f"[Reference images selected: {paths_str}]\n\n{text}"
-            # Session-sticky TEST MODE trigger: if the user's message contains
-            # "TEST MODE" (case-insensitive, whole phrase), flip the session
-            # into test mode. Every subprocess dispatch then runs with
-            # TEST_MODE=true, so Gemini/ElevenLabs are never called.
-            if re.search(r"\bTEST\s+MODE\b", text, re.IGNORECASE):
-                session.test_mode = True
-                print(f"session {session.id}: TEST MODE enabled", file=sys.stderr, flush=True)
-            start_agent_thread(session, text)
-            return self._write_json(200, {"session_id": session.id, "project": session.project})
-
-        if path == "/api/projects":
-            return self._handle_create_project()
-
-        if path == "/api/cancel":
-            body = self._read_json_body()
-            sid = body.get("session_id")
-            if not isinstance(sid, str):
-                return self._write_error(400, "session_id required")
-            s = SESSIONS.get(sid)
-            if s is None:
-                return self._write_error(404, "no such session")
-            s.cancel_event.set()
-            proc = s.dispatch_proc
-            if proc is not None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            return self._write_json(200, {"ok": True})
-
-        if path == "/api/upload":
-            return self._handle_upload()
-
-        if path == "/api/open_in_finder":
-            body = self._read_json_body()
-            user_path = body.get("path") or ""
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            if user_path:
-                try:
-                    target = _resolve_project_path(user_path, workspace=workspace)
-                except PathError as e:
-                    return self._write_error(400, str(e))
-            else:
-                target = workspace
-            # Refuse to launch Finder against a path that doesn't exist —
-            # `open` swallows the error and the user sees nothing.
-            if not target.exists():
-                return self._write_error(
-                    404, f"path does not exist: {target}",
-                )
-            try:
-                result = subprocess.run(
-                    ["open", str(target)],
-                    capture_output=True, text=True, timeout=5,
-                )
-            except Exception as e:
-                return self._write_error(500, f"open failed: {e}")
-            if result.returncode != 0:
-                err = (result.stderr or "").strip() or f"open exit {result.returncode}"
-                return self._write_error(500, f"open failed: {err}")
-            return self._write_json(200, {"ok": True, "path": str(target)})
-
-        self._write_error(404, f"not found: {path}")
-
-    def do_DELETE(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/api/image":
-            body = self._read_json_body()
-            rel = (body.get("path") or "").strip()
-            if not rel:
-                return self._write_error(400, "path is required")
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            try:
-                target = _resolve_project_path(rel, workspace=workspace)
-            except PathError as e:
-                return self._write_error(400, str(e))
-            if not target.is_file():
-                return self._write_error(404, "file not found")
-            try:
-                subprocess.run(
-                    ["osascript", "-e",
-                     f'tell application "Finder" to delete POSIX file "{target}"'],
-                    check=True, capture_output=True,
-                )
-            except Exception as e:
-                return self._write_error(500, f"trash failed: {e}")
-            return self._write_json(200, {"ok": True, "path": rel})
-
-        if path.startswith("/api/session/"):
-            sid = path[len("/api/session/"):]
-            if not sid:
-                return self._write_error(400, "session_id required")
-            # Cancel any live session first
-            with SESSIONS_LOCK:
-                live = SESSIONS.get(sid)
-            if live:
-                live.cancel_event.set()
-                if live.dispatch_proc:
-                    try:
-                        live.dispatch_proc.kill()
-                    except Exception:
-                        pass
-            removed = telemetry.delete_session(sid)
-            with SESSIONS_LOCK:
-                SESSIONS.pop(sid, None)
-            return self._write_json(200, {"ok": True, "removed": removed})
-
-        if path.startswith("/api/projects/"):
-            name = unquote(path[len("/api/projects/"):])
-            return self._handle_delete_project(name)
-
-        self._write_error(404, f"not found: {path}")
-
-    # ---- projects --------------------------------------------------------
-
-    def _handle_delete_project(self, name: str) -> None:
-        """
-        DELETE /api/projects/<name> — remove a per-user project workspace.
-
-        Refuses to delete `main` (the default, always required) and refuses
-        to delete the caller's currently-active project (which would pull
-        the rug out from under their running session). Raw media at the
-        master dir is never touched — this only nukes the nested workspace.
-        """
-        name = _sanitize_name(name or "")
-        if not name:
-            return self._write_error(400, "project name is required")
-        if name == "main":
-            return self._write_error(400, "cannot delete the default 'main' project")
-        current = self._get_request_project() or "main"
-        if name == current:
-            return self._write_error(
-                400,
-                f"cannot delete the active project '{name}'. Switch to another project first.",
-            )
-        user = self._get_request_user()
-        if PER_USER_WORKSPACES and user:
-            workspace = (_users_root() / _sanitize_name(user) / name).resolve()
-            scope = _users_root() / _sanitize_name(user)
-        else:
-            workspace = (_workspace_root() / name).resolve()
-            scope = _workspace_root()
-        # Belt-and-suspenders: the target must live inside the expected scope.
-        try:
-            workspace.relative_to(scope.resolve())
-        except ValueError:
-            return self._write_error(400, "invalid project path")
-        if not workspace.is_dir():
-            return self._write_error(404, f"project '{name}' not found")
-        try:
-            shutil.rmtree(workspace)
-        except Exception as e:
-            return self._write_error(500, f"failed to delete: {e}")
-        return self._write_json(200, {"ok": True, "deleted": name})
-
-    # ---- upload ----------------------------------------------------------
-
-    def _handle_upload(self) -> None:
-        """
-        POST /api/upload — multipart/form-data with a single 'file' field.
-        Writes to <user_workspace>/input/<filename>. Sanitizes filename.
-        """
-        ctype = self.headers.get("Content-Type", "")
-        if not ctype.startswith("multipart/form-data"):
-            return self._write_error(400, "Content-Type must be multipart/form-data")
-
-        # Extract boundary
-        try:
-            _, params = ctype.split(";", 1)
-            boundary = None
-            for part in params.split(";"):
-                part = part.strip()
-                if part.startswith("boundary="):
-                    boundary = part[len("boundary="):].strip('"')
-                    break
-            if not boundary:
-                return self._write_error(400, "missing multipart boundary")
-        except Exception:
-            return self._write_error(400, "could not parse Content-Type")
-
-        try:
-            length = int(self.headers.get("Content-Length") or "0")
-        except ValueError:
-            return self._write_error(400, "invalid Content-Length")
-        if length <= 0 or length > 50 * 1024 * 1024:  # 50 MB cap
-            return self._write_error(400, "file too large or empty (max 50 MB)")
-
-        try:
-            body = self.rfile.read(length)
-        except Exception as e:
-            return self._write_error(500, f"read failed: {e}")
-
-        # Parse multipart manually — we only need the first file field
-        boundary_bytes = ("--" + boundary).encode("ascii")
-        parts = body.split(boundary_bytes)
-        filename = None
-        file_data = None
-        for part in parts:
-            if not part or part == b"--\r\n" or part == b"--":
-                continue
-            # Each part: \r\nheader\r\nheader\r\n\r\nbody\r\n
-            try:
-                header_blob, _, payload = part.lstrip(b"\r\n").partition(b"\r\n\r\n")
-                headers_text = header_blob.decode("latin-1", errors="ignore")
-                if "filename=" not in headers_text:
-                    continue
-                # Pull filename
-                for h in headers_text.split("\r\n"):
-                    if h.lower().startswith("content-disposition"):
-                        for token in h.split(";"):
-                            token = token.strip()
-                            if token.startswith("filename="):
-                                filename = token[len("filename="):].strip('"')
-                                break
-                        break
-                if filename:
-                    file_data = payload.rstrip(b"\r\n")
-                    break
-            except Exception:
-                continue
-
-        if not filename or file_data is None:
-            return self._write_error(400, "no file field in upload")
-
-        # Sanitize filename: basename only, ASCII alnum + . _ - and collapse
-        # runs of unsafe chars to a single underscore. Preserves spaces as
-        # underscores so screenshot names stay readable.
-        filename = os.path.basename(filename)
-        safe_chars = []
-        prev_underscore = False
-        for c in filename:
-            # Only ASCII letters/digits — c.isalnum() would let through Unicode.
-            if (c.isascii() and c.isalnum()) or c in "._-":
-                safe_chars.append(c)
-                prev_underscore = False
-            else:
-                if not prev_underscore:
-                    safe_chars.append("_")
-                    prev_underscore = True
-        safe_name = "".join(safe_chars).strip("_")[:200]
-        if not safe_name or safe_name in (".", ".."):
-            return self._write_error(400, "invalid filename")
-
-        # Upload is a write boundary — scaffold so all canonical subdirs
-        # exist, not just input/. The inline mkdir below is belt-and-suspenders.
-        workspace = _workspace_for(
-            self._get_request_user(), self._get_request_project(), scaffold=True,
+            print(f"parallax-web: default workspace scaffold failed: {e}", file=sys.stderr)
+    try:
+        registry.install_shutdown_hooks()
+        port = int(os.environ.get("_PARALLAX_PORT", "0"))
+        host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
+        registry.register(
+            cwd=str(PROJECT_DIR),
+            host=host,
+            port=port,
+            user=os.environ.get("USER", "unknown"),
         )
-        input_dir = workspace / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        target = input_dir / safe_name
+    except Exception as e:
+        print(f"parallax-web: registry register failed: {e}", file=sys.stderr)
+    yield
+    # Shutdown
+    try:
+        registry.deregister()
+    except Exception:
+        pass
 
+
+app = FastAPI(title="parallax-web", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files if the directory exists
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Routes — GET
+# ---------------------------------------------------------------------------
+
+
+@app.get("/")
+async def serve_index(request: Request):
+    _require_auth(request)
+    index = STATIC_DIR / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=404, detail="index.html not found")
+    return FileResponse(str(index), media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/costs")
+async def serve_costs_page(request: Request):
+    _require_auth(request)
+    page = STATIC_DIR / "costs.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="costs.html not found")
+    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/manifest")
+async def serve_manifest_page(request: Request):
+    _require_auth(request)
+    page = STATIC_DIR / "manifest.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="manifest.html not found")
+    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/media/{rel_path:path}")
+async def serve_project_file(rel_path: str, request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    try:
+        target = _resolve_project_path(rel_path, workspace=workspace, read_fallback=True)
+    except PathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"not found: {rel_path}")
+    mime, _ = mimetypes.guess_type(str(target))
+    return FileResponse(
+        str(target),
+        media_type=mime or "application/octet-stream",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/gallery")
+async def api_gallery(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    return JSONResponse(list_gallery(workspace=workspace))
+
+
+@app.get("/api/sessions")
+async def api_list_sessions(request: Request):
+    _require_auth(request)
+    request_user = _get_user(request) if PER_USER_WORKSPACES else None
+    try:
+        sessions = telemetry.list_sessions(limit=50, user=request_user)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"sessions query failed: {e}")
+
+    with SESSIONS_LOCK:
+        live_ids = {
+            sid for sid, s in SESSIONS.items()
+            if s.agent_thread and s.agent_thread.is_alive()
+        }
+
+    sessions_out = []
+    for s in sessions:
+        preview = (s.get("first_user_message") or "")[:80]
+        sid = s.get("id")
+        project_dir = s.get("project_dir") or ""
         try:
-            target.write_bytes(file_data)
-        except Exception as e:
-            return self._write_error(500, f"write failed: {e}")
-
-        rel_path = str(target.relative_to(workspace))
-        return self._write_json(200, {
-            "ok": True,
-            "path": rel_path,
-            "size": len(file_data),
+            project_name = Path(project_dir).name if project_dir else "main"
+        except Exception:
+            project_name = "main"
+        sessions_out.append({
+            "id": sid,
+            "started_at": s.get("started_at"),
+            "last_activity_at": s.get("last_activity_at"),
+            "event_count": s.get("event_count", 0),
+            "preview": preview,
+            "project": project_name,
+            "user": s.get("user") or "",
+            "live": sid in live_ids,
         })
 
-    # ---- usage / cost ----------------------------------------------------
+    return JSONResponse({"sessions": sessions_out})
 
-    def _handle_usage(self) -> None:
-        """
-        GET /api/usage — aggregate cost/tokens for the requesting user.
-        Returns today's (rolling 24h) and lifetime spend by scanning the
-        JSONL log once per query.
-        """
-        user = self._get_request_user()
-        now = time.time()
-        day_start = now - 86400
 
-        try:
-            lifetime = telemetry.usage_for_user(user)
-            today = telemetry.usage_for_user(user, since_ts=day_start)
-        except Exception as e:
-            return self._write_error(500, f"usage query failed: {e}")
+@app.get("/api/projects")
+async def api_list_projects(request: Request):
+    _require_auth(request)
+    user = _get_user(request)
+    if PER_USER_WORKSPACES and user:
+        user_root = (_users_root() / _sanitize_name(user)).resolve()
+    else:
+        user_root = _workspace_root()
 
-        return self._write_json(200, {
-            "user": user,
-            "today": today,
-            "lifetime": lifetime,
-        })
+    projects = []
+    try:
+        if user_root.exists():
+            for entry in sorted(user_root.iterdir()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    projects.append({"name": entry.name, "path": str(entry)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to list projects: {e}")
 
-    def _handle_manifest_report(self) -> None:
-        """
-        GET /api/manifest — parsed workspace manifest.yaml + a scene list
-        with resolved thumbnail URLs. Honors ?user= and ?project= via the
-        same rules as the rest of the app, so the manifest view can be
-        bookmarked for a specific workspace.
-        """
-        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-        manifest_path = workspace / "manifest.yaml"
-        if not manifest_path.is_file():
-            return self._write_json(200, {
-                "exists": False,
-                "workspace": str(workspace),
-                "manifest": None,
-                "voiceover": None,
-                "scenes": [],
-            })
-        try:
-            import yaml as _yaml
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                raw = _yaml.safe_load(f) or {}
-        except Exception as e:
-            return self._write_error(500, f"manifest read failed: {e}")
+    return JSONResponse({"projects": projects, "user": user or ""})
 
-        scenes_out: list[dict] = []
-        for s in (raw.get("scenes") or []):
-            if not isinstance(s, dict):
-                continue
-            still_rel = s.get("still") or ""
-            still_url = None
-            if still_rel:
-                # /media/... resolves via _resolve_project_path with read
-                # fallback, so this works for master-dir and workspace stills.
-                still_url = f"/media/{still_rel}"
-            scenes_out.append({
-                "number": s.get("number"),
-                "title": s.get("title"),
-                "duration": s.get("duration"),
-                "still": still_rel,
-                "still_url": still_url,
-                "motion": s.get("motion"),
-                "vo_text": s.get("vo_text") or "",
-            })
 
-        # Voiceover block gets its own shape so the UI can link to the
-        # audio file + display word count / duration if present.
-        vo = raw.get("voiceover") or {}
-        vo_out = None
-        if isinstance(vo, dict) and vo:
-            audio_rel = vo.get("audio_file") or ""
-            vo_out = {
-                "audio_file": audio_rel,
-                "audio_url": f"/media/{audio_rel}" if audio_rel else None,
-                "vo_manifest": vo.get("vo_manifest"),
-                "duration_s": vo.get("duration_s"),
-                "script": vo.get("script"),
-                "transcribed_by": vo.get("transcribed_by"),
-            }
+@app.get("/api/usage")
+async def api_usage(request: Request):
+    _require_auth(request)
+    user = _get_user(request)
+    now = time.time()
+    day_start = now - 86400
+    try:
+        lifetime = telemetry.usage_for_user(user)
+        today = telemetry.usage_for_user(user, since_ts=day_start)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"usage query failed: {e}")
+    return JSONResponse({"user": user, "today": today, "lifetime": lifetime})
 
-        return self._write_json(200, {
-            "exists": True,
+
+@app.get("/api/costs")
+async def api_costs(request: Request):
+    _require_auth(request)
+    user_param = request.query_params.get("user", "").strip() or None
+    try:
+        report = costs.build_report(user_param)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"costs build failed: {e}")
+    report["fal"] = _fal_whoami()
+    return JSONResponse(report)
+
+
+@app.get("/api/manifest")
+async def api_manifest(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    manifest_path = workspace / "manifest.yaml"
+    if not manifest_path.is_file():
+        return JSONResponse({
+            "exists": False,
             "workspace": str(workspace),
-            "project": workspace.name,
-            "brief": raw.get("brief"),
-            "concept_id": raw.get("concept_id"),
-            "voice": raw.get("voice") or {},
-            "voiceover": vo_out,
-            "headline": raw.get("headline"),
-            "captions": raw.get("captions") or {},
-            "scenes": scenes_out,
-            "raw": raw,
+            "manifest": None,
+            "voiceover": None,
+            "scenes": [],
+        })
+    try:
+        import yaml as _yaml
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"manifest read failed: {e}")
+
+    scenes_out: list[dict] = []
+    for s in (raw.get("scenes") or []):
+        if not isinstance(s, dict):
+            continue
+        still_rel = s.get("still") or ""
+        still_url = f"/media/{still_rel}" if still_rel else None
+        scenes_out.append({
+            "number": s.get("number"),
+            "title": s.get("title"),
+            "duration": s.get("duration"),
+            "still": still_rel,
+            "still_url": still_url,
+            "motion": s.get("motion"),
+            "vo_text": s.get("vo_text") or "",
         })
 
-    def _handle_costs_report(self) -> None:
-        """
-        GET /api/costs — full cost breakdown (LLM + image + video) folded
-        from the JSONL event log. Honors ?user= for per-user filtering.
-        Also fetches the fal account identity if FAL_KEY or FAL_API_KEY is
-        set on the server process — that is the only live network call in
-        the handler and it is wrapped in a short timeout.
-        """
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        user_param = qs.get("user", [""])[0].strip() or None
+    vo = raw.get("voiceover") or {}
+    vo_out = None
+    if isinstance(vo, dict) and vo:
+        audio_rel = vo.get("audio_file") or ""
+        vo_out = {
+            "audio_file": audio_rel,
+            "audio_url": f"/media/{audio_rel}" if audio_rel else None,
+            "vo_manifest": vo.get("vo_manifest"),
+            "duration_s": vo.get("duration_s"),
+            "script": vo.get("script"),
+            "transcribed_by": vo.get("transcribed_by"),
+        }
 
+    return JSONResponse({
+        "exists": True,
+        "workspace": str(workspace),
+        "project": workspace.name,
+        "brief": raw.get("brief"),
+        "concept_id": raw.get("concept_id"),
+        "voice": raw.get("voice") or {},
+        "voiceover": vo_out,
+        "headline": raw.get("headline"),
+        "captions": raw.get("captions") or {},
+        "scenes": scenes_out,
+        "raw": raw,
+    })
+
+
+@app.get("/api/servers")
+async def api_servers(request: Request):
+    _require_auth(request)
+    return JSONResponse({"servers": registry.list_servers()})
+
+
+@app.get("/api/chat")
+async def api_chat(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    return JSONResponse({
+        "workspace": str(workspace),
+        "project": workspace.name,
+        "turns": _load_chat_history(workspace),
+    })
+
+
+@app.get("/api/session/{session_id}/history")
+async def api_session_history(session_id: str, request: Request):
+    _require_auth(request)
+    events = telemetry.load_session_events(session_id)
+    messages = []
+    for ev in events:
+        kind = ev.get("kind", "")
+        p = ev.get("payload", {})
         try:
-            report = costs.build_report(user_param)
-        except Exception as e:
-            return self._write_error(500, f"costs build failed: {e}")
-
-        # Fal whoami — best-effort, stdlib urllib only.
-        report["fal"] = _fal_whoami()
-        return self._write_json(200, report)
-
-    # ---- projects (filesystem-backed) -----------------------------------
-
-    def _handle_list_projects(self) -> None:
-        """GET /api/projects — list every project folder owned by the user."""
-        user = self._get_request_user()
-        if PER_USER_WORKSPACES and user:
-            user_root = (_users_root() / _sanitize_name(user)).resolve()
-        else:
-            user_root = _workspace_root()
-
-        projects = []
-        try:
-            if user_root.exists():
-                for entry in sorted(user_root.iterdir()):
-                    if entry.is_dir() and not entry.name.startswith("."):
-                        projects.append({"name": entry.name, "path": str(entry)})
-        except Exception as e:
-            return self._write_error(500, f"failed to list projects: {e}")
-
-        return self._write_json(200, {"projects": projects, "user": user or ""})
-
-    def _handle_create_project(self) -> None:
-        """POST /api/projects — create a new project folder."""
-        body = self._read_json_body()
-        name = _sanitize_name(body.get("name") or "")
-        if not name:
-            return self._write_error(400, "name is required")
-        user = self._get_request_user()
-        try:
-            workspace = _workspace_for(user, name, scaffold=True)
-        except Exception as e:
-            return self._write_error(500, f"failed to create project: {e}")
-        return self._write_json(200, {"name": name, "path": str(workspace)})
-
-    # ---- session history -------------------------------------------------
-
-    def _handle_list_sessions(self) -> None:
-        """GET /api/sessions — recent sessions with preview text and live status."""
-        request_user = self._get_request_user() if PER_USER_WORKSPACES else None
-        try:
-            sessions = telemetry.list_sessions(limit=50, user=request_user)
-        except Exception as e:
-            return self._write_error(500, f"sessions query failed: {e}")
-
-        # Snapshot which sessions are currently live (agent thread alive)
-        with SESSIONS_LOCK:
-            live_ids = {
-                sid for sid, s in SESSIONS.items()
-                if s.agent_thread and s.agent_thread.is_alive()
-            }
-
-        sessions_out = []
-        for s in sessions:
-            preview = (s.get("first_user_message") or "")[:80]
-            sid = s.get("id")
-            # Extract just the project name from the full project_dir path
-            project_dir = s.get("project_dir") or ""
-            try:
-                project_name = Path(project_dir).name if project_dir else "main"
-            except Exception:
-                project_name = "main"
-            sessions_out.append({
-                "id": sid,
-                "started_at": s.get("started_at"),
-                "last_activity_at": s.get("last_activity_at"),
-                "event_count": s.get("event_count", 0),
-                "preview": preview,
-                "project": project_name,
-                "user": s.get("user") or "",
-                "live": sid in live_ids,
-            })
-
-        return self._write_json(200, {"sessions": sessions_out})
-
-    def _handle_session_history(self, session_id: str) -> None:
-        """GET /api/session/<id>/history — reconstructed message list."""
-        events = telemetry.load_session_events(session_id)
-        messages = []
-        for ev in events:
-            kind = ev.get("kind", "")
-            p = ev.get("payload", {})
-            try:
-                if kind == "user_message":
-                    messages.append({"role": "user", "text": p.get("text", "")})
-                elif kind == "assistant_text":
-                    messages.append({"role": "assistant", "text": p.get("text", "")})
-                elif kind == "tool_use":
-                    messages.append({
-                        "role": "tool_use",
-                        "name": p.get("name", ""),
-                        "args": p.get("input", {}),
-                        "tool_id": p.get("id", ""),
-                    })
-                elif kind == "tool_result":
-                    messages.append({
-                        "role": "tool_result",
-                        "tool_id": p.get("id", ""),
-                        "summary": p.get("summary", ""),
-                    })
-                elif kind == "dispatch_start":
-                    mode = p.get("mode", "")
-                    preview = p.get("brief_preview", "")
-                    messages.append({
-                        "role": "dispatch",
-                        "phase": "starting",
-                        "text": f"dispatching ({mode}): {preview}",
-                    })
-                elif kind == "dispatch_complete":
-                    cancelled = p.get("cancelled")
-                    if cancelled:
-                        text = "dispatch cancelled"
+            if kind == "user_message":
+                messages.append({"role": "user", "text": p.get("text", "")})
+            elif kind == "assistant_text":
+                messages.append({"role": "assistant", "text": p.get("text", "")})
+            elif kind == "tool_use":
+                messages.append({
+                    "role": "tool_use",
+                    "name": p.get("name", ""),
+                    "args": p.get("input", {}),
+                    "tool_id": p.get("id", ""),
+                })
+            elif kind == "tool_result":
+                messages.append({
+                    "role": "tool_result",
+                    "tool_id": p.get("id", ""),
+                    "summary": p.get("summary", ""),
+                })
+            elif kind == "dispatch_start":
+                mode = p.get("mode", "")
+                preview = p.get("brief_preview", "")
+                messages.append({
+                    "role": "dispatch",
+                    "phase": "starting",
+                    "text": f"dispatching ({mode}): {preview}",
+                })
+            elif kind == "dispatch_complete":
+                cancelled = p.get("cancelled")
+                if cancelled:
+                    text = "dispatch cancelled"
+                else:
+                    rc = p.get("rc")
+                    out = p.get("output_path", "")
+                    err = p.get("error", "")
+                    if rc == 0:
+                        text = f"render complete: {out}" if out else "render complete"
                     else:
-                        rc = p.get("rc")
-                        out = p.get("output_path", "")
-                        err = p.get("error", "")
-                        if rc == 0:
-                            text = f"render complete: {out}" if out else "render complete"
-                        else:
-                            text = f"dispatch failed rc={rc}: {err}" if err else f"dispatch failed rc={rc}"
-                    messages.append({"role": "dispatch", "phase": "done", "text": text})
-                elif kind == "dispatch_error":
-                    messages.append({
-                        "role": "dispatch",
-                        "phase": "error",
-                        "text": p.get("error", "dispatch error"),
-                    })
-                elif kind == "error":
-                    messages.append({"role": "error", "text": p.get("message", str(p))})
-                # skip other event kinds (dispatch_event raw lines, etc.)
-            except Exception as e:
-                print(
-                    f"history: failed to convert event kind={kind}: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-        return self._write_json(200, {"session_id": session_id, "messages": messages})
-
-    # ---- static + media --------------------------------------------------
-
-    def _serve_static(self, rel: str) -> None:
-        safe = (STATIC_DIR / rel).resolve()
-        try:
-            safe.relative_to(STATIC_DIR)
-        except ValueError:
-            return self._write_error(400, "bad path")
-        if not safe.is_file():
-            return self._write_error(404, f"static not found: {rel}")
-        mime, _ = mimetypes.guess_type(str(safe))
-        data = safe.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(data)
-        except Exception:
-            pass
-
-    def _serve_project_file(self, rel: str) -> None:
-        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-        # URL-decode the path — browsers percent-escape spaces and non-ASCII
-        # chars, but Path resolution needs the raw filename.
-        rel = unquote(rel)
-        try:
-            # `read_fallback=True` lets any project read raw media dropped
-            # at the master launch dir — core to the beta cross-project
-            # layout. Writes still target the workspace.
-            target = _resolve_project_path(rel, workspace=workspace, read_fallback=True)
-        except PathError as e:
-            return self._write_error(400, str(e))
-        if not target.is_file():
-            return self._write_error(404, f"not found: {rel}")
-        mime, _ = mimetypes.guess_type(str(target))
-        try:
-            data = target.read_bytes()
+                        text = f"dispatch failed rc={rc}: {err}" if err else f"dispatch failed rc={rc}"
+                messages.append({"role": "dispatch", "phase": "done", "text": text})
+            elif kind == "dispatch_error":
+                messages.append({
+                    "role": "dispatch",
+                    "phase": "error",
+                    "text": p.get("error", "dispatch error"),
+                })
+            elif kind == "error":
+                messages.append({"role": "error", "text": p.get("message", str(p))})
         except Exception as e:
-            return self._write_error(500, f"read failed: {e}")
-        self.send_response(200)
-        self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(data)
-        except Exception:
-            pass
+            print(
+                f"history: failed to convert event kind={kind}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return JSONResponse({"session_id": session_id, "messages": messages})
 
-    # ---- SSE -------------------------------------------------------------
 
-    def _serve_sse(self, session_id: str) -> None:
-        session = get_or_create_session(session_id)
-        q = session.subscribe()
+@app.get("/api/session/{session_id}")
+async def api_session(session_id: str, request: Request):
+    _require_auth(request)
+    s = SESSIONS.get(session_id)
+    if s is None:
+        return JSONResponse({"session_id": session_id, "log": telemetry.load_session_events(session_id)})
+    return JSONResponse({"session_id": session_id, "log": s.display_log})
+
+
+@app.get("/api/stream/{session_id}")
+async def api_stream(session_id: str, request: Request):
+    _require_auth(request)
+    session = get_or_create_session(session_id)
+    q = session.subscribe()
+
+    async def event_generator():
+        # Initial hello
+        yield {
+            "event": "hello",
+            "data": json.dumps({"session_id": session_id}),
+        }
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            # initial hello
-            self._sse_write("hello", {"session_id": session_id})
             while True:
+                if await request.is_disconnected():
+                    break
                 try:
-                    evt = q.get(timeout=15.0)
+                    # Poll with a short timeout so we can check disconnect
+                    evt = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: q.get(timeout=15.0)
+                    )
                 except queue.Empty:
-                    # keep-alive
-                    try:
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        return
+                    # Keep-alive ping
+                    yield {"event": "ping", "data": "{}"}
                     continue
                 kind = evt.get("kind", "message")
                 data = evt.get("data", {})
-                self._sse_write(kind, data)
-        except Exception as e:
-            print(f"sse: stream ended: {e}", file=sys.stderr, flush=True)
+                yield {
+                    "event": kind,
+                    "data": json.dumps(data, default=str),
+                }
         finally:
             session.unsubscribe(q)
 
-    def _sse_write(self, kind: str, data: Any) -> None:
+    return EventSourceResponse(event_generator())
+
+
+# ---------------------------------------------------------------------------
+# Routes — POST
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/message")
+async def api_message(body: MessageRequest, request: Request):
+    _require_auth(request)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    sid = body.session_id
+    user = _get_user(request)
+    project = _get_project(request)
+    session = get_or_create_session(
+        sid if isinstance(sid, str) else None,
+        user=user, project=project,
+    )
+    ref_images = body.reference_images
+    if isinstance(ref_images, list):
+        session.selected_refs = [str(p) for p in ref_images if p]
+    if session.selected_refs:
+        paths_str = ", ".join(session.selected_refs)
+        text = f"[Reference images selected: {paths_str}]\n\n{text}"
+    if re.search(r"\bTEST\s+MODE\b", text, re.IGNORECASE):
+        session.test_mode = True
+        print(f"session {session.id}: TEST MODE enabled", file=sys.stderr, flush=True)
+    start_agent_thread(session, text)
+    return JSONResponse({"session_id": session.id, "project": session.project})
+
+
+@app.post("/api/projects")
+async def api_create_project(body: CreateProjectRequest, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(body.name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    user = _get_user(request)
+    try:
+        workspace = _workspace_for(user, name, scaffold=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to create project: {e}")
+    return JSONResponse({"name": name, "path": str(workspace)})
+
+
+@app.post("/api/cancel")
+async def api_cancel(body: CancelRequest, request: Request):
+    _require_auth(request)
+    sid = body.session_id
+    s = SESSIONS.get(sid)
+    if s is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    s.cancel_event.set()
+    proc = s.dispatch_proc
+    if proc is not None:
         try:
-            payload = json.dumps(data, default=str)
-            msg = f"event: {kind}\ndata: {payload}\n\n".encode("utf-8")
-            self.wfile.write(msg)
-            self.wfile.flush()
+            proc.kill()
         except Exception:
-            raise
+            pass
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/upload")
+async def api_upload(request: Request):
+    _require_auth(request)
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        raise HTTPException(status_code=400, detail="Content-Type must be multipart/form-data")
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"form parse failed: {e}")
+
+    upload_file = form.get("file")
+    if upload_file is None:
+        raise HTTPException(status_code=400, detail="no file field in upload")
+
+    try:
+        file_data = await upload_file.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"read failed: {e}")
+
+    if not file_data:
+        raise HTTPException(status_code=400, detail="file too large or empty (max 50 MB)")
+    if len(file_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large (max 50 MB)")
+
+    filename = upload_file.filename or ""
+    filename = os.path.basename(filename)
+    safe_chars = []
+    prev_underscore = False
+    for c in filename:
+        if (c.isascii() and c.isalnum()) or c in "._-":
+            safe_chars.append(c)
+            prev_underscore = False
+        else:
+            if not prev_underscore:
+                safe_chars.append("_")
+                prev_underscore = True
+    safe_name = "".join(safe_chars).strip("_")[:200]
+    if not safe_name or safe_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+
+    workspace = _workspace_for(
+        _get_user(request), _get_project(request), scaffold=True,
+    )
+    input_dir = workspace / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    target = input_dir / safe_name
+
+    try:
+        target.write_bytes(file_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+
+    rel_path = str(target.relative_to(workspace))
+    return JSONResponse({"ok": True, "path": rel_path, "size": len(file_data)})
+
+
+@app.post("/api/open_in_finder")
+async def api_open_in_finder(body: OpenInFinderRequest, request: Request):
+    _require_auth(request)
+    user_path = (body.path or "").strip()
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    if user_path:
+        try:
+            target = _resolve_project_path(user_path, workspace=workspace)
+        except PathError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        target = workspace
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"path does not exist: {target}")
+    try:
+        result = subprocess.run(
+            ["open", str(target)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"open failed: {e}")
+    if result.returncode != 0:
+        err = (result.stderr or "").strip() or f"open exit {result.returncode}"
+        raise HTTPException(status_code=500, detail=f"open failed: {err}")
+    return JSONResponse({"ok": True, "path": str(target)})
+
+
+# ---------------------------------------------------------------------------
+# Routes — DELETE
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/api/image")
+async def api_delete_image(body: DeleteImageRequest, request: Request):
+    _require_auth(request)
+    rel = (body.path or "").strip()
+    if not rel:
+        raise HTTPException(status_code=400, detail="path is required")
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    try:
+        target = _resolve_project_path(rel, workspace=workspace)
+    except PathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "Finder" to delete POSIX file "{target}"'],
+            check=True, capture_output=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"trash failed: {e}")
+    return JSONResponse({"ok": True, "path": rel})
+
+
+@app.delete("/api/session/{session_id}")
+async def api_delete_session(session_id: str, request: Request):
+    _require_auth(request)
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    with SESSIONS_LOCK:
+        live = SESSIONS.get(session_id)
+    if live:
+        live.cancel_event.set()
+        if live.dispatch_proc:
+            try:
+                live.dispatch_proc.kill()
+            except Exception:
+                pass
+    removed = telemetry.delete_session(session_id)
+    with SESSIONS_LOCK:
+        SESSIONS.pop(session_id, None)
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+@app.delete("/api/projects/{name}")
+async def api_delete_project(name: str, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="project name is required")
+    if name == "main":
+        raise HTTPException(status_code=400, detail="cannot delete the default 'main' project")
+    current = _get_project(request) or "main"
+    if name == current:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot delete the active project '{name}'. Switch to another project first.",
+        )
+    user = _get_user(request)
+    if PER_USER_WORKSPACES and user:
+        workspace = (_users_root() / _sanitize_name(user) / name).resolve()
+        scope = _users_root() / _sanitize_name(user)
+    else:
+        workspace = (_workspace_root() / name).resolve()
+        scope = _workspace_root()
+    try:
+        workspace.relative_to(scope.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid project path")
+    if not workspace.is_dir():
+        raise HTTPException(status_code=404, detail=f"project '{name}' not found")
+    try:
+        shutil.rmtree(workspace)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to delete: {e}")
+    return JSONResponse({"ok": True, "deleted": name})
 
 
 # ---------------------------------------------------------------------------
@@ -2643,17 +2270,6 @@ def preflight() -> None:
 
 def main() -> int:
     preflight()
-    telemetry.init_db()
-
-    # Eagerly scaffold the default workspace in single-user mode so the
-    # sidebar has something to list on first load. In per-user mode we
-    # don't know who the default user is at startup, so each user's
-    # workspace is scaffolded lazily by the first request that touches it.
-    if not PER_USER_WORKSPACES:
-        try:
-            _ensure_workspace(_workspace_for(None, "main"))
-        except Exception as e:
-            print(f"parallax-web: default workspace scaffold failed: {e}", file=sys.stderr)
 
     port = find_free_port()
     host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
@@ -2663,24 +2279,12 @@ def main() -> int:
     print(f"parallax-web: model    = {MODEL}")
     print(f"parallax-web: url      = {url}")
     if os.environ.get("PARALLAX_WEB_PASSWORD"):
-        print(f"parallax-web: auth     = enabled (Basic Auth)")
+        print("parallax-web: auth     = enabled (Basic Auth)")
     else:
-        print(f"parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
+        print("parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
 
-    server = ThreadedHTTPServer((bind_host, port), Handler)
-
-    # Announce ourselves in the cross-machine server registry so other
-    # parallax-web processes (and the CLI) can find us by cwd/port/pid.
-    try:
-        registry.install_shutdown_hooks()
-        registry.register(
-            cwd=str(PROJECT_DIR),
-            host=host,
-            port=port,
-            user=os.environ.get("USER", "unknown"),
-        )
-    except Exception as e:
-        print(f"parallax-web: registry register failed: {e}", file=sys.stderr)
+    # Pass port to lifespan via env so the registry gets the real port
+    os.environ["_PARALLAX_PORT"] = str(port)
 
     if os.environ.get("PARALLAX_WEB_NO_BROWSER") != "1":
         try:
@@ -2688,16 +2292,13 @@ def main() -> int:
         except Exception as e:
             print(f"parallax-web: webbrowser.open failed: {e}", file=sys.stderr)
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nparallax-web: shutting down")
-    finally:
-        try:
-            registry.deregister()
-        except Exception:
-            pass
-        server.server_close()
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=bind_host,
+        port=port,
+        log_level="warning",
+    )
     return 0
 
 

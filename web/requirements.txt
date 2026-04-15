@@ -4,6 +4,16 @@
 # Anthropic SDK — HoP agent loop
 anthropic>=0.40.0
 
+# FastAPI + ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# SSE streaming (replaces manual text/event-stream writes)
+sse-starlette>=1.8.0
+
+# Request/response validation
+pydantic>=2.0
+
 # Storyboard contact sheets (tools/storyboard.py)
 Pillow>=10.0
 
