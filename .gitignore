@@ -23,3 +23,5 @@ logs/costs/
 node_modules/
 *.jsonl
 brands/rugiet.yaml
+
+worktrees/

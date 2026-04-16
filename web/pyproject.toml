@@ -1,0 +1,15 @@
+[project]
+name = "parallax-web"
+version = "0.1.0"
+description = "Parallax web server"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "elevenlabs>=1.0",
+    "google-genai>=0.3",
+    "whisperx>=3.8.5",
+]
+
+[tool.uv]
