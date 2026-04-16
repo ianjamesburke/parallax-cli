@@ -177,6 +177,61 @@ class PathError(ValueError):
     pass
 
 
+def _safe_filename(filename: str) -> str:
+    """
+    Canonical filename sanitizer. Strips to basename, keeps ASCII alnum and
+    `._-`, collapses any run of other chars (spaces, unicode whitespace like
+    U+202F, punctuation) to a single underscore, trims underscores, caps at
+    200 chars. Returns "" if nothing safe remains.
+
+    THE INVARIANT: every file under a workspace must already be a safe name.
+    Filenames with spaces or non-ASCII characters break path round-tripping
+    through the LLM (it normalizes U+202F to ASCII space, ASCII space to %20,
+    etc.) and cause "file not found" loops. Sanitize on ingest AND on
+    enumeration so the agent never sees an unsafe name.
+    """
+    filename = os.path.basename(filename)
+    out = []
+    prev_us = False
+    for c in filename:
+        if (c.isascii() and c.isalnum()) or c in "._-":
+            out.append(c)
+            prev_us = False
+        elif not prev_us:
+            out.append("_")
+            prev_us = True
+    return "".join(out).strip("_")[:200]
+
+
+def _ensure_safe_name(entry: Path) -> Path:
+    """
+    If `entry`'s basename is not already safe, rename it in place to a safe
+    name (disambiguating against collisions). Returns the (possibly new) path.
+    Silently returns the original path on any failure — enumeration must not
+    break because of a rename hiccup.
+    """
+    name = entry.name
+    safe = _safe_filename(name)
+    if safe == name and safe:
+        return entry
+    if not safe:
+        safe = "file"
+    parent = entry.parent
+    stem, dot, ext = safe.rpartition(".")
+    base, suffix = (stem, dot + ext) if dot else (safe, "")
+    candidate = parent / safe
+    i = 1
+    while candidate.exists() and candidate != entry:
+        candidate = parent / f"{base}_{i}{suffix}"
+        i += 1
+    try:
+        if candidate != entry:
+            entry.rename(candidate)
+        return candidate
+    except Exception:
+        return entry
+
+
 def _resolve_project_path(user_path: str, workspace: Optional[Path] = None) -> Path:
     """
     Resolve `user_path` against the workspace (or PROJECT_DIR if no workspace
@@ -470,7 +525,12 @@ TOOL_SCHEMAS = [
             "  set-vo — set the voiceover text for a scene. `values` is ['<scene_number>', '<vo text>']\n"
             "  set-voice — pick the voiceover voice. `values` is ['<voice_name_or_id>']. "
             "Shortcuts: george, rachel, domi, bella, antoni, arnold.\n"
-            "  set-headline — set a static headline overlay for the whole video. `values` is ['<headline text>']\n"
+            "  set-headline — set a static headline overlay for the whole video. "
+            "`values` is ['<headline text>'] or ['<text>', '<style>'] or ['<text>', '<style>', '<position>']. "
+            "Style defaults to 'title' — a transparent top-safe-zone overlay suitable for text over Ken Burns video. "
+            "Other styles: 'caption' (bottom safe zone, for subtitle-like lines), "
+            "'banner' (FULL-SCREEN solid-background title card that COVERS the video — only use when the user explicitly wants a title card, never as a default). "
+            "Position options: top | bottom | center (default depends on style).\n"
             "  clear-headline — remove the headline overlay.\n"
             "  enable-captions / disable-captions — toggle word-by-word caption burn in compose.\n"
             "  set — set an arbitrary top-level key. `values` is ['<key>', '<value>'].\n"
@@ -651,7 +711,13 @@ def tool_list_dir(path: str, workspace: Optional[Path] = None) -> dict:
         return {"error": f"not a directory: {path}"}
     entries = []
     try:
-        for entry in sorted(resolved.iterdir(), key=lambda p: p.name.lower()):
+        raw_entries = list(resolved.iterdir())
+        # Sanitize any unsafe filenames in place before enumeration so the
+        # agent never sees names it can't round-trip (see _safe_filename).
+        normalized = []
+        for e in raw_entries:
+            normalized.append(_ensure_safe_name(e) if e.is_file() else e)
+        for entry in sorted(normalized, key=lambda p: p.name.lower()):
             try:
                 st = entry.stat()
                 entries.append(
@@ -1871,22 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
         if not filename or file_data is None:
             return self._write_error(400, "no file field in upload")
 
-        # Sanitize filename: basename only, ASCII alnum + . _ - and collapse
-        # runs of unsafe chars to a single underscore. Preserves spaces as
-        # underscores so screenshot names stay readable.
-        filename = os.path.basename(filename)
-        safe_chars = []
-        prev_underscore = False
-        for c in filename:
-            # Only ASCII letters/digits — c.isalnum() would let through Unicode.
-            if (c.isascii() and c.isalnum()) or c in "._-":
-                safe_chars.append(c)
-                prev_underscore = False
-            else:
-                if not prev_underscore:
-                    safe_chars.append("_")
-                    prev_underscore = True
-        safe_name = "".join(safe_chars).strip("_")[:200]
+        safe_name = _safe_filename(filename)
         if not safe_name or safe_name in (".", ".."):
             return self._write_error(400, "invalid filename")
 

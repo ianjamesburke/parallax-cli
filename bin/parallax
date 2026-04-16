@@ -1743,21 +1743,27 @@ def cmd_compose(args) -> int:
         # and burn it in for the full video duration (or a window).
         headline_cfg = manifest.get("headline")
         if headline_cfg:
+            # Default style is "title" (transparent overlay in the top safe
+            # zone). "banner" is a FULL-SCREEN SOLID title card and covers all
+            # video content — only use when the user explicitly asks for a
+            # title card. Never default to banner.
+            headline_position = None
             if isinstance(headline_cfg, str):
                 headline_text = headline_cfg
-                headline_style = "banner"
+                headline_style = "title"
                 headline_start = 0.0
                 headline_end = None
             elif isinstance(headline_cfg, dict):
                 headline_text = headline_cfg.get("text", "")
-                headline_style = headline_cfg.get("style", "banner")
+                headline_style = headline_cfg.get("style", "title")
                 headline_start = float(headline_cfg.get("start_s", 0.0))
                 headline_end = headline_cfg.get("end_s")
+                headline_position = headline_cfg.get("position")
                 if headline_end is not None:
                     headline_end = float(headline_end)
             else:
                 headline_text = ""
-                headline_style = "banner"
+                headline_style = "title"
                 headline_start = 0.0
                 headline_end = None
 
@@ -1770,12 +1776,15 @@ def cmd_compose(args) -> int:
                     headline_png = Path(tmpdir) / "headline.png"
                     print(f"[parallax] rendering headline: {headline_text!r}...", end=" ", flush=True)
                     try:
-                        result = _sp.run(
-                            [sys.executable, str(gen_caption_script),
+                        gen_cmd = [sys.executable, str(gen_caption_script),
                              "--text", headline_text,
                              "--style", headline_style,
                              "--resolution", resolution,
-                             "--output", str(headline_png)],
+                             "--output", str(headline_png)]
+                        if headline_position:
+                            gen_cmd += ["--position", headline_position]
+                        result = _sp.run(
+                            gen_cmd,
                             capture_output=True, text=True, timeout=60,
                         )
                         if result.returncode != 0:
@@ -2062,8 +2071,19 @@ def cmd_manifest_edit(args) -> int:
         if not args.values:
             print("[parallax] ERROR: set-headline needs the headline text", file=sys.stderr)
             return 1
-        text = " ".join(args.values)
-        manifest["headline"] = {"text": text, "style": "banner"}
+        # values: [text] | [text, style] | [text, style, position]
+        # style defaults to "title" — a transparent top-safe-zone overlay.
+        # The old "banner" default rendered a full-screen solid black card that
+        # covered all video content; never what a headline-over-KenBurns wants.
+        text = args.values[0]
+        style = args.values[1] if len(args.values) > 1 else "title"
+        if style not in ("title", "caption", "banner"):
+            print(f"[parallax] ERROR: unknown headline style {style!r} (title|caption|banner)", file=sys.stderr)
+            return 1
+        headline_entry = {"text": text, "style": style}
+        if len(args.values) > 2:
+            headline_entry["position"] = args.values[2]
+        manifest["headline"] = headline_entry
 
     elif op == "clear-headline":
         manifest.pop("headline", None)

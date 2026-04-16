@@ -2,6 +2,14 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [FIX] Unsafe workspace filenames break LLM path round-tripping
+
+Session `005933acd2…` looped on `read_image` returning "file does not exist" for `Screenshot 2026-03-12 at 1.00.01 PM.png`. Root cause: macOS screenshot filenames contain U+202F (narrow no-break space) between the time and AM/PM. `list_dir` returns the raw unicode name; the model normalizes U+202F to ASCII space when echoing it back in the next `read_image` call; path lookup misses. The agent retried 3× then gave up and guessed content blind.
+
+**Systemic fix:** extracted `_safe_filename()` as the canonical sanitizer (ASCII alnum + `._-`; everything else → `_`) and added `_ensure_safe_name()` which renames unsafe files in place during `tool_list_dir` enumeration. Two choke points now enforce the invariant: HTTP upload (already sanitized — refactored to reuse the helper) and any directory listing the agent performs. Files with unsafe names literally cannot survive first contact with the agent. Rejected: fuzzy-matching fallback in `_resolve_project_path` — hides the problem instead of eliminating it, and two-way magic is worse than one-way renames.
+
+Documented as an invariant in `CLAUDE.md` so future file-producing paths route through `_safe_filename()` rather than reinventing.
+
 ## 2026-04-13 — [CHANGED] Web UI sidebar, update command, install bootstrap
 
 Session focused on parallax-web frontend and CLI tooling. Built a persistent left-sidebar session switcher replacing the history drawer, added video delete (× on hover), replaced trash emoji with minimal × on stills, removed Open in Finder button, and added a Google Drive link stored in localStorage per user. Added `parallax update` CLI command and a daily background update check (git ls-remote, cached in `~/.parallax/.update_check`, prints one-liner to stderr if behind). Added `scripts/install.sh` for curl-pipe bootstrap (brew + python@3.11 + just + ffmpeg + just install). Fixed exit-code-127 bug in `just install-web`: switched from `web/.venv/bin/pip` to `web/.venv/bin/python3 -m pip`; same fix applied in `cmd_update` which now does install steps directly in Python without calling `just`.
