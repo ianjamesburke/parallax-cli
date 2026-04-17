@@ -77,6 +77,26 @@ def _write_test_image(output_path: Path) -> None:
         raise RuntimeError(f"ffmpeg test image failed: {e.stderr.decode()[:200]}") from e
 
 
+def _load_config_model(kind: str, tier: str):  # -> tuple[str | None, str]
+    """Return (model_id_override, source) from project config. None override = use default."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    try:
+        from packs.video.config import load as _load_config
+        cfg = _load_config()
+        if kind == "video":
+            model_id, source = cfg.video[tier]
+        else:
+            model_id, source = cfg.image[tier]
+        # Only treat as override if source isn't default
+        if source != "default":
+            return model_id, source
+        return None, "default"
+    except Exception:
+        return None, "default"
+
+
 def cmd_fal_video(args) -> int:
     """Handler for: parallax fal video <tier> --prompt TEXT [flags]"""
     from .models import get_video_model
@@ -88,8 +108,18 @@ def cmd_fal_video(args) -> int:
     seed = getattr(args, "seed", None)
     use_json = getattr(args, "json", False)
     output = getattr(args, "output", None)
+    model_flag = getattr(args, "model", None)
 
-    spec = get_video_model(tier)
+    # Precedence: --model flag > env/config > default
+    if model_flag:
+        model_override, override_source = model_flag, "cli"
+    else:
+        model_override, override_source = _load_config_model("video", tier)
+
+    spec = get_video_model(tier, model_id_override=model_override)
+    if model_override:
+        if not use_json:
+            print(f"[fal] model override ({override_source}): {model_override}")
     output_path = Path(output) if output else _default_output("video", tier, "mp4")
 
     if TEST_MODE:
@@ -120,8 +150,16 @@ def cmd_fal_image(args) -> int:
     seed = getattr(args, "seed", None)
     use_json = getattr(args, "json", False)
     output = getattr(args, "output", None)
+    model_flag = getattr(args, "model", None)
 
-    spec = get_image_model(tier)
+    if model_flag:
+        model_override, override_source = model_flag, "cli"
+    else:
+        model_override, override_source = _load_config_model("image", tier)
+
+    spec = get_image_model(tier, model_id_override=model_override)
+    if model_override and not use_json:
+        print(f"[fal] model override ({override_source}): {model_override}")
     output_path = Path(output) if output else _default_output("image", tier, "png")
 
     if TEST_MODE:
@@ -144,17 +182,17 @@ def cmd_fal_image(args) -> int:
 
 def cmd_fal_models(args) -> int:
     """Handler for: parallax fal models [--json]"""
-    from .models import all_models
+    from .models import all_models_with_config
 
     use_json = getattr(args, "json", False)
-    rows = all_models()
+    rows = all_models_with_config()
 
     if use_json:
         for row in rows:
             print(json.dumps(row), flush=True)
     else:
-        print(f"{'KIND':<8} {'TIER':<8} {'MODEL ID':<55} PRICE")
-        print("-" * 100)
+        print(f"{'KIND':<8} {'TIER':<8} {'SOURCE':<9} {'MODEL ID':<55} PRICE")
+        print("-" * 110)
         for r in rows:
-            print(f"{r['kind']:<8} {r['tier']:<8} {r['model_id']:<55} {r['price']}")
+            print(f"{r['kind']:<8} {r['tier']:<8} {r.get('source','default'):<9} {r['model_id']:<55} {r['price']}")
     return 0

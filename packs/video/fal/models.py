@@ -107,16 +107,41 @@ IMAGE_MODELS: dict[Tier, ModelSpec] = {
 }
 
 
-def get_video_model(tier: Tier) -> ModelSpec:
-    return VIDEO_MODELS[tier]
+def get_video_model(tier: Tier, model_id_override=None) -> ModelSpec:
+    """Return the ModelSpec for the given tier, optionally overriding the model_id."""
+    spec = VIDEO_MODELS[tier]
+    if model_id_override:
+        spec = ModelSpec(
+            model_id=model_id_override,
+            tier=spec.tier,
+            kind=spec.kind,
+            description=f"(overridden) {model_id_override}",
+            price_note="custom",
+            size_map=spec.size_map,
+        )
+    return spec
 
 
-def get_image_model(tier: Tier) -> ModelSpec:
-    return IMAGE_MODELS[tier]
+def get_image_model(tier: Tier, model_id_override=None) -> ModelSpec:
+    """Return the ModelSpec for the given tier, optionally overriding the model_id."""
+    spec = IMAGE_MODELS[tier]
+    if model_id_override:
+        spec = ModelSpec(
+            model_id=model_id_override,
+            tier=spec.tier,
+            kind=spec.kind,
+            description=f"(overridden) {model_id_override}",
+            price_note="custom",
+            size_map=spec.size_map,
+        )
+    return spec
 
 
 def all_models() -> list[dict]:
-    """Return all tier→model entries as plain dicts for --json output."""
+    """Return all tier→model entries as plain dicts for --json output.
+
+    Call all_models_with_config() to get source attribution from .parallax/config.toml.
+    """
     rows = []
     for tier, spec in VIDEO_MODELS.items():
         rows.append({
@@ -132,6 +157,47 @@ def all_models() -> list[dict]:
             "tier": tier,
             "model_id": spec.model_id,
             "description": spec.description,
+            "price": spec.price_note,
+        })
+    return rows
+
+
+def all_models_with_config() -> list[dict]:
+    """Return effective tier→model rows with source attribution (default/config/env)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    try:
+        from packs.video.config import load as _load_config
+        cfg = _load_config()
+    except Exception:
+        cfg = None
+
+    rows = []
+    for tier, spec in VIDEO_MODELS.items():
+        if cfg:
+            model_id, source = cfg.video[tier]
+        else:
+            model_id, source = spec.model_id, "default"
+        rows.append({
+            "kind": "video",
+            "tier": tier,
+            "model_id": model_id,
+            "source": source,
+            "description": spec.description if model_id == spec.model_id else f"(overridden) {model_id}",
+            "price": spec.price_note,
+        })
+    for tier, spec in IMAGE_MODELS.items():
+        if cfg:
+            model_id, source = cfg.image[tier]
+        else:
+            model_id, source = spec.model_id, "default"
+        rows.append({
+            "kind": "image",
+            "tier": tier,
+            "model_id": model_id,
+            "source": source,
+            "description": spec.description if model_id == spec.model_id else f"(overridden) {model_id}",
             "price": spec.price_note,
         })
     return rows

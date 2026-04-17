@@ -2,6 +2,22 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [CHANGED] Four-task pass: drawtext audit, config.toml, voice CLI, manifest voice_id
+
+**Task 1 — drawtext audit:** No dead code found. `burn()` in `burn-captions.py` is a live fallback when `text_render` is unavailable or the requested style isn't a PIL style (confirmed by DEV_LOG 2026-04-17 "falls back to drawtext if style is not a PIL style"). `burn-overlay.py` is entirely drawtext-based and still the correct tool for persistent lower-thirds/brand-tags (called from `head_of_production.py`). `drawtext` references in `senior_editor.py`, `junior_editor.py`, and `head_of_production.py` are in LLM prompt strings, not executable code — removing them would regress the agent's instructions. Nothing deleted; nothing flagged as dead.
+
+**Task 2 — `.parallax/config.toml` model config:** New `packs/video/config.py` loader walks cwd upward for `.parallax/config.toml`. Precedence: `--model` CLI flag > env (`PARALLAX_FAL_VIDEO_LOW` etc.) > config.toml > built-in defaults. Invalid model IDs (missing `/`) fail fast with a clear error. `fal/models.py` updated with `model_id_override` param on `get_video_model`/`get_image_model`. `fal/cli.py` reads config on every invocation. `parallax fal models` now shows source column (default/config/env). New `parallax config show` command dumps effective config with source attribution. Verified: config.toml `fal.video.low` override shows `source: config` in `fal models --json` and `config show`.
+
+**Task 3 — `parallax voice` CLI:** New `parallax voice list [--json]` and `parallax voice clone --name ... --sample ...` commands. `voice list` hits `GET /v1/voices` and prints voice_id, name, category, gender, accent. `voice clone` posts multipart to `/v1/voices/add`, returns new voice_id. Both require `AI_VIDEO_ELEVENLABS_KEY` or `ELEVENLABS_API_KEY` (same lookup as `cmd_voiceover`). Clear error on 402/403 (requires paid plan). Added `requests>=2.31` to `pyproject.toml`. Verified: `parallax voice list --json | head -3` returns well-formed NDJSON with real voice_ids.
+
+**Task 4 — Persist voice_id into manifest:** `cmd_voiceover` now writes `voice_id` and `voice_name` to `manifest.voiceover` in all three manifest-write sites: pre-transcription stub, post-WhisperX update, and TEST_MODE path. `manifest.voice.voice_id` was already written; `manifest.voiceover.voice_id` was missing. Verified via TEST_MODE run: both keys present in the written YAML.
+
+**Breaks if:**
+- `parallax fal models --json` from a dir with `.parallax/config.toml` shows `"source": "default"` for an overridden tier (Task 2 config not loading).
+- `parallax config show` exits non-zero or omits any tier row (Task 2 regression).
+- `parallax voice list --json` with a valid API key returns no output or exits non-zero (Task 3 regression).
+- After `parallax voiceover` succeeds, `manifest.yaml` has `voiceover:` section but no `voice_id` key inside it (Task 4 regression).
+
 ## 2026-04-17 — [FIX] Three caption/text_render bugs — static caption burn, block_background wrap, stroke width
 
 Three bugs fixed in one pass:

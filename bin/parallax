@@ -1094,6 +1094,8 @@ def cmd_voiceover(args) -> int:
         }
         manifest["voiceover"] = {
             "audio_file": "audio/voiceover.mp3",
+            "voice_id": voice_id,
+            "voice_name": voice_name,
             "vo_manifest": "audio/vo_manifest.json",
             "duration_s": round(duration_s, 3),
             "script": script_text,
@@ -1176,6 +1178,8 @@ def cmd_voiceover(args) -> int:
     }
     manifest["voiceover"] = {
         "audio_file": "audio/voiceover.mp3",
+        "voice_id": voice_id,
+        "voice_name": voice_name,
         "script": script_text,
     }
     try:
@@ -1231,6 +1235,8 @@ def cmd_voiceover(args) -> int:
         # Update manifest with full vo info
         manifest["voiceover"] = {
             "audio_file": "audio/voiceover.mp3",
+            "voice_id": voice_id,
+            "voice_name": voice_name,
             "vo_manifest": "audio/vo_manifest.json",
             "duration_s": round(duration_s, 3),
             "script": script_text,
@@ -3027,6 +3033,197 @@ def cmd_fal_models(args: argparse.Namespace) -> int:
     return _impl(args)
 
 
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """
+    Show effective Parallax config (tier→model map with source attribution).
+
+    Reads .parallax/config.toml walking up from cwd, merges env vars, and prints
+    the effective value for every config key with where it came from.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    use_json = getattr(args, "json", False)
+    try:
+        from packs.video.config import load as _load_config
+        cfg = _load_config()
+    except Exception as e:
+        print(f"[parallax config] ERROR: {e}", file=sys.stderr)
+        return 1
+
+    rows = cfg.as_rows()
+    if use_json:
+        for row in rows:
+            print(json.dumps(row), flush=True)
+    else:
+        config_label = str(cfg.config_path) if cfg.config_path else "(none found)"
+        print(f"Config file: {config_label}")
+        print()
+        print(f"{'KIND':<8} {'TIER':<8} {'SOURCE':<9} MODEL ID")
+        print("-" * 80)
+        for r in rows:
+            print(f"{r['kind']:<8} {r['tier']:<8} {r['source']:<9} {r['model_id']}")
+    return 0
+
+
+def cmd_voice_list(args: argparse.Namespace) -> int:
+    """
+    List available ElevenLabs voices.
+
+    GET /v1/voices — prints voice_id, name, category, gender, accent.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    use_json = getattr(args, "json", False)
+
+    try:
+        import requests as _requests
+    except ImportError:
+        print("[parallax voice] ERROR: requests not installed. Run: uv add requests", file=sys.stderr)
+        return 2
+
+    try:
+        from packs.video.scripts.api_config import get_elevenlabs_key
+    except ImportError as e:
+        print(f"[parallax voice] ERROR: api_config import failed: {e}", file=sys.stderr)
+        return 2
+
+    key = get_elevenlabs_key()
+    if not key:
+        print(
+            "[parallax voice] ERROR: no ElevenLabs API key. "
+            "Set ELEVENLABS_API_KEY or AI_VIDEO_ELEVENLABS_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        resp = _requests.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": key},
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"[parallax voice] ERROR: request failed: {e}", file=sys.stderr)
+        return 1
+
+    if resp.status_code != 200:
+        print(
+            f"[parallax voice] ERROR: ElevenLabs API returned {resp.status_code}: {resp.text[:300]}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        voices = resp.json().get("voices", [])
+    except Exception as e:
+        print(f"[parallax voice] ERROR: could not parse response: {e}", file=sys.stderr)
+        return 1
+
+    if use_json:
+        for v in voices:
+            labels = v.get("labels") or {}
+            print(json.dumps({
+                "voice_id": v.get("voice_id", ""),
+                "name": v.get("name", ""),
+                "category": v.get("category", ""),
+                "gender": labels.get("gender", ""),
+                "accent": labels.get("accent", ""),
+            }), flush=True)
+    else:
+        print(f"{'VOICE ID':<32} {'NAME':<22} {'CATEGORY':<14} {'GENDER':<10} ACCENT")
+        print("-" * 100)
+        for v in voices:
+            labels = v.get("labels") or {}
+            print(
+                f"{v.get('voice_id',''):<32} "
+                f"{v.get('name',''):<22} "
+                f"{v.get('category',''):<14} "
+                f"{labels.get('gender',''):<10} "
+                f"{labels.get('accent','')}"
+            )
+        print(f"\n{len(voices)} voice(s)")
+    return 0
+
+
+def cmd_voice_clone(args: argparse.Namespace) -> int:
+    """
+    Clone a voice on ElevenLabs from a sample audio file.
+
+    POST /v1/voices/add — requires name + at least one audio sample.
+    Prints the new voice_id on success.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    use_json = getattr(args, "json", False)
+
+    try:
+        import requests as _requests
+    except ImportError:
+        print("[parallax voice] ERROR: requests not installed. Run: uv add requests", file=sys.stderr)
+        return 2
+
+    try:
+        from packs.video.scripts.api_config import get_elevenlabs_key
+    except ImportError as e:
+        print(f"[parallax voice] ERROR: api_config import failed: {e}", file=sys.stderr)
+        return 2
+
+    key = get_elevenlabs_key()
+    if not key:
+        print(
+            "[parallax voice] ERROR: no ElevenLabs API key. "
+            "Set ELEVENLABS_API_KEY or AI_VIDEO_ELEVENLABS_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+
+    sample_path = Path(args.sample)
+    if not sample_path.exists():
+        print(f"[parallax voice] ERROR: sample file not found: {sample_path}", file=sys.stderr)
+        return 2
+
+    name = args.name.strip()
+    description = getattr(args, "description", None) or ""
+
+    print(f"[parallax voice] cloning voice '{name}' from {sample_path.name}...")
+    try:
+        with open(sample_path, "rb") as f:
+            resp = _requests.post(
+                "https://api.elevenlabs.io/v1/voices/add",
+                headers={"xi-api-key": key},
+                data={"name": name, "description": description},
+                files={"files": (sample_path.name, f, "audio/mpeg")},
+                timeout=120,
+            )
+    except Exception as e:
+        print(f"[parallax voice] ERROR: request failed: {e}", file=sys.stderr)
+        return 1
+
+    if resp.status_code in (402, 403):
+        print(
+            f"[parallax voice] ERROR: ElevenLabs returned {resp.status_code} — "
+            "voice cloning requires a paid ElevenLabs plan.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if resp.status_code != 200:
+        print(
+            f"[parallax voice] ERROR: ElevenLabs returned {resp.status_code}: {resp.text[:300]}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        voice_id = resp.json()["voice_id"]
+    except Exception as e:
+        print(f"[parallax voice] ERROR: could not parse response: {e}", file=sys.stderr)
+        return 1
+
+    if use_json:
+        print(json.dumps({"voice_id": voice_id}), flush=True)
+    else:
+        print(f"[parallax voice] cloned → voice_id: {voice_id}")
+    return 0
+
+
 def cmd_script_write(args: argparse.Namespace) -> int:
     """
     Write a video script from a brief using Claude.
@@ -3694,6 +3891,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="random seed for reproducibility")
     p_fal_video.add_argument("--output", metavar="PATH",
                              help="output file path (default: ./parallax-out/<timestamp>-<tier>.mp4)")
+    p_fal_video.add_argument("--model", metavar="MODEL_ID", default=None,
+                             help="override model id (highest precedence, overrides config.toml and env)")
     p_fal_video.add_argument("--json", action="store_true",
                              help="emit NDJSON progress events to stdout")
     p_fal_video.set_defaults(func=cmd_fal_video)
@@ -3716,6 +3915,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="random seed for reproducibility")
     p_fal_image.add_argument("--output", metavar="PATH",
                              help="output file path (default: ./parallax-out/<timestamp>-<tier>.png)")
+    p_fal_image.add_argument("--model", metavar="MODEL_ID", default=None,
+                             help="override model id (highest precedence, overrides config.toml and env)")
     p_fal_image.add_argument("--json", action="store_true",
                              help="emit NDJSON progress events to stdout")
     p_fal_image.set_defaults(func=cmd_fal_image)
@@ -3725,6 +3926,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_fal_models.add_argument("--json", action="store_true",
                               help="emit NDJSON rows to stdout")
     p_fal_models.set_defaults(func=cmd_fal_models)
+
+    # ── config ────────────────────────────────────────────────────────────────
+    p_config = sub.add_parser("config", help="show or edit Parallax project config")
+    config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+
+    p_config_show = config_sub.add_parser(
+        "show",
+        help="dump effective config (tier→model map with source: default/config/env)",
+    )
+    p_config_show.add_argument("--json", action="store_true",
+                               help="emit NDJSON rows to stdout")
+    p_config_show.set_defaults(func=cmd_config_show)
+
+    # ── voice ─────────────────────────────────────────────────────────────────
+    p_voice = sub.add_parser("voice", help="manage ElevenLabs voices")
+    voice_sub = p_voice.add_subparsers(dest="voice_cmd", required=True)
+
+    p_voice_list = voice_sub.add_parser("list", help="list available ElevenLabs voices")
+    p_voice_list.add_argument("--json", action="store_true",
+                              help="emit NDJSON rows to stdout (one voice per line)")
+    p_voice_list.set_defaults(func=cmd_voice_list)
+
+    p_voice_clone = voice_sub.add_parser(
+        "clone",
+        help="create an instant voice clone from a sample audio file (requires paid ElevenLabs plan)",
+    )
+    p_voice_clone.add_argument("--name", required=True, help="name for the cloned voice")
+    p_voice_clone.add_argument("--sample", required=True, metavar="PATH",
+                               help="path to audio sample file (mp3, wav, etc.)")
+    p_voice_clone.add_argument("--description", default=None, help="optional description for the voice")
+    p_voice_clone.add_argument("--json", action="store_true",
+                               help="emit JSON result: {\"voice_id\": \"...\"}")
+    p_voice_clone.set_defaults(func=cmd_voice_clone)
 
     return parser
 
