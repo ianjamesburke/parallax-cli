@@ -128,6 +128,8 @@ All tools are scoped to the project directory the chat was launched in.
 - **Keep replies under ~120 words.** No corporate fluff, no bullet dumps, no "I'd be happy to help."
 - **If a render is already running, the system will tell you.** Don't dispatch over it.
 - **Prefer reading the project over asking.** If the answer is a `list_dir` away, just look.
+- **When referencing generated files in subsequent tool calls, use the exact path from the most recent tool_result — never reconstruct filenames from your own reasoning.** The tool_result shows you the actual filenames the CLI wrote. Use those verbatim.
+- **When the user has an image AND uses a motion verb** (animate, wave, move, walk, turn, dance, blink, run, fly, swim, etc.), always offer two explicit options before proceeding: (1) **Free:** Ken Burns zoom/pan on the still — fake motion, zero API spend. (2) **~$0.02:** `parallax_fal_video` using LTX-2.3 image-to-video for real motion. Quote the cost and ask which they want. Do NOT auto-route to AI video generation without confirmation.
 
 ## When in doubt about which tool
 

@@ -899,6 +899,44 @@ TOOL_SCHEMAS = [
             "properties": {},
         },
     },
+    {
+        "name": "parallax_fal_video",
+        "description": (
+            "Animate a reference image into a short video clip using AI video generation. "
+            "Use when the user has an image and wants the subject to actually move "
+            "(not pan/zoom on a static frame). "
+            "Costs ~$0.02 at the low tier — ALWAYS confirm with the user before calling. "
+            "Always offer Ken Burns (free) as the alternative first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image": {
+                    "type": "string",
+                    "description": "Reference image path (relative to project root).",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Motion description — what the subject should do.",
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Cost tier. low=~$0.02 (LTX-2.3), medium=~$0.20 (Wan), high=~$0.50 (Kling). Default: low.",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["9:16", "16:9", "1:1"],
+                    "description": "Output aspect ratio (default: 9:16).",
+                },
+                "output": {
+                    "type": "string",
+                    "description": "Output path relative to project root (default: output/fal_<ts>.mp4).",
+                },
+            },
+            "required": ["image", "prompt"],
+        },
+    },
 ]
 
 
@@ -2258,6 +2296,43 @@ def _execute_tool_calls(
                     out = tool_relink_footage(old_path=old_p, new_path=new_p)
                 content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
                 summary = out.get("error") or f"relinked {old_p} → {new_p}"
+            elif name == "parallax_fal_video":
+                bin_path = _find_parallax_bin()
+                if bin_path is None:
+                    text = "parallax CLI binary not found on PATH"
+                else:
+                    fal_image = args.get("image", "")
+                    fal_prompt = args.get("prompt", "")
+                    fal_tier = args.get("tier") or "low"
+                    fal_aspect = args.get("aspect_ratio") or "9:16"
+                    fal_output = args.get("output") or ""
+                    if not fal_image or not fal_prompt:
+                        text = "error: image and prompt are required"
+                    else:
+                        try:
+                            img_p = _resolve_project_path(fal_image, workspace=session.workspace, read_fallback=True)
+                        except PathError as pe:
+                            text = f"invalid image path {fal_image!r}: {pe}"
+                            img_p = None
+                        if img_p is not None:
+                            if not fal_output:
+                                ts = int(time.time())
+                                fal_output = f"output/fal_{ts}.mp4"
+                            out_p = session.workspace / fal_output
+                            out_p.parent.mkdir(parents=True, exist_ok=True)
+                            fal_cmd = [
+                                bin_path, "fal", "video", fal_tier,
+                                "--image", str(img_p),
+                                "--prompt", fal_prompt,
+                                "--aspect", fal_aspect,
+                                "--output", str(out_p),
+                            ]
+                            text = _stream_parallax_subprocess(
+                                session, fal_cmd, None,
+                                f"fal video {fal_tier}: {fal_prompt[:60]}",
+                            )
+                content_block = [{"type": "text", "text": text}]
+                summary = text[:200]
             elif name == "move_to_shared":
                 paths_arg = args.get("paths", [])
                 if not isinstance(paths_arg, list):
