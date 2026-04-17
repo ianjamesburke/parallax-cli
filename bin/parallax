@@ -1675,7 +1675,20 @@ def cmd_compose(args) -> int:
         )
 
     default_motion = manifest.get("output_motion") or "zoom_drift_right"
-    resolution = manifest.get("output_resolution") or "1080x1920"
+    # Resolution priority: manifest.config.resolution > manifest.output_resolution > default portrait.
+    # Never silently mutate user-specified resolution. Accept any positive WxH string.
+    _config_block = manifest.get("config") or {}
+    resolution = (
+        _config_block.get("resolution")
+        or manifest.get("output_resolution")
+        or "1080x1920"
+    )
+    import re as _re
+    if not _re.match(r"^\d+x\d+$", str(resolution)):
+        return fail(
+            f"resolution must be WxH (e.g. '1080x1920'), got {resolution!r}",
+            where="cmd_compose.resolution", exit_code=3,
+        )
     concept_id = manifest.get("concept_id") or f"CMP-{int(time.time()) % 1000:03d}"
 
     valid_motions = {
