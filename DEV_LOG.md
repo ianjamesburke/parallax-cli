@@ -2,6 +2,37 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [CHANGED] fal video i2v: image-to-video, start/end-frame anchoring, audio flag
+
+Extended the fal.ai video generation surface with image-to-video (i2v) support across all three tiers. Passing `--image PATH` to `parallax fal video` now routes to the i2v endpoint; without it the existing t2v path is unchanged.
+
+**Capability matrix:**
+
+| Tier   | t2v model                                      | i2v model                                            | start-frame | end-frame        | audio |
+|--------|------------------------------------------------|------------------------------------------------------|-------------|------------------|-------|
+| low    | fal-ai/ltx-2.3/text-to-video                   | fal-ai/ltx-2.3/image-to-video                        | yes         | yes (end_image_url) | no |
+| medium | fal-ai/wan-t2v                                 | fal-ai/wan-i2v                                       | yes         | no               | no    |
+| high   | fal-ai/kling-video/v1.6/standard/text-to-video | fal-ai/kling-video/v1.6/standard/image-to-video      | yes         | yes (tail_image_url) | no |
+
+Veo 3 (`fal-ai/veo3`) confirmed as a future `high-audio` t2v tier candidate ($0.20–$0.75/sec, native dialogue + sfx + ambient). Not added — separate task when the use case is concrete.
+
+**New CLI flags on `parallax fal video`:** `--image PATH`, `--end-frame PATH` (requires `--image`), `--audio`/`--no-audio` (fails fast on any model without `supports_audio=True`).
+
+**ModelSpec** gained four capability flags: `supports_image_to_video`, `supports_start_frame`, `supports_end_frame`, `supports_audio`. `VIDEO_MODELS` preserved as alias for `VIDEO_T2V_MODELS` (backward compat). `get_video_model()` gained `mode` param (default `"t2v"`).
+
+**config.py** updated to support `[fal.video.t2v]` / `[fal.video.i2v]` subsections. Legacy flat `[fal.video]` with tier keys accepted as t2v + stderr deprecation warning.
+
+**API naming gotchas:** LTX-2.3 i2v uses `end_image_url` (not `tail_image_url`). Kling i2v uses `tail_image_url`. Wan i2v has no end-frame param at all. All three differ from each other — `_build_i2v_args` branches per model ID.
+
+**Live test:** LTX-2.3 i2v (`fal-ai/ltx-2.3/image-to-video`, low tier): `ffprobe` → h264, 1080×1920, 6.08s. t=0 frame visually matches input (b&w silhouette, same hand pose, digital-rain head). t=3 frame shows clear morphing/wave motion. Image upload via `fal_client.upload_file` worked without issues.
+
+**Breaks if:**
+- `parallax fal video low --image /path/img.jpg --prompt X --aspect 9:16 --output /tmp/out.mp4` produces a landscape (width > height) video, exits non-zero, or produces no file.
+- `parallax fal video low --audio` exits 0 instead of exit 2 with "does not support audio generation" error.
+- `parallax fal video low --end-frame /tmp/x.jpg` (without `--image`) exits 0 instead of exit 2 with "--end-frame requires --image" error.
+- `parallax fal models --json` returns rows missing the `mode`, `supports_start_frame`, `supports_end_frame`, `supports_audio` keys.
+- `parallax fal video medium --end-frame /tmp/x.jpg --image /tmp/y.jpg --prompt X` exits 0 instead of exit 2 (Wan i2v lacks end-frame support).
+
 ## 2026-04-16 — [CHANGED] Four-task pass: drawtext audit, config.toml, voice CLI, manifest voice_id
 
 **Task 1 — drawtext audit:** No dead code found. `burn()` in `burn-captions.py` is a live fallback when `text_render` is unavailable or the requested style isn't a PIL style (confirmed by DEV_LOG 2026-04-17 "falls back to drawtext if style is not a PIL style"). `burn-overlay.py` is entirely drawtext-based and still the correct tool for persistent lower-thirds/brand-tags (called from `head_of_production.py`). `drawtext` references in `senior_editor.py`, `junior_editor.py`, and `head_of_production.py` are in LLM prompt strings, not executable code — removing them would regress the agent's instructions. Nothing deleted; nothing flagged as dead.

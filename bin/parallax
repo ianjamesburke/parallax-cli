@@ -3869,13 +3869,45 @@ def build_parser() -> argparse.ArgumentParser:
     # fal video
     p_fal_video = fal_sub.add_parser(
         "video",
-        help="text-to-video generation (low=$0.02/clip, medium=$0.20/clip, high=~$0.056/sec)",
+        help=(
+            "video generation via fal.ai. Text-to-video by default; "
+            "pass --image for image-to-video (i2v). "
+            "low=$0.02/clip, medium=$0.20/clip, high=~$0.056/sec"
+        ),
     )
     p_fal_video.add_argument(
         "tier", choices=["low", "medium", "high"],
-        help="quality/cost tier: low (LTX-2.3 $0.02), medium (Wan 2.1 $0.20), high (Kling 1.6 ~$0.056/s)",
+        help="quality/cost tier: low (LTX-2.3 $0.02), medium (Wan $0.20), high (Kling 1.6 ~$0.056/s)",
     )
     p_fal_video.add_argument("--prompt", required=True, help="text prompt for video generation")
+    p_fal_video.add_argument(
+        "--image", metavar="PATH", default=None,
+        help=(
+            "path to a start-frame image. Switches to image-to-video (i2v) mode. "
+            "Image is uploaded to fal storage before generation."
+        ),
+    )
+    p_fal_video.add_argument(
+        "--end-frame", metavar="PATH", default=None, dest="end_frame",
+        help=(
+            "path to an end-frame image for frame-to-frame animation. "
+            "Requires --image. Only valid on tiers with end-frame support "
+            "(low=LTX-2.3 end_image_url, high=Kling tail_image_url). "
+            "Fails fast on medium (Wan i2v lacks end-frame support)."
+        ),
+    )
+    p_fal_video.add_argument(
+        "--audio", action="store_true", default=None,
+        help=(
+            "enable native audio generation (only valid on models with audio support). "
+            "Current t2v and i2v tiers do not support audio — use this flag only with "
+            "audio-capable models (e.g. Veo 3 if added as a future tier)."
+        ),
+    )
+    p_fal_video.add_argument(
+        "--no-audio", action="store_false", dest="audio",
+        help="explicitly disable audio generation (only relevant on audio-capable models)",
+    )
     p_fal_video.add_argument("--duration", type=int, default=5, metavar="SECONDS",
                              help="clip duration in seconds (default: 5)")
     p_fal_video.add_argument(
