@@ -2460,10 +2460,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    test_mode = bool(getattr(args, "test", False))
+
+    if not test_mode and not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "[parallax chat] ANTHROPIC_API_KEY is not set. "
-            "Export it and try again:\n"
+            "Export it and try again (or pass --test for mock mode):\n"
             "  export ANTHROPIC_API_KEY=sk-ant-...",
             file=sys.stderr,
         )
@@ -2474,29 +2476,33 @@ def cmd_chat(args: argparse.Namespace) -> int:
     venv_py = web_dir / ".venv" / "bin" / "python3"
     python_bin = str(venv_py) if venv_py.is_file() else (_shutil.which("python3") or sys.executable)
 
-    # Probe for the anthropic package; if missing, tell the user how to fix.
-    probe = _subprocess.run(
-        [python_bin, "-c", "import anthropic"],
-        capture_output=True,
-        text=True,
-    )
-    if probe.returncode != 0:
-        print(
-            "[parallax chat] the `anthropic` Python package isn't installed in\n"
-            f"  {python_bin}\n"
-            "Install it:\n"
-            f"  cd \"{web_dir}\" && python3 -m venv .venv\n"
-            f"  source .venv/bin/activate\n"
-            "  pip install -r requirements.txt",
-            file=sys.stderr,
+    if not test_mode:
+        # Probe for the anthropic package; if missing, tell the user how to fix.
+        probe = _subprocess.run(
+            [python_bin, "-c", "import anthropic"],
+            capture_output=True,
+            text=True,
         )
-        return 2
+        if probe.returncode != 0:
+            print(
+                "[parallax chat] the `anthropic` Python package isn't installed in\n"
+                f"  {python_bin}\n"
+                "Install it:\n"
+                f"  cd \"{web_dir}\" && python3 -m venv .venv\n"
+                f"  source .venv/bin/activate\n"
+                "  pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            return 2
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(web_dir) + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )
     env.setdefault("PARALLAX_PROJECT_DIR", os.getcwd())
+    if test_mode:
+        env["TEST_MODE"] = "true"
+        print("[parallax chat] --test: mock mode (no paid API calls)", file=sys.stderr)
 
     try:
         proc = _subprocess.Popen(
@@ -2665,6 +2671,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat = sub.add_parser(
         "chat",
         help="open the parallax-web localhost chat UI in the browser",
+    )
+    p_chat.add_argument(
+        "--test",
+        action="store_true",
+        help="run the chat UI in TEST_MODE — mock LLM + image/video/voiceover calls, no API key required",
     )
     p_chat.set_defaults(func=cmd_chat)
 

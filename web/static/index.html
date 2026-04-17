@@ -81,11 +81,11 @@
           <button type="button" class="btn ghost btn-sm" id="upload-btn" title="Upload an image">
             + Upload
           </button>
-          <input type="file" id="upload-input" accept="image/*" multiple style="display:none" />
+          <input type="file" id="upload-input" accept="image/*,video/*" multiple style="display:none" />
         </div>
         <div class="gallery dropzone" id="gallery">
-          <div class="gallery-empty" id="gallery-empty">
-            Drag images here or click <strong>+ Upload</strong>
+          <div class="gallery-empty" id="gallery-empty" style="cursor:pointer" onclick="document.getElementById('upload-input').click()">
+            Drag images or video here, or click to upload
           </div>
         </div>
       </section>

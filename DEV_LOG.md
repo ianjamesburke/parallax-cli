@@ -2,7 +2,36 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
-## 2026-04-16 — [FIX] Unsafe workspace filenames break LLM path round-tripping
+## 2026-04-16 — [CHANGED] Video uploads in media bin + web-layer TEST_MODE
+
+Two master-agent blocks shipped back-to-back.
+
+**Block A — video uploads in media bin.** `_handle_upload()` size cap in `web/server.py` raised from 50 MB to 500 MB so real video files fit. No gallery changes needed: `list_gallery` was already scanning `input/` for both image (png/jpg/jpeg/webp/gif) and video (mp4/mov/webm/m4v) extensions, and `/media/` already serves project-relative paths. The only gap was the cap.
+
+**Block B — web-layer TEST_MODE.** Set `TEST_MODE=1` on `parallax-web` to run the entire stack without paid APIs. Implementation in `web/server.py` only:
+1. Module-level `TEST_MODE` constant with canonical truthy parse (matches `main.py`).
+2. `preflight()` early-returns when TEST_MODE — no `ANTHROPIC_API_KEY` required.
+3. `_clean_subprocess_env()` sets `env["TEST_MODE"] = "true"` — one choke point propagates to every CLI subprocess so existing stubs in `packs/video/tools.py` fire (stills, voiceover, compose, evaluator all skip paid calls).
+4. Inline `_MockStream` + `_mock_anthropic_stream()` mimic the Anthropic SDK stream interface (context manager, `text_stream`, `get_final_message()`, usage). First user message containing "still"/"compose"/"voiceover" triggers one tool_use; everything else is plain text. Zero-token usage events emitted so telemetry doesn't crash.
+5. `run_agent_turn()` branches on TEST_MODE at the `client.messages.stream(...)` site.
+
+**Why inline mock over a fixture dir:** deterministic, no file I/O, one-file diff. Rejected adding a `--test-mode` CLI flag — env var is consistent with the existing CLI contract.
+
+**Breaks if:** uploading a 100+ MB video returns "file too large" (cap regressed); OR `TEST_MODE=1 just web` fails at startup asking for `ANTHROPIC_API_KEY` (preflight gate regressed); OR sending "hello" in TEST_MODE hits the real Anthropic API (mock branch regressed); OR a subprocess spawned from the server with TEST_MODE on still tries to call paid APIs (env propagation regressed).
+
+## 2026-04-16 — [FIX] Orphan tool_use 400s + mid-flight interrupt
+
+A session hit `anthropic.BadRequestError: messages.38: tool_use ids were found without tool_result blocks`. Root cause in `web/server.py:run_agent_turn`: the assistant turn (with `tool_use` blocks) was appended to `session.messages` **before** `_execute_tool_calls` ran. Any exception, cancel, or abort between those two statements left an orphan `tool_use` committed to history — every subsequent API call on the session then 400'd forever. Test replaying the failing transcript (`test/test_transcript_integrity.py`) reproduces it.
+
+**Fix:** inverted the commit order. Tools now execute first, then assistant+tool_result are appended atomically as a pair. If `_execute_tool_calls` crashes, we synthesize an `is_error: True` tool_result for every pending `tool_use` id so the transcript stays valid. Added `_finalize_pending_tool_uses(session, reason)` as belt-and-suspenders, called in a `finally` around the whole turn and again at the top of every new turn (repairs any history corrupted before this fix). Regression test covers all three failure modes (tool crash, cancel mid-exec, stream error) plus a replay of the real failing transcript.
+
+**Also landed in the same pass:**
+- **Mid-flight interrupt**: new `POST /api/interrupt` lets the user type while the agent is running. The server sets `cancel_event` + stores `pending_interrupt_text`; the top-of-loop cancel check injects the text as a user message and continues the same turn instead of ending it. Frontend (`app.js:sendMessage`) detects `state.thinking` and routes to `/api/interrupt` automatically — no separate UI control. Transcript integrity guaranteed by (A) so the interrupted turn is always valid.
+- **Scene-creation checklist in `web/hop_prompt.md`**: explicit 5-step ordering (survey → show manifest → single `set-scenes` call → create only if needed → confirm) to stop the agent from dribbling `add-scene` calls one-at-a-time and skipping ahead to compose.
+
+**Breaks if:** agent sends a prompt that triggers tool use and the subsequent send 400s with "tool_use ids were found without tool_result" — the atomic-commit or finalize path regressed. Or: user types during an agent turn and the message starts a separate new turn instead of landing as an inline interrupt.
+
+
 
 Session `005933acd2…` looped on `read_image` returning "file does not exist" for `Screenshot 2026-03-12 at 1.00.01 PM.png`. Root cause: macOS screenshot filenames contain U+202F (narrow no-break space) between the time and AM/PM. `list_dir` returns the raw unicode name; the model normalizes U+202F to ASCII space when echoing it back in the next `read_image` call; path lookup misses. The agent retried 3× then gave up and guessed content blind.
 

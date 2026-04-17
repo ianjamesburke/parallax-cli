@@ -59,9 +59,9 @@ function scrollToBottom() {
   m.scrollTop = m.scrollHeight;
 }
 
-function appendUserMsg(text) {
+function appendUserMsg(text, opts) {
   const el = document.createElement("div");
-  el.className = "msg user";
+  el.className = "msg user" + (opts && opts.interrupt ? " interrupt" : "");
   el.textContent = text;
   messagesEl().appendChild(el);
   scrollToBottom();
@@ -199,6 +199,15 @@ function openStream(sessionId) {
     if (state.thinking) setStatus("thinking");
   });
 
+  es.addEventListener("user_interrupt", (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      appendUserMsg(data.text || "", { interrupt: true });
+    } catch (_) {
+      // ignore
+    }
+  });
+
   es.addEventListener("assistant_delta", (e) => {
     const data = JSON.parse(e.data);
     setStatus("streaming");
@@ -250,6 +259,25 @@ function openStream(sessionId) {
 
 async function sendMessage(text) {
   if (!text.trim()) return;
+
+  // If the agent is mid-turn, route this as an interrupt (soft course-correct)
+  // instead of starting a new turn. The server injects the text inline at the
+  // next iteration boundary and continues the same turn.
+  if (state.thinking && state.sessionId) {
+    // No optimistic render — the server broadcasts `user_interrupt` over SSE
+    // which the stream handler paints. Avoids double-render.
+    try {
+      await fetch("/api/interrupt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: state.sessionId, text }),
+      });
+    } catch (e) {
+      appendError(`interrupt failed: ${e}`);
+    }
+    return;
+  }
+
   appendUserMsg(text);
   state.thinking = true;
   setStatus("thinking");
@@ -355,7 +383,12 @@ function renderGallery(data) {
     if (stills.length === 0 && !emptyEl) {
       const empty = document.createElement("div");
       empty.className = "gallery-empty";
-      empty.innerHTML = 'Drag images here or click <strong>+ Upload</strong>';
+      empty.innerHTML = 'Drag images or video here, or click to upload';
+      empty.style.cursor = "pointer";
+      empty.addEventListener("click", () => {
+        const inp = document.getElementById("upload-input");
+        if (inp) inp.click();
+      });
       gallery.appendChild(empty);
     }
 

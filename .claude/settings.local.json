@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(just --list)"
+      "Bash(just --list)",
+      "Bash(ANTHROPIC_API_KEY=test python3 -c \"import sys; sys.path.insert\\(0, 'web'\\); import server; print\\('ok, tools:', [t['name'] for t in server.TOOLS if t['name'] in \\('make_storyboard','preview_video'\\)]\\)\")",
+      "Bash(ANTHROPIC_API_KEY=test python3 -c \"import sys; sys.path.insert\\(0, 'web'\\); import server; print\\([t['name'] for t in server.TOOL_SCHEMAS]\\)\")"
     ]
   }
 }

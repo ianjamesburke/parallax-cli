@@ -38,6 +38,18 @@ Use `add-video-scene` for actual video clips (with optional `start_s`/`end_s` to
 
 If audio was edited or trimmed externally, run `parallax_transcribe()` to regenerate the WhisperX vo_manifest. You usually don't need this — `parallax_voiceover` auto-transcribes — but use it if the audio file changes after voiceover.
 
+## Scene creation — get it right first try
+
+When the user asks you to create or set up scenes, do this, in this order, every time:
+
+1. **Survey first.** `make_storyboard(path="input")` if they just uploaded refs, or `make_storyboard(path="stills")` if you already generated some. One call — not N `read_image` calls.
+2. **Check the manifest.** `edit_manifest(op="show")` to see what scenes already exist. Do not edit blind.
+3. **Write the full list in ONE call.** `edit_manifest(op="set-scenes", values=[...])` with every scene in the spec `'path:duration:motion'`. Do NOT add scenes one at a time with `add-scene` in a loop — that's N round-trips for something that should be one.
+4. **Only generate new stills if needed.** If the user has given you usable inputs or stills, don't call `parallax_create` reflexively. Create only when there's a concrete gap in the scene list.
+5. **Confirm visually.** One `make_storyboard(path="stills")` after to show what's queued, then stop and wait for the user's next instruction.
+
+If any step errors, stop and report the exact message. Do not retry blindly, do not "try a different approach" silently, do not skip ahead to compose.
+
 ## Project layout — KNOW THIS, DO NOT LIST IT
 
 Every Parallax project has the same fixed layout. **Never call `list_dir(".")` to discover it.** Only list a folder when you actually need to see its contents.
@@ -69,6 +81,7 @@ Filenames you read from `list_dir` or `make_storyboard` are exact. **Use them ve
 - `read_file(path)` — read a text file (briefs, YAML, scripts, transcripts). Max 256 KB.
 - `read_image(path)` — see a single still or reference image. Use sparingly.
 - `make_storyboard(path, max_images?)` — see up to 8 images from a directory in ONE call, each labeled with its filename. **Always prefer this over multiple `read_image` calls when surveying a directory.**
+- `preview_video(path, frames?)` — see a video as a frame grid with timecodes + waveform strip. **Always call this before composing over or editing based on an existing video** — it's the only way to actually see what's in the video.
 
 **Driving the pipeline:**
 - `parallax_create(brief, count?, aspect_ratio?, ref?)` — generate new stills via Gemini Flash Image. Pass `ref` (array of paths inside the project, e.g. `['input/foo.png']`) for image-to-image. Stills land in `stills/`.
@@ -118,3 +131,4 @@ All tools are scoped to the project directory the chat was launched in.
 - "I need to choose which images to use" → `edit_manifest set-scenes`
 - "I need to render the video" → `parallax_compose`
 - "I need to see what's in stills/" → `make_storyboard`
+- "I need to see what's in a video" → `preview_video`

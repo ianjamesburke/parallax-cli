@@ -25,6 +25,7 @@ import shutil
 import socket
 import socketserver
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -48,6 +49,8 @@ import telemetry  # noqa: E402
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+TEST_MODE = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes", "on")
 
 MODEL = os.environ.get("PARALLAX_WEB_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = 16384
@@ -327,6 +330,7 @@ class Session:
         self.display_log: list[dict[str, Any]] = []  # normalized for /api/session
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
         self.cancel_event = threading.Event()
+        self.pending_interrupt_text: Optional[str] = None
         self.agent_thread: Optional[threading.Thread] = None
         self.dispatch_proc: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
@@ -466,6 +470,31 @@ TOOL_SCHEMAS = [
                     "description": "Max images to include, up to 8 (default: 8).",
                 },
             },
+        },
+    },
+    {
+        "name": "preview_video",
+        "description": (
+            "Produce a contact sheet of frames + waveform from a video file. "
+            "The output is a single image: evenly-spaced frames with timecodes, "
+            "plus a waveform strip under each row showing audio level and silence "
+            "regions. Use this BEFORE calling parallax_compose over an existing "
+            "video or making edits based on video content — it is the only way "
+            "to actually see what is in a video."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Video path relative to project root (e.g. 'output/latest.mp4').",
+                },
+                "frames": {
+                    "type": "integer",
+                    "description": "Total frames to extract across the whole video (default: 12).",
+                },
+            },
+            "required": ["path"],
         },
     },
     {
@@ -862,6 +891,8 @@ def _clean_subprocess_env() -> dict:
     cleaned = [p for p in path_parts if "/venv/" not in p and "/.venv/" not in p and "/virtualenvs/" not in p]
     if cleaned:
         env["PATH"] = ":".join(cleaned)
+    if TEST_MODE:
+        env["TEST_MODE"] = "true"
     return env
 
 
@@ -1123,6 +1154,105 @@ def tool_edit_manifest(
 # ---------------------------------------------------------------------------
 
 
+class _MockStream:
+    """Minimal context-manager stream that mimics the Anthropic SDK streaming interface."""
+
+    def __init__(self, messages: list[dict], tools: list[dict]):
+        # Determine what to emit based on the last user message text.
+        last_text = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content") or []
+                # If the last user message is tool_results, don't trigger tool_use again
+                if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                    break
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        last_text = c.get("text", "").lower()
+                        break
+            if last_text:
+                break
+
+        TOOL_TRIGGER_MAP = {
+            "still": ("parallax_create", {"brief": "a test still image", "count": 1}),
+            "compose": ("parallax_compose", {"script": "test_compose"}),
+            "voiceover": ("parallax_voiceover", {"text": "test voiceover", "filename": "test_vo.mp3"}),
+        }
+
+        self._tool_use: Optional[dict] = None
+        for kw, (tool_name, tool_input) in TOOL_TRIGGER_MAP.items():
+            if kw in last_text:
+                # Verify the tool actually exists in TOOL_SCHEMAS before emitting
+                schema_names = {s.get("name") for s in tools}
+                if tool_name in schema_names:
+                    self._tool_use = {
+                        "type": "tool_use",
+                        "id": f"mock_tool_{uuid.uuid4().hex[:8]}",
+                        "name": tool_name,
+                        "input": tool_input,
+                    }
+                break
+
+        self._text = "TEST_MODE: mock reply. No API call made."
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def __iter__(self):
+        # Yield a synthetic text_delta event so the streaming path emits assistant_delta
+        class _Delta:
+            type = "text_delta"
+            def __init__(self, t): self.text = t
+        class _Event:
+            type = "content_block_delta"
+            def __init__(self, t): self.delta = _Delta(t)
+        yield _Event(self._text)
+
+    def get_final_message(self):
+        """Return an object mimicking anthropic.types.Message."""
+        class _FakeUsage:
+            input_tokens = 0
+            output_tokens = 0
+
+        class _TextBlock:
+            type = "text"
+            def __init__(self, text):
+                self.text = text
+
+        class _ToolUseBlock:
+            type = "tool_use"
+            def __init__(self, id, name, input):
+                self.id = id
+                self.name = name
+                self.input = input
+
+        class _FakeMessage:
+            def __init__(self, text_block, tool_block):
+                self.usage = _FakeUsage()
+                self.content: list = [text_block]
+                if tool_block:
+                    self.content.append(tool_block)
+                    self.stop_reason = "tool_use"
+                else:
+                    self.stop_reason = "end_turn"
+
+        tool_block = None
+        if self._tool_use:
+            tool_block = _ToolUseBlock(
+                self._tool_use["id"],
+                self._tool_use["name"],
+                self._tool_use["input"],
+            )
+        return _FakeMessage(_TextBlock(self._text), tool_block)
+
+
+def _mock_anthropic_stream(messages: list[dict], tools: list[dict]) -> _MockStream:
+    return _MockStream(messages, tools)
+
+
 def _lazy_client():
     try:
         import anthropic  # noqa: F401
@@ -1240,6 +1370,63 @@ def _execute_tool_calls(
                                     msg = f"could not read storyboard output: {e}"
                                     content_block = [{"type": "text", "text": msg}]
                                     summary = msg
+            elif name == "preview_video":
+                raw_path = (args.get("path") or "").strip()
+                frames = int(args.get("frames") or 12)
+                if not raw_path:
+                    content_block = [{"type": "text", "text": "error: path is required"}]
+                    summary = "preview_video: missing path"
+                else:
+                    try:
+                        vid_path = _resolve_project_path(raw_path, workspace=session.workspace)
+                    except PathError as pe:
+                        content_block = [{"type": "text", "text": f"error: {pe}"}]
+                        summary = str(pe)
+                    else:
+                        if not vid_path.exists() or not vid_path.is_file():
+                            msg = f"video not found: {raw_path}"
+                            content_block = [{"type": "text", "text": msg}]
+                            summary = msg
+                        else:
+                            script = _HERE.parent / "packs" / "video" / "scripts" / "preview-sheet.py"
+                            out_tmp = Path(tempfile.gettempdir()) / f"parallax_preview_{session.id}_{int(time.time())}.jpg"
+                            try:
+                                result = subprocess.run(
+                                    [sys.executable, str(script),
+                                     "--input", str(vid_path),
+                                     "--frames", str(frames),
+                                     "--waveform", str(vid_path),
+                                     "--output", str(out_tmp)],
+                                    capture_output=True, text=True, timeout=60,
+                                )
+                            except Exception as e:
+                                msg = f"preview_video failed: {e}"
+                                content_block = [{"type": "text", "text": msg}]
+                                summary = msg
+                            else:
+                                if result.returncode != 0:
+                                    msg = (result.stderr or "preview_video error").strip()
+                                    content_block = [{"type": "text", "text": msg}]
+                                    summary = msg
+                                else:
+                                    try:
+                                        meta = json.loads(result.stdout.strip().splitlines()[-1])
+                                        pages = meta.get("pages") or [str(out_tmp)]
+                                        first = Path(pages[0])
+                                        raw = first.read_bytes()
+                                        b64 = base64.standard_b64encode(raw).decode("ascii")
+                                        note = f"preview of {raw_path} ({meta.get('frame_count', frames)} frames)"
+                                        if len(pages) > 1:
+                                            note += f" — page 1 of {len(pages)}"
+                                        content_block = [
+                                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                                            {"type": "text", "text": note},
+                                        ]
+                                        summary = f"preview: {first.name}"
+                                    except Exception as e:
+                                        msg = f"could not read preview output: {e}"
+                                        content_block = [{"type": "text", "text": msg}]
+                                        summary = msg
             elif name == "parallax_create":
                 brief = args.get("brief", "")
                 count = int(args.get("count") or 3)
@@ -1338,15 +1525,53 @@ def _execute_tool_calls(
     return results
 
 
+def _finalize_pending_tool_uses(session: Session, reason: str) -> None:
+    """Repair transcript if the tail is an assistant turn with tool_use blocks
+    lacking matching tool_result blocks. Synthesizes is_error results so the
+    next Anthropic call doesn't 400 on orphan tool_use ids. Idempotent."""
+    if not session.messages:
+        return
+    last = session.messages[-1]
+    if last.get("role") != "assistant":
+        return
+    content = last.get("content") or []
+    if not isinstance(content, list):
+        return
+    pending_ids = [
+        b.get("id") for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+    ]
+    if not pending_ids:
+        return
+    synthetic = [
+        {
+            "type": "tool_result",
+            "tool_use_id": tid,
+            "content": [{"type": "text", "text": f"tool not executed: {reason}"}],
+            "is_error": True,
+        }
+        for tid in pending_ids
+    ]
+    session.messages.append({"role": "user", "content": synthetic})
+
+
 def run_agent_turn(session: Session, user_text: str) -> None:
     """Agent loop body — runs in a background thread per POST /api/message."""
-    try:
-        client = _lazy_client()
-    except Exception as e:
-        session.broadcast("error", {"message": str(e)})
-        telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
-        session.broadcast("agent_done", {"ok": False})
-        return
+    if not TEST_MODE:
+        try:
+            client = _lazy_client()
+        except Exception as e:
+            session.broadcast("error", {"message": str(e)})
+            telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
+            session.broadcast("agent_done", {"ok": False})
+            return
+    else:
+        client = None  # unused in TEST_MODE; mock stream is called directly
+
+    # Defense-in-depth: if a prior turn ended with orphan tool_use blocks
+    # (pre-fix history, or a crash that bypassed the synthesizer), repair
+    # before appending the new user turn so we don't 400 on the next call.
+    _finalize_pending_tool_uses(session, reason="prior turn ended without tool_result")
 
     # Append user turn.
     user_content: list[dict] = [{"type": "text", "text": user_text}]
@@ -1357,111 +1582,160 @@ def run_agent_turn(session: Session, user_text: str) -> None:
     hop_prompt = _load_hop_prompt()
 
     MAX_ITER = 12
-    for _iter in range(MAX_ITER):
-        if session.cancel_event.is_set():
-            session.broadcast("agent_done", {"ok": False, "cancelled": True})
-            return
+    try:
+        for _iter in range(MAX_ITER):
+            if session.cancel_event.is_set():
+                # Soft interrupt: inject the new user message and continue.
+                pending = getattr(session, "pending_interrupt_text", None)
+                if pending:
+                    session.messages.append(
+                        {"role": "user", "content": [{"type": "text", "text": pending}]}
+                    )
+                    session.push_display("user_message", {"text": pending, "interrupt": True})
+                    telemetry.record_event(
+                        session.id, "user_interrupt", {"text": pending}
+                    )
+                    session.pending_interrupt_text = None
+                    session.cancel_event.clear()
+                    continue
+                session.broadcast("agent_done", {"ok": False, "cancelled": True})
+                return
 
-        try:
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=hop_prompt,
-                tools=TOOL_SCHEMAS,
-                messages=session.messages,
-            ) as stream:
-                for event in stream:
-                    if session.cancel_event.is_set():
-                        break
-                    etype = getattr(event, "type", "")
-                    if etype == "content_block_delta":
-                        delta = getattr(event, "delta", None)
-                        if delta is not None and getattr(delta, "type", "") == "text_delta":
-                            session.broadcast(
-                                "assistant_delta", {"text": delta.text}
-                            )
-                final = stream.get_final_message()
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"agent: stream error: {e}\n{tb}", file=sys.stderr, flush=True)
-            session.broadcast("error", {"message": f"stream error: {e}"})
-            telemetry.record_event(
-                session.id, "error", {"where": "stream", "message": str(e)}
-            )
-            session.broadcast("agent_done", {"ok": False})
-            return
+            try:
+                _stream_ctx = (
+                    _mock_anthropic_stream(session.messages, TOOL_SCHEMAS)
+                    if TEST_MODE
+                    else client.messages.stream(  # type: ignore[union-attr]
+                        model=MODEL,
+                        max_tokens=MAX_TOKENS,
+                        system=hop_prompt,
+                        tools=TOOL_SCHEMAS,
+                        messages=session.messages,
+                    )
+                )
+                with _stream_ctx as stream:
+                    for event in stream:
+                        if session.cancel_event.is_set():
+                            break
+                        etype = getattr(event, "type", "")
+                        if etype == "content_block_delta":
+                            delta = getattr(event, "delta", None)
+                            if delta is not None and getattr(delta, "type", "") == "text_delta":
+                                session.broadcast(
+                                    "assistant_delta", {"text": delta.text}
+                                )
+                    final = stream.get_final_message()
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"agent: stream error: {e}\n{tb}", file=sys.stderr, flush=True)
+                session.broadcast("error", {"message": f"stream error: {e}"})
+                telemetry.record_event(
+                    session.id, "error", {"where": "stream", "message": str(e)}
+                )
+                session.broadcast("agent_done", {"ok": False})
+                return
 
-        # Unpack final message content into serializable blocks for history.
-        blocks: list[dict] = []
-        text_chunks: list[str] = []
-        tool_uses: list[dict] = []
-        for block in final.content:
-            btype = getattr(block, "type", "")
-            if btype == "text":
-                text = getattr(block, "text", "") or ""
-                blocks.append({"type": "text", "text": text})
-                text_chunks.append(text)
-            elif btype == "tool_use":
-                tu = {
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                }
-                blocks.append(tu)
-                tool_uses.append(tu)
+            # Unpack final message content into serializable blocks for history.
+            blocks: list[dict] = []
+            text_chunks: list[str] = []
+            tool_uses: list[dict] = []
+            for block in final.content:
+                btype = getattr(block, "type", "")
+                if btype == "text":
+                    text = getattr(block, "text", "") or ""
+                    blocks.append({"type": "text", "text": text})
+                    text_chunks.append(text)
+                elif btype == "tool_use":
+                    tu = {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    }
+                    blocks.append(tu)
+                    tool_uses.append(tu)
 
-        if text_chunks:
-            joined = "".join(text_chunks)
-            session.push_display("assistant_text", {"text": joined})
-            telemetry.record_event(
-                session.id, "assistant_text", {"text": joined}
-            )
+            if text_chunks:
+                joined = "".join(text_chunks)
+                session.push_display("assistant_text", {"text": joined})
+                telemetry.record_event(
+                    session.id, "assistant_text", {"text": joined}
+                )
 
-        # Update tokens + cost in telemetry.
-        try:
-            usage = getattr(final, "usage", None)
-            if usage is not None:
-                in_tok = getattr(usage, "input_tokens", 0) or 0
-                out_tok = getattr(usage, "output_tokens", 0) or 0
-                cost_delta = _model_cost_usd(MODEL, in_tok, out_tok)
-                telemetry.touch_session(
-                    session.id,
-                    input_tokens_delta=in_tok,
-                    output_tokens_delta=out_tok,
-                    cost_delta_usd=cost_delta,
+            # Update tokens + cost in telemetry.
+            try:
+                usage = getattr(final, "usage", None)
+                if usage is not None:
+                    in_tok = getattr(usage, "input_tokens", 0) or 0
+                    out_tok = getattr(usage, "output_tokens", 0) or 0
+                    cost_delta = _model_cost_usd(MODEL, in_tok, out_tok)
+                    telemetry.touch_session(
+                        session.id,
+                        input_tokens_delta=in_tok,
+                        output_tokens_delta=out_tok,
+                        cost_delta_usd=cost_delta,
+                    )
+                    telemetry.record_event(
+                        session.id,
+                        "anthropic_usage",
+                        {
+                            "model": MODEL,
+                            "input_tokens": in_tok,
+                            "output_tokens": out_tok,
+                            "cost_usd": round(cost_delta, 6),
+                        },
+                    )
+            except Exception as e:
+                print(f"agent: usage update failed: {e}", file=sys.stderr, flush=True)
+
+            stop_reason = getattr(final, "stop_reason", None)
+            if stop_reason != "tool_use" or not tool_uses:
+                # No tools — commit assistant turn and exit.
+                session.messages.append({"role": "assistant", "content": blocks})
+                session.broadcast("agent_done", {"ok": True})
+                return
+
+            # Execute tools FIRST, then commit assistant + results atomically so
+            # the transcript can never have an orphan tool_use block.
+            try:
+                tool_results = _execute_tool_calls(session, tool_uses)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(
+                    f"agent: tool exec crashed: {e}\n{tb}",
+                    file=sys.stderr,
+                    flush=True,
                 )
                 telemetry.record_event(
-                    session.id,
-                    "anthropic_usage",
-                    {
-                        "model": MODEL,
-                        "input_tokens": in_tok,
-                        "output_tokens": out_tok,
-                        "cost_usd": round(cost_delta, 6),
-                    },
+                    session.id, "error", {"where": "tool_exec", "message": str(e)}
                 )
-        except Exception as e:
-            print(f"agent: usage update failed: {e}", file=sys.stderr, flush=True)
+                tool_results = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": [
+                            {"type": "text", "text": f"tool exec crashed: {e}"}
+                        ],
+                        "is_error": True,
+                    }
+                    for tu in tool_uses
+                ]
 
-        session.messages.append({"role": "assistant", "content": blocks})
+            session.messages.append({"role": "assistant", "content": blocks})
+            session.messages.append({"role": "user", "content": tool_results})
 
-        stop_reason = getattr(final, "stop_reason", None)
-        if stop_reason != "tool_use" or not tool_uses:
-            session.broadcast("agent_done", {"ok": True})
-            return
-
-        # Run the tools and feed the results back.
-        tool_results = _execute_tool_calls(session, tool_uses)
-        session.messages.append({"role": "user", "content": tool_results})
-
-    session.broadcast(
-        "agent_done", {"ok": False, "error": "max iterations exceeded"}
-    )
+        session.broadcast(
+            "agent_done", {"ok": False, "error": "max iterations exceeded"}
+        )
+    finally:
+        # Belt-and-suspenders: whatever path we exit on, the transcript must
+        # never have a trailing assistant-with-tool_use lacking tool_results.
+        _finalize_pending_tool_uses(session, reason="turn ended before tool execution")
 
 
 def start_agent_thread(session: Session, user_text: str) -> None:
     session.cancel_event.clear()
+    session.pending_interrupt_text = None
 
     def _run():
         try:
@@ -1788,6 +2062,7 @@ class Handler(BaseHTTPRequestHandler):
             s = SESSIONS.get(sid)
             if s is None:
                 return self._write_error(404, "no such session")
+            s.pending_interrupt_text = None
             s.cancel_event.set()
             proc = s.dispatch_proc
             if proc is not None:
@@ -1796,6 +2071,33 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return self._write_json(200, {"ok": True})
+
+        if path == "/api/interrupt":
+            body = self._read_json_body()
+            sid = body.get("session_id")
+            text = body.get("text")
+            if not isinstance(sid, str):
+                return self._write_error(400, "session_id required")
+            if not isinstance(text, str) or not text.strip():
+                return self._write_error(400, "text required")
+            s = SESSIONS.get(sid)
+            if s is None:
+                return self._write_error(404, "no such session")
+            thread = s.agent_thread
+            if thread is None or not thread.is_alive():
+                # Agent not running — treat as a normal message send.
+                start_agent_thread(s, text)
+                return self._write_json(200, {"ok": True, "mode": "new_turn"})
+            s.pending_interrupt_text = text
+            s.cancel_event.set()
+            proc = s.dispatch_proc
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            s.broadcast("user_interrupt", {"text": text})
+            return self._write_json(200, {"ok": True, "mode": "interrupt"})
 
         if path == "/api/upload":
             return self._handle_upload()
@@ -1897,8 +2199,8 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or "0")
         except ValueError:
             return self._write_error(400, "invalid Content-Length")
-        if length <= 0 or length > 50 * 1024 * 1024:  # 50 MB cap
-            return self._write_error(400, "file too large or empty (max 50 MB)")
+        if length <= 0 or length > 500 * 1024 * 1024:  # 500 MB cap
+            return self._write_error(400, "file too large or empty (max 500 MB)")
 
         try:
             body = self.rfile.read(length)
@@ -2232,6 +2534,9 @@ def find_free_port() -> int:
 
 def preflight() -> None:
     """Validate required environment before spawning the server."""
+    if TEST_MODE:
+        print("parallax-web: TEST_MODE enabled — API key not required, mock stream active", flush=True)
+        return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "parallax-web: ANTHROPIC_API_KEY is not set. "
