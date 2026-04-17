@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parallax — Head of Production</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="app">
+
+      <!-- ── Left column: header + project list + chat ── -->
+      <div class="left-col">
+        <header class="app-header">
+          <div class="header-brand">
+            <span class="brand-mark">◐</span>
+            <span class="brand-name">Parallax</span>
+            <span class="brand-sub">Head of Production</span>
+          </div>
+          <div class="header-meta">
+            <span class="status-dot" id="status-dot" title="idle"></span>
+            <span class="project-badge" id="project-badge">main</span>
+            <button type="button" class="header-link" id="finder-btn" title="Open project folder in Finder">finder ↗</button>
+          </div>
+        </header>
+
+        <div class="sidebar-wrap">
+          <div class="sidebar-header">
+            <span class="sidebar-section-label">Projects</span>
+            <button type="button" class="btn ghost btn-sm" id="new-session-btn" title="New project">+</button>
+          </div>
+          <div class="sidebar-list" id="sidebar-list">
+            <div class="sidebar-empty">No projects yet.</div>
+          </div>
+        </div>
+
+        <div class="chat">
+          <div class="messages" id="messages">
+            <div class="welcome" id="welcome">
+              <div class="welcome-title">Welcome to Parallax</div>
+              <div class="welcome-sub">A short-form video studio driven by natural language.</div>
+              <ul class="welcome-list">
+                <li><b>Brief the Head of Production.</b> Describe what you want — a 3-scene Ken Burns ad, a character study, a mood piece — and it handles stills, voiceover, pacing, and final render.</li>
+                <li><b>Upload reference images</b> via the Media tab on the right. They're selected as references by default, so the next generation uses them image-to-image via Gemini.</li>
+                <li><b>Type "TEST MODE" anywhere in your brief</b> to run the full pipeline without spending API credits — placeholder stills + macOS voice.</li>
+                <li><b>Projects</b> live under <code>parallax/&lt;project&gt;/</code>. Create one via the <b>+</b> above; files at the launch-dir root are shared across every project.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="thinking-bar hidden" id="thinking-bar">
+            <span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>
+            <span class="thinking-label" id="thinking-label">Thinking</span>
+          </div>
+          <div class="ref-bar hidden" id="ref-bar">
+            <span class="ref-bar-label" id="ref-bar-label"></span>
+            <button type="button" class="ref-bar-clear" id="ref-bar-clear" title="Clear reference images">×</button>
+          </div>
+          <form class="composer" id="composer">
+            <textarea
+              id="composer-input"
+              placeholder="Brief the Head of Production… (Enter to send, Shift+Enter for newline)"
+              rows="3"
+              autofocus
+            ></textarea>
+            <div class="composer-row">
+              <button type="button" id="expand-composer-btn" class="btn ghost icon-btn" title="Expand editor">⤢</button>
+              <button type="button" id="cancel-btn" class="btn ghost" disabled>Cancel</button>
+              <button type="submit" id="send-btn" class="btn primary">Send</button>
+            </div>
+          </form>
+
+          <!-- Expanded composer modal -->
+          <div id="composer-modal" class="composer-modal hidden">
+            <div class="composer-modal-inner">
+              <div class="composer-modal-header">
+                <span class="composer-modal-title">Compose message</span>
+                <button type="button" id="composer-modal-close" class="btn ghost icon-btn" title="Close">✕</button>
+              </div>
+              <textarea
+                id="composer-modal-input"
+                placeholder="Brief the Head of Production…"
+                autofocus
+              ></textarea>
+              <div class="composer-modal-footer">
+                <button type="button" id="composer-modal-cancel" class="btn ghost" disabled>Cancel</button>
+                <button type="button" id="composer-modal-send" class="btn primary">Send</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div><!-- /left-col -->
+
+      <!-- ── Right column: preview + tabbed panels ── -->
+      <div class="right-col">
+        <div class="workspace">
+          <div class="workspace-main">
+            <div class="tab-bar">
+              <button type="button" class="tab-btn" data-tab="media">Media</button>
+              <button type="button" class="tab-btn" data-tab="timeline">Timeline</button>
+              <button type="button" class="tab-btn" data-tab="costs">Costs</button>
+              <button type="button" class="tab-btn" data-tab="manifest">Manifest</button>
+            </div>
+
+            <div class="tab-panels">
+
+              <!-- Timeline: scene cards from the manifest -->
+              <div class="tab-panel" id="panel-timeline">
+                <div class="timeline-layout">
+                  <div class="timeline-scenes" id="timeline-scenes">
+                    <div class="timeline-empty">No scenes yet — brief the Head of Production to build the manifest.</div>
+                  </div>
+                  <div class="timeline-detail empty" id="timeline-detail">
+                    Click a scene card to inspect voiceover and scene description.
+                  </div>
+                </div>
+              </div>
+
+              <!-- Media: stills gallery + video list -->
+              <div class="tab-panel active" id="panel-media">
+                <div class="media-inner">
+                  <div class="gallery-head">
+                    <span class="gallery-title">Stills</span>
+                    <span class="gallery-count" id="gallery-count">0</span>
+                    <button type="button" class="btn ghost btn-sm" id="upload-btn" title="Upload an image">+ Upload</button>
+                    <input type="file" id="upload-input" accept="image/*" multiple style="display:none" />
+                  </div>
+                  <div class="gallery dropzone" id="gallery">
+                    <div class="gallery-empty" id="gallery-empty">
+                      Drag images here or click <strong>+ Upload</strong>
+                    </div>
+                  </div>
+                  <div class="gallery-head" style="margin-top:12px">
+                    <span class="gallery-title">Videos</span>
+                    <span class="gallery-count" id="video-count">0</span>
+                  </div>
+                  <div class="video-gallery" id="video-gallery"></div>
+                </div>
+              </div>
+
+              <!-- Costs: inline cost report -->
+              <div class="tab-panel" id="panel-costs">
+                <div class="costs-inner" id="costs-inner">
+                  <div class="panel-loading">Loading cost report…</div>
+                </div>
+              </div>
+
+              <!-- Manifest: project manifest detail view -->
+              <div class="tab-panel" id="panel-manifest">
+                <div class="manifest-inner" id="manifest-inner">
+                  <div class="panel-loading">Loading manifest…</div>
+                </div>
+              </div>
+
+            </div><!-- /tab-panels -->
+          </div>
+
+          <aside class="preview-area">
+            <div class="preview-header">
+              <span class="project-label" id="project-label">—</span>
+              <select class="version-select" id="version-select" title="Select output version">
+                <option value="">No renders yet</option>
+              </select>
+            </div>
+            <div class="player-wrap" id="player-wrap">
+              <div class="video-empty">No renders yet.</div>
+            </div>
+          </aside>
+          </div>
+        </div><!-- /workspace -->
+      </div><!-- /right-col -->
+
+    </div><!-- /app -->
+
+    <div class="lightbox hidden" id="lightbox">
+      <img id="lightbox-img" alt="" />
+    </div>
+
+    <script src="/static/marked.min.js"></script>
+    <script src="/static/app.js"></script>
+    <script src="/static/timeline.js"></script>
+  </body>
+</html>

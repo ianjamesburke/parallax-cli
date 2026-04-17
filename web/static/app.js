@@ -84,6 +84,17 @@ function scrollToBottom() {
   m.scrollTop = m.scrollHeight;
 }
 
+function applyPlayerAspectClass(playerEl, videoEl) {
+  if (!playerEl || !videoEl) return;
+  const sync = () => {
+    const w = videoEl.videoWidth || 0;
+    const h = videoEl.videoHeight || 0;
+    playerEl.classList.toggle("is-portrait", w > 0 && h > w * 1.05);
+  };
+  if (videoEl.readyState >= 1) sync();
+  videoEl.addEventListener("loadedmetadata", sync, { once: true });
+}
+
 function appendUserMsg(text) {
   hideWelcome();
   const el = document.createElement("div");
@@ -132,7 +143,7 @@ function appendToolUse(ev) {
           .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 80)}`)
           .join(" ")
       : "";
-  el.innerHTML = `<span class="tool-name">${escapeHtml(ev.name || "tool")}</span><span class="tool-arrow">→</span><span>${escapeHtml(args)}</span>`;
+  el.innerHTML = `<span class="tool-name">${escapeHtml(ev.name || "tool")}</span><span class="tool-arrow">→</span><span class="tool-args">${escapeHtml(args)}</span>`;
   messagesEl().appendChild(el);
   scrollToBottom();
 }
@@ -281,6 +292,7 @@ function openStream(sessionId) {
     setStatus("");
     updateButtons();
     refreshGallery();
+    _callRefreshTimeline();
     refreshUsage();
     try {
       JSON.parse(e.data);
@@ -361,8 +373,11 @@ async function cancel() {
 }
 
 function updateButtons() {
-  $("cancel-btn").disabled = !state.thinking && !state.dispatchActive;
+  const cancelDisabled = !state.thinking && !state.dispatchActive;
+  $("cancel-btn").disabled = cancelDisabled;
   $("send-btn").disabled = false;
+  const modalCancel = $("composer-modal-cancel");
+  if (modalCancel) modalCancel.disabled = cancelDisabled;
 }
 
 // ----- gallery -------------------------------------------------------------
@@ -478,7 +493,8 @@ function renderGallery(data) {
         zoom.textContent = "⤢";
         zoom.addEventListener("click", (e) => {
           e.stopPropagation();
-          openLightbox(img.src);
+          const allSrcs = Array.from($("gallery").querySelectorAll("img")).map((i) => i.src);
+          openLightbox(img.src, allSrcs);
         });
         thumb.appendChild(zoom);
 
@@ -505,6 +521,7 @@ function renderGallery(data) {
   // ----- video gallery + player -----
   const player = $("player-wrap");
   const vList = $("video-gallery");
+  const vSelect = $("version-select");
 
   // Track which video is currently shown in the player
   if (!state.activeVideo && videos.length > 0) {
@@ -516,7 +533,8 @@ function renderGallery(data) {
 
   // Player
   if (videos.length === 0) {
-    player.innerHTML = '<div class="video-empty">No videos yet.</div>';
+    player.classList.remove("is-portrait");
+    player.innerHTML = '<div class="video-empty">No renders yet.</div>';
   } else {
     const active = videos.find((v) => v.path === state.activeVideo) || videos[0];
     const expected = `/media/${encodeURI(active.path)}`;
@@ -528,6 +546,30 @@ function renderGallery(data) {
       el.src = expected;
       el.dataset.src = expected;
       player.appendChild(el);
+    }
+    const currentVideo = player.querySelector("video");
+    applyPlayerAspectClass(player, currentVideo);
+  }
+
+  // Version dropdown — mtime-sorted, most recent first
+  if (vSelect) {
+    const vsigSel = videos.map((v) => v.path).join("\u0001") + "|" + (state.activeVideo || "");
+    if (vSelect.dataset.sig !== vsigSel) {
+      vSelect.dataset.sig = vsigSel;
+      vSelect.innerHTML = "";
+      if (videos.length === 0) {
+        const opt = document.createElement("option");
+        opt.textContent = "No renders yet";
+        vSelect.appendChild(opt);
+      } else {
+        for (const v of videos) {
+          const opt = document.createElement("option");
+          opt.value = v.path;
+          opt.textContent = v.name;
+          opt.selected = v.path === state.activeVideo;
+          vSelect.appendChild(opt);
+        }
+      }
     }
   }
 
@@ -626,13 +668,26 @@ function showWelcomeIfEmpty() {
 
 // ----- lightbox ------------------------------------------------------------
 
-function openLightbox(src) {
+const lightboxState = { srcs: [], idx: -1 };
+
+function openLightbox(src, allSrcs) {
+  lightboxState.srcs = allSrcs || [src];
+  lightboxState.idx = lightboxState.srcs.indexOf(src);
+  if (lightboxState.idx === -1) lightboxState.idx = 0;
   $("lightbox-img").src = src;
   $("lightbox").classList.remove("hidden");
 }
 function closeLightbox() {
   $("lightbox").classList.add("hidden");
   $("lightbox-img").src = "";
+  lightboxState.srcs = [];
+  lightboxState.idx = -1;
+}
+function lightboxNav(dir) {
+  const { srcs } = lightboxState;
+  if (srcs.length < 2) return;
+  lightboxState.idx = (lightboxState.idx + dir + srcs.length) % srcs.length;
+  $("lightbox-img").src = srcs[lightboxState.idx];
 }
 
 // ----- sidebar -------------------------------------------------------------
@@ -642,17 +697,26 @@ function closeLightbox() {
 // /api/projects endpoint reads the filesystem every time, and we poll it
 // on a short interval so a delete in Finder disappears almost immediately.
 const sidebarState = {
-  projects: [],  // [{name, path}] straight from /api/projects
+  projects: [],   // [{name, path}] from /api/projects
+  archived: [],   // [{name, archived_date}] from /api/projects/archived
+  archivedOpen: false,
 };
 
 async function refreshSidebar() {
   try {
     // /api/projects is global in single-user mode but user-scoped when
     // PER_USER_WORKSPACES is on, so forward ?user= too.
-    const r = await fetch(apiUrl("/api/projects"));
+    const [r, ra] = await Promise.all([
+      fetch(apiUrl("/api/projects")),
+      fetch(apiUrl("/api/projects/archived")),
+    ]);
     if (!r.ok) return;
     const data = await r.json();
     sidebarState.projects = data.projects || [];
+    if (ra.ok) {
+      const archivedData = await ra.json();
+      sidebarState.archived = archivedData.projects || [];
+    }
 
     // Stale-URL guard: if ?project=X points at something that no longer
     // exists on disk (deleted in Finder, wiped across a server restart,
@@ -689,70 +753,155 @@ async function refreshSidebar() {
   }
 }
 
-function renderSidebar() {
-  const list = $("sidebar-list");
-  const { projects } = sidebarState;
+function _makeSidebarRow(proj, currentProject, isArchived) {
+  const row = document.createElement("div");
+  row.className = "sidebar-project-row" + (!isArchived && proj.name === currentProject ? " active" : "");
+  if (isArchived) row.classList.add("archived");
 
-  if (projects.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No projects yet. Hit + to create one.</div>';
-    return;
-  }
+  // Name label — double-click to rename (active projects only)
+  const labelText = document.createElement("span");
+  labelText.className = "sidebar-project-name";
+  labelText.textContent = proj.name;
 
-  list.innerHTML = "";
-  const currentProject = new URL(window.location.href).searchParams.get("project") || "main";
+  if (!isArchived && proj.name !== "main") {
+    labelText.title = "Double-click to rename";
+    labelText.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      const input = document.createElement("input");
+      input.className = "sidebar-project-rename-input";
+      input.value = proj.name;
+      row.replaceChild(input, labelText);
+      input.focus();
+      input.select();
 
-  for (const proj of projects) {
-    const isActive = proj.name === currentProject;
-
-    // Flat project row — no nested sessions. One chat per project, loaded
-    // from <workspace>/chat.jsonl on click.
-    const row = document.createElement("div");
-    row.className = "sidebar-project-row" + (isActive ? " active" : "");
-
-    const labelText = document.createElement("span");
-    labelText.className = "sidebar-project-name";
-    labelText.textContent = proj.name;
-    row.appendChild(labelText);
-
-    // Delete button — refuses to delete the active project or `main`.
-    if (proj.name !== "main") {
-      const del = document.createElement("button");
-      del.className = "sidebar-project-del";
-      del.title = "Delete project";
-      del.textContent = "×";
-      del.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        if (proj.name === currentProject) {
-          appendError(
-            `can't delete the active project "${proj.name}". Switch to another project first.`
-          );
-          return;
-        }
-        if (!window.confirm(
-          `Delete project "${proj.name}"?\n\n` +
-          `This removes parallax/${proj.name}/ and every still, voiceover, ` +
-          `draft, output, log, and chat transcript inside it. ` +
-          `Raw media at the master dir is not touched.`
-        )) return;
+      const commit = async () => {
+        const newName = input.value.trim();
+        row.replaceChild(labelText, input);
+        if (!newName || newName === proj.name) return;
         try {
           const r = await fetch(
-            apiUrl(`/api/projects/${encodeURIComponent(proj.name)}`),
-            { method: "DELETE" },
+            apiUrl(`/api/projects/${encodeURIComponent(proj.name)}/rename`),
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new_name: newName }) },
           );
           if (!r.ok) {
             const err = await r.json().catch(() => ({}));
-            appendError(`failed to delete project: ${err.error || r.statusText}`);
+            appendError(`rename failed: ${err.detail || r.statusText}`);
             return;
+          }
+          const data = await r.json();
+          // If renaming the active project, update the URL
+          if (proj.name === currentProject) {
+            const url = new URL(window.location.href);
+            url.searchParams.set("project", data.name);
+            window.history.replaceState({}, "", url);
           }
           refreshSidebar();
         } catch (err) {
-          appendError(`failed to delete project: ${err}`);
+          appendError(`rename failed: ${err}`);
         }
-      });
-      row.appendChild(del);
-    }
+      };
 
-    // Click the row → switch project, update URL, reload chat.
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        if (e.key === "Escape") { row.replaceChild(labelText, input); }
+      });
+      input.addEventListener("blur", commit);
+    });
+  }
+
+  row.appendChild(labelText);
+
+  if (!isArchived && proj.name !== "main") {
+    // Archive button
+    const arch = document.createElement("button");
+    arch.className = "sidebar-project-action";
+    arch.title = "Archive project";
+    arch.textContent = "⊡";
+    arch.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (proj.name === currentProject) {
+        appendError(`switch away from "${proj.name}" before archiving it`);
+        return;
+      }
+      try {
+        const r = await fetch(
+          apiUrl(`/api/projects/${encodeURIComponent(proj.name)}/archive`),
+          { method: "POST" },
+        );
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          appendError(`archive failed: ${err.detail || r.statusText}`);
+          return;
+        }
+        refreshSidebar();
+      } catch (err) {
+        appendError(`archive failed: ${err}`);
+      }
+    });
+    row.appendChild(arch);
+
+    // Delete button
+    const del = document.createElement("button");
+    del.className = "sidebar-project-del";
+    del.title = "Delete project";
+    del.textContent = "×";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (proj.name === currentProject) {
+        appendError(`can't delete the active project "${proj.name}". Switch to another project first.`);
+        return;
+      }
+      if (!window.confirm(
+        `Delete project "${proj.name}"?\n\n` +
+        `This removes parallax/${proj.name}/ and every still, voiceover, ` +
+        `draft, output, log, and chat transcript inside it. ` +
+        `Raw media at the master dir is not touched.`
+      )) return;
+      try {
+        const r = await fetch(
+          apiUrl(`/api/projects/${encodeURIComponent(proj.name)}`),
+          { method: "DELETE" },
+        );
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          appendError(`failed to delete project: ${err.detail || r.statusText}`);
+          return;
+        }
+        refreshSidebar();
+      } catch (err) {
+        appendError(`failed to delete project: ${err}`);
+      }
+    });
+    row.appendChild(del);
+  }
+
+  if (isArchived) {
+    // Unarchive button
+    const unarch = document.createElement("button");
+    unarch.className = "sidebar-project-action";
+    unarch.title = "Restore project";
+    unarch.textContent = "↩";
+    unarch.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        const r = await fetch(
+          apiUrl(`/api/projects/${encodeURIComponent(proj.name)}/unarchive`),
+          { method: "POST" },
+        );
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          appendError(`restore failed: ${err.detail || r.statusText}`);
+          return;
+        }
+        refreshSidebar();
+      } catch (err) {
+        appendError(`restore failed: ${err}`);
+      }
+    });
+    row.appendChild(unarch);
+  }
+
+  if (!isArchived) {
     row.addEventListener("click", async () => {
       if (proj.name === currentProject) return;
       const url = new URL(window.location.href);
@@ -763,8 +912,6 @@ function renderSidebar() {
       }
       window.history.pushState({}, "", url);
       refreshProjectBadge();
-      // Drop the in-memory session ID so the next message opens a fresh
-      // server-side session that hydrates from the new project's chat.jsonl.
       state.sessionId = null;
       state.thinking = false;
       state.dispatchActive = false;
@@ -778,8 +925,43 @@ function renderSidebar() {
       refreshSidebar();
       refreshGallery();
     });
+  }
 
-    list.appendChild(row);
+  return row;
+}
+
+function renderSidebar() {
+  const list = $("sidebar-list");
+  const { projects, archived } = sidebarState;
+
+  if (projects.length === 0 && archived.length === 0) {
+    list.innerHTML = '<div class="sidebar-empty">No projects yet. Hit + to create one.</div>';
+    return;
+  }
+
+  list.innerHTML = "";
+  const currentProject = new URL(window.location.href).searchParams.get("project") || "main";
+
+  for (const proj of projects) {
+    list.appendChild(_makeSidebarRow(proj, currentProject, false));
+  }
+
+  // Archived section — collapsed by default
+  if (archived.length > 0) {
+    const label = document.createElement("div");
+    label.className = "sidebar-group-label" + (sidebarState.archivedOpen ? " active" : "");
+    label.textContent = `Archived (${archived.length})`;
+    label.addEventListener("click", () => {
+      sidebarState.archivedOpen = !sidebarState.archivedOpen;
+      renderSidebar();
+    });
+    list.appendChild(label);
+
+    if (sidebarState.archivedOpen) {
+      for (const proj of archived) {
+        list.appendChild(_makeSidebarRow(proj, currentProject, true));
+      }
+    }
   }
 }
 
@@ -801,6 +983,8 @@ async function loadProjectChat() {
     console.error("loadProjectChat failed", e);
   }
 
+  _callRefreshTimeline();
+
   const turns = data.turns || [];
   if (turns.length === 0) {
     // Fresh / empty project — show the welcome card.
@@ -813,6 +997,10 @@ async function loadProjectChat() {
     } else if (t.role === "assistant") {
       appendAssistantDelta(t.text || "");
       finalizeAssistantMsg();
+    } else if (t.role === "tool_call") {
+      appendToolUse({ id: t.tool_id || t.id || "", name: t.name || "", input: t.input || {} });
+    } else if (t.role === "tool_result") {
+      appendToolResult({ id: t.tool_id || t.id || "", summary: t.summary || "" });
     }
   }
 }
@@ -898,15 +1086,7 @@ function refreshProjectBadge() {
     );
   }
 
-  // Forward ?user= / ?project= to the header links so opening /manifest
-  // or /costs from the chat lands in the same workspace the user is in.
-  for (const id of ["manifest-link", "costs-link"]) {
-    const el = document.getElementById(id);
-    if (el) {
-      const base = el.getAttribute("href").split("?")[0];
-      el.href = apiUrl(base);
-    }
-  }
+  // manifest and costs are now inline tabs — no href forwarding needed
 }
 
 // ----- file uploads --------------------------------------------------------
@@ -926,7 +1106,7 @@ async function uploadFile(file) {
     // deselect it from the gallery — this just removes the dead click step.
     if (data.path) {
       state.refImages.add(data.path);
-      renderRefBar();
+      updateRefBar();
     }
     appendDispatchEvent({
       phase: "done",
@@ -991,6 +1171,228 @@ function initDropZone() {
   }
 }
 
+// ----- tab routing ---------------------------------------------------------
+
+// Tabs switch the right-column bottom panel without a page reload.
+// Routes pushed to history so the URL stays bookmarkable.
+const TAB_ROUTE = { media: "/", timeline: "/timeline", costs: "/costs", manifest: "/manifest" };
+const ROUTE_TAB = { "/": "media", "/timeline": "timeline", "/media": "media", "/costs": "costs", "/manifest": "manifest" };
+
+function activateTab(tabName, pushHistory = true) {
+  const tabName_ = tabName || "media";
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tabName_);
+  });
+  document.querySelectorAll(".tab-panel").forEach((p) => {
+    p.classList.toggle("active", p.id === `panel-${tabName_}`);
+  });
+  if (pushHistory) {
+    const url = new URL(window.location.href);
+    const path = TAB_ROUTE[tabName_] || "/";
+    window.history.pushState({}, "", path + (url.search || ""));
+  }
+  // Lazy-load panel content when first activated
+  if (tabName_ === "costs") loadCostsPanel();
+  if (tabName_ === "manifest") loadManifestPanel();
+  if (tabName_ === "timeline") _callRefreshTimeline();
+}
+
+function initTabs() {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => activateTab(btn.dataset.tab));
+  });
+
+  // Restore active tab from URL path on load
+  const path = window.location.pathname;
+  const tab = ROUTE_TAB[path] || "media";
+  activateTab(tab, false);
+
+  // Handle browser back/forward
+  window.addEventListener("popstate", () => {
+    const t = ROUTE_TAB[window.location.pathname] || "media";
+    activateTab(t, false);
+  });
+}
+
+// ----- version select wiring -----------------------------------------------
+
+function initVersionSelect() {
+  const sel = $("version-select");
+  if (!sel) return;
+  sel.addEventListener("change", () => {
+    const path = sel.value;
+    if (!path) return;
+    state.activeVideo = path;
+    // Swap player src without re-rendering entire gallery
+    const player = $("player-wrap");
+    const expected = `/media/${encodeURI(path)}`;
+    const existing = player.querySelector("video");
+    if (existing) {
+      existing.src = expected;
+      existing.dataset.src = expected;
+      existing.load();
+    } else {
+      const el = document.createElement("video");
+      el.controls = true;
+      el.src = expected;
+      el.dataset.src = expected;
+      player.innerHTML = "";
+      player.appendChild(el);
+    }
+    // Keep video-gallery list in sync (active highlight)
+    document.querySelectorAll(".video-item").forEach((item) => {
+      item.classList.toggle("active", item.dataset.path === path);
+    });
+  });
+}
+
+// ----- inline panel loaders ------------------------------------------------
+
+async function loadCostsPanel() {
+  const el = $("costs-inner");
+  if (!el || el.dataset.loaded === "1") return;
+  el.dataset.loaded = "1";
+
+  const fmtUSD = (n) =>
+    "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+  const fmtInt = (n) => (Number(n) || 0).toLocaleString();
+
+  let report;
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    const user = qs.get("user") || "";
+    const r = await fetch(user ? `/api/costs?user=${encodeURIComponent(user)}` : "/api/costs");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    report = await r.json();
+  } catch (e) {
+    el.innerHTML = `<div class="errors">Failed to load cost report: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+
+  function llmTable(llm) {
+    const rows = (llm.models || []).map((m) =>
+      `<tr><td>${escapeHtml(m.model || "unknown")}</td><td class="num">${fmtInt(m.input_tokens)}</td><td class="num">${fmtInt(m.output_tokens)}</td><td class="num">${fmtInt(m.session_count)}</td><td class="cost">${fmtUSD(m.cost_usd)}</td></tr>`
+    ).join("") || `<tr><td class="empty" colspan="5">no LLM activity recorded</td></tr>`;
+    return `<table class="cost-table"><thead><tr><th>Model</th><th>Input tok</th><th>Output tok</th><th>Sessions</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function projectedTable(bucket, label) {
+    const entries = (bucket && bucket.entries) || [];
+    const total = (bucket && bucket.total_cost_usd) || 0;
+    if (!entries.length) return `<div class="sub-label">${label} · ${fmtUSD(total)}</div><table class="cost-table"><tbody><tr><td class="empty" colspan="5">no ${label} runs</td></tr></tbody></table>`;
+    const rows = entries.map((e) =>
+      `<tr><td>${escapeHtml(e.provider || "?")}</td><td>${escapeHtml(e.model || "?")}</td><td class="num">${fmtInt(e.call_count)}</td><td class="num">${fmtInt(e.quantity)} ${escapeHtml(e.unit || "")}</td><td class="cost">${fmtUSD(e.usd)}</td></tr>`
+    ).join("");
+    return `<div class="sub-label">${label} · ${fmtUSD(total)}</div><table class="cost-table"><thead><tr><th>Provider</th><th>Model</th><th>Calls</th><th>Units</th><th>Projected</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  const userLabel = report.user_filter ? ` (user: ${report.user_filter})` : " (all users)";
+  el.innerHTML = `
+    <div class="grand-total"><span class="label">Grand total</span><span class="amount">${fmtUSD(report.grand_total_usd)}</span></div>
+    <div class="cost-section"><h2>LLM${userLabel}<span class="section-total">${fmtUSD(report.llm.total_cost_usd)}</span></h2>${llmTable(report.llm)}</div>
+    <div class="cost-section"><h2>Image generation<span class="section-total">${fmtUSD(report.image.total_cost_usd)}</span></h2>
+      <table class="cost-table"><thead><tr><th>Model</th><th>Images</th><th>Test-mode</th><th>$/image</th><th>Cost</th></tr></thead>
+      <tbody><tr><td>${escapeHtml(report.image.model || "unknown")}</td><td class="num">${fmtInt(report.image.image_count)}</td><td class="num">${fmtInt(report.image.skipped_test_mode)}</td><td class="num">${fmtUSD(report.image.usd_per_image)}</td><td class="cost">${fmtUSD(report.image.total_cost_usd)}</td></tr></tbody>
+      </table></div>
+    <div class="cost-section"><h2>Video / voiceover<span class="section-total">${fmtUSD(report.video.total_cost_usd)}</span></h2>
+      <div class="sub-label">voiceover</div>
+      <table class="cost-table"><thead><tr><th>Metric</th><th>Runs</th><th>Words</th><th>~Chars</th><th>Cost</th></tr></thead>
+      <tbody><tr><td>voiceover</td><td class="num">${fmtInt(report.video.voiceover?.count)}</td><td class="num">${fmtInt(report.video.voiceover?.word_total)}</td><td class="num">${fmtInt(report.video.voiceover?.char_estimate)}</td><td class="cost">${fmtUSD(report.video.voiceover?.total_cost_usd)}</td></tr></tbody>
+      </table>
+      <div class="sub-label">compose</div>
+      <table class="cost-table"><thead><tr><th>Step</th><th>Runs</th><th>Test-mode</th><th>$/run</th><th>Cost</th></tr></thead>
+      <tbody><tr><td>compose</td><td class="num">${fmtInt(report.video.compose?.count)}</td><td class="num">${fmtInt(report.video.compose?.skipped_test_mode)}</td><td class="num">${fmtUSD(report.video.compose?.usd_per_run)}</td><td class="cost">${fmtUSD(report.video.compose?.total_cost_usd)}</td></tr></tbody>
+      </table></div>
+    <div class="cost-section"><h2>Projected spend<span class="section-total">${fmtUSD((report.projected?.real?.total_cost_usd || 0) + (report.projected?.test_mode?.total_cost_usd || 0))}</span></h2>
+      ${projectedTable(report.projected?.real, "real runs")}${projectedTable(report.projected?.test_mode, "test mode")}
+    </div>
+    ${report.errors?.length ? `<div class="errors">errors: ${escapeHtml(report.errors.join("; "))}</div>` : ""}`;
+}
+
+async function loadManifestPanel() {
+  const el = $("manifest-inner");
+  if (!el || el.dataset.loaded === "1") return;
+  el.dataset.loaded = "1";
+  await _renderManifestPanel(el);
+}
+
+async function _renderManifestPanel(el) {
+  function esc(s) { return escapeHtml(s == null ? "" : String(s)); }
+  function fmtDur(d) {
+    if (d == null) return "—";
+    const n = Number(d);
+    return isNaN(n) ? String(d) : `${n.toFixed(2)}s`;
+  }
+
+  let data;
+  try {
+    const r = await fetch(apiUrl("/api/manifest"));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  } catch (e) {
+    el.innerHTML = `<div class="panel-loading">Failed to load: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  if (!data.exists) {
+    el.innerHTML = `<div class="panel-loading">No manifest yet — brief the Head of Production to create one.</div>`;
+    return;
+  }
+
+  const totalDur = (data.scenes || []).reduce((s, sc) => s + (Number(sc.duration) || 0), 0);
+  const voice = data.voice || {};
+  const voiceLabel = voice.voice_name || voice.voice_id || "—";
+  const qs = (() => {
+    const p = new URLSearchParams(window.location.search);
+    const o = new URLSearchParams();
+    for (const k of ["user", "project"]) { const v = p.get(k); if (v) o.set(k, v); }
+    return o.toString();
+  })();
+
+  const meta = `<div class="meta-strip">
+    <div class="meta-cell"><div class="meta-label">Project</div><div class="meta-value">${esc(data.project || "main")}</div></div>
+    <div class="meta-cell"><div class="meta-label">Concept</div><div class="meta-value">${esc(data.concept_id || "—")}</div></div>
+    <div class="meta-cell"><div class="meta-label">Scenes</div><div class="meta-value">${(data.scenes || []).length} · ${fmtDur(totalDur)}</div></div>
+    <div class="meta-cell"><div class="meta-label">Voice</div><div class="meta-value dim">${esc(voiceLabel)}</div></div>
+  </div>`;
+
+  const brief = data.brief ? `<div class="brief-block"><div class="section-label">Brief</div><div class="brief-text">${esc(data.brief)}</div></div>` : "";
+
+  let vo = "";
+  const voData = data.voiceover;
+  if (voData && (voData.script || voData.audio_url)) {
+    const dur = voData.duration_s != null ? fmtDur(voData.duration_s) : "—";
+    vo = `<div class="vo-block"><div class="section-label"><span>Voiceover</span><span>${esc(dur)}</span></div><div class="vo-box">
+      ${voData.script ? `<div class="vo-script">${esc(voData.script)}</div>` : ""}
+      ${voData.audio_url ? `<audio controls preload="none" src="${esc(voData.audio_url)}${qs ? "?" + qs : ""}"></audio>` : ""}
+    </div></div>`;
+  }
+
+  const scenes = data.scenes || [];
+  const sceneHtml = scenes.map((s) => {
+    const stillUrl = s.still_url ? (s.still_url + (qs ? "?" + qs : "")) : null;
+    const thumb = stillUrl ? `<img src="${esc(stillUrl)}" alt="scene ${esc(s.number)}" loading="lazy" />` : "no still";
+    const motion = s.motion ? ` · ${esc(s.motion)}` : "";
+    const voText = (s.vo_text || "").trim();
+    const voClass = voText ? "scene-vo" : "scene-vo empty";
+    return `<div class="scene">
+      <div class="scene-thumb">${thumb}</div>
+      <div class="scene-body">
+        <div class="scene-number">SCENE ${esc(s.number ?? "?")}</div>
+        <div class="scene-title">${esc(s.title || "Untitled")}</div>
+        <div class="scene-meta">${fmtDur(s.duration)}${motion}</div>
+        <div class="${voClass}">${esc(voText || "no voiceover text yet")}</div>
+      </div>
+    </div>`;
+  }).join("");
+
+  el.innerHTML = meta + brief + vo + `
+    <div class="scenes-head">
+      <div class="section-label">Scenes</div>
+      <div class="scene-count">${scenes.length} scene${scenes.length === 1 ? "" : "s"}</div>
+    </div>` + sceneHtml;
+}
+
 // ----- wiring --------------------------------------------------------------
 
 function initComposer() {
@@ -1014,6 +1416,48 @@ function initComposer() {
   });
 
   $("cancel-btn").addEventListener("click", () => cancel());
+
+  // Expanded composer modal
+  const modal = $("composer-modal");
+  const modalInput = $("composer-modal-input");
+
+  function openComposerModal() {
+    modalInput.value = input.value;
+    modal.classList.remove("hidden");
+    modalInput.focus();
+    // Sync cancel state
+    $("composer-modal-cancel").disabled = $("cancel-btn").disabled;
+  }
+
+  function closeComposerModal() {
+    modal.classList.add("hidden");
+    input.value = modalInput.value;
+    input.focus();
+  }
+
+  function sendFromModal() {
+    const text = modalInput.value.trim();
+    if (!text) return;
+    input.value = modalInput.value;
+    modal.classList.add("hidden");
+    modalInput.value = "";
+    form.requestSubmit();
+  }
+
+  $("expand-composer-btn").addEventListener("click", openComposerModal);
+  $("composer-modal-close").addEventListener("click", closeComposerModal);
+  $("composer-modal-send").addEventListener("click", sendFromModal);
+  $("composer-modal-cancel").addEventListener("click", () => { closeComposerModal(); cancel(); });
+
+  modalInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); closeComposerModal(); }
+    if (e.key === "Enter" && e.metaKey) { e.preventDefault(); sendFromModal(); }
+  });
+
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeComposerModal();
+  });
+
   $("new-session-btn").addEventListener("click", () => startNewSession());
   $("ref-bar-clear").addEventListener("click", () => {
     state.refImages.clear();
@@ -1023,7 +1467,10 @@ function initComposer() {
 
   $("lightbox").addEventListener("click", closeLightbox);
   document.addEventListener("keydown", (e) => {
+    if ($("lightbox").classList.contains("hidden")) return;
     if (e.key === "Escape") closeLightbox();
+    if (e.key === "ArrowRight") { e.preventDefault(); lightboxNav(1); }
+    if (e.key === "ArrowLeft")  { e.preventDefault(); lightboxNav(-1); }
   });
 }
 
@@ -1150,13 +1597,19 @@ async function snapStaleProjectToMain() {
   }
 }
 
+// Safe shim — timeline.js defines refreshTimeline after app.js loads.
+// app.js internal callers use _callRefreshTimeline() so they don't
+// shadow the real implementation once timeline.js has defined it.
+function _callRefreshTimeline() {
+  if (typeof refreshTimeline === "function") refreshTimeline();
+}
+
 async function init() {
   initComposer();
   initDropZone();
-  // Wire the Finder button early but the click handler is gated on the
-  // stale-URL snap-back below — any click before the page finishes
-  // initializing is harmless because openProjectInFinder always reads
-  // window.location fresh via apiUrl().
+  initTabs();
+  initVersionSelect();
+
   const finderBtn = document.getElementById("finder-btn");
   if (finderBtn) finderBtn.addEventListener("click", openProjectInFinder);
 
@@ -1175,8 +1628,6 @@ async function init() {
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
-  // Short poll so Finder deletions + creates are reflected almost
-  // immediately. 2s is cheap — /api/projects is a bare iterdir.
   setInterval(refreshSidebar, 2000);
   setInterval(refreshUsage, 30000);
 }

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -51,11 +52,7 @@ if str(_HERE) not in sys.path:
 import telemetry  # noqa: E402
 import costs  # noqa: E402
 import registry  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# TEST_MODE — set TEST_MODE=1 to run without paid API calls
-# ---------------------------------------------------------------------------
-TEST_MODE: bool = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes", "on")
+import server_log  # noqa: E402
 
 
 def _fal_whoami() -> dict:
@@ -145,7 +142,7 @@ ALLOWED_IMAGE_MIMES = {
 
 PROJECT_DIR = Path(os.environ.get("PARALLAX_PROJECT_DIR", os.getcwd())).resolve()
 STATIC_DIR = _HERE / "static"
-HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
+HOP_PROMPT_PATH = _HERE / "head_of_production_prompt.md"
 
 _network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
 PER_USER_WORKSPACES = (
@@ -233,14 +230,16 @@ def _find_parallax_bin() -> Optional[str]:
     return None
 
 
-def _load_hop_prompt() -> str:
+def _load_head_of_production_prompt() -> str:
     try:
-        return HOP_PROMPT_PATH.read_text(encoding="utf-8")
+        base = HOP_PROMPT_PATH.read_text(encoding="utf-8")
     except Exception as e:
         print(
-            f"server: failed to load hop_prompt.md: {e}", file=sys.stderr, flush=True
+            f"server: failed to load head_of_production_prompt.md: {e}", file=sys.stderr, flush=True
         )
-        return "You are the Head of Production for Parallax."
+        base = "You are the Head of Production for Parallax."
+    launch_ctx = _build_launch_context()
+    return base + launch_ctx if launch_ctx else base
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +263,21 @@ def _resolve_project_path(
     if not isinstance(user_path, str) or not user_path:
         raise PathError("path must be a non-empty string")
     workspace = workspace or PROJECT_DIR
+    # `project_root` sentinel — resolves relative to PROJECT_DIR, not the workspace.
+    if user_path == "project_root" or user_path.startswith("project_root/"):
+        remainder = user_path[len("project_root"):].lstrip("/")
+        candidate = PROJECT_DIR / remainder if remainder else PROJECT_DIR
+        try:
+            resolved = candidate.resolve()
+        except Exception as e:
+            raise PathError(f"could not resolve path: {e}") from e
+        try:
+            resolved.relative_to(PROJECT_DIR.resolve())
+        except ValueError as e:
+            raise PathError(
+                f"path {user_path!r} escapes project {PROJECT_DIR}"
+            ) from e
+        return resolved
     p = Path(user_path)
     escaped = False
     if not p.is_absolute():
@@ -294,6 +308,37 @@ def _resolve_project_path(
             f"path {user_path!r} escapes project {PROJECT_DIR}"
         ) from e
     return resolved
+
+
+def _expand_project_root_token(value: str) -> str:
+    """Rewrite the leading `project_root/...` sentinel in a CLI arg to an absolute path.
+
+    Manifest scene values look like `project_root/image.png:5:zoom_in` — only the
+    path segment (up to the first `:`) should be rewritten; trailing duration/motion
+    fields must be preserved verbatim.
+    """
+    if not value.startswith("project_root"):
+        return value
+    head, sep, tail = value.partition(":")
+    if head == "project_root":
+        head = str(PROJECT_DIR)
+    elif head.startswith("project_root/"):
+        head = str(PROJECT_DIR / head[len("project_root/"):])
+    return head + sep + tail
+
+
+def _display_path(resolved: Path, base: Path) -> str:
+    """Path string for tool output: relative to `base` when inside it, else absolute.
+
+    Use this anywhere a resolved path is surfaced back to the agent/UI — the
+    `project_root/` sentinel lets paths live outside the workspace, so a naive
+    `relative_to(base)` raises. Centralizing the fallback prevents the bug from
+    recurring as new tools are added.
+    """
+    try:
+        return str(resolved.relative_to(base))
+    except ValueError:
+        return str(resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +503,13 @@ TOOL_SCHEMAS = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path, relative to project root. Use '.' for the root.",
+                    "description": (
+                        "Directory path. Use '.' for the workspace root, 'input' / 'stills' / etc. "
+                        "for workspace subdirs, or 'project_root' (or 'project_root/sub/dir') for "
+                        "anything at the launch directory. The launch directory is first-class — "
+                        "files there are already enumerated in the 'Launch directory contents' block "
+                        "of the system prompt, so you rarely need to list it just to discover files."
+                    ),
                 }
             },
             "required": ["path"],
@@ -544,7 +595,7 @@ TOOL_SCHEMAS = [
                 },
                 "count": {
                     "type": "integer",
-                    "description": "Number of variations to generate (default: 3).",
+                    "description": "Number of variations to generate. Default is 1. Only increase if the user explicitly asks for multiple.",
                 },
                 "aspect_ratio": {
                     "type": "string",
@@ -716,6 +767,133 @@ TOOL_SCHEMAS = [
             "properties": {},
         },
     },
+    {
+        "name": "parallax_ingest",
+        "description": (
+            "Index footage files so they can be searched and used in the pipeline. "
+            "Pass a file path or directory path (relative to project root). "
+            "Use 'project_root' to ingest everything in the master project directory. "
+            "ALWAYS offer to run this when you see unindexed video files — don't ask the user to run it from the terminal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to ingest, relative to project root. Use 'project_root' for the launch directory.",
+                },
+                "no_vision": {
+                    "type": "boolean",
+                    "description": "Skip Gemini visual analysis — transcription only. Faster and cheaper.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "search_footage",
+        "description": (
+            "Search indexed footage by transcript content, scene descriptions, or keywords. "
+            "Returns matching clips with timestamps and excerpts. "
+            "Always run this before asking the user to locate footage manually."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search term or phrase to find in transcripts, descriptions, or keywords",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_footage",
+        "description": "List all indexed footage clips with duration and scene count.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "analyze_footage_segment",
+        "description": (
+            "Get a detailed analysis of a specific time segment of a footage clip. "
+            "Use this for high-resolution reads on any part of any clip — e.g. "
+            "'what exactly is written on the whiteboard at 6:30'. "
+            "Merges result into the clip's metadata file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the video file (relative to project dir)",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "Start time in HH:MM:SS format",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "End time in HH:MM:SS format",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Specific question to answer about this segment (optional)",
+                },
+            },
+            "required": ["path", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "relink_footage",
+        "description": (
+            "Update the index when a footage file has been moved or renamed. "
+            "Use when auto-relink failed and the user tells you where the file now lives."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_path": {
+                    "type": "string",
+                    "description": "Original path as stored in the index",
+                },
+                "new_path": {
+                    "type": "string",
+                    "description": "New path relative to project dir",
+                },
+            },
+            "required": ["old_path", "new_path"],
+        },
+    },
+    {
+        "name": "move_to_shared",
+        "description": (
+            "Move files from the current project into the shared/ directory, "
+            "making them accessible to all projects under this root."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths within the current project to move to shared/",
+                }
+            },
+            "required": ["paths"],
+        },
+    },
+    {
+        "name": "list_shared",
+        "description": "List files in the shared/ directory accessible to all projects.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -726,10 +904,13 @@ TOOL_SCHEMAS = [
 
 def tool_list_dir(path: str, workspace: Optional[Path] = None) -> dict:
     base = workspace or PROJECT_DIR
-    try:
-        resolved = _resolve_project_path(path, workspace=base)
-    except PathError as e:
-        return {"error": str(e)}
+    if path == "project_root":
+        resolved = PROJECT_DIR
+    else:
+        try:
+            resolved = _resolve_project_path(path, workspace=base)
+        except PathError as e:
+            return {"error": str(e)}
     if not resolved.exists():
         return {"error": f"path does not exist: {path}"}
     if not resolved.is_dir():
@@ -752,7 +933,7 @@ def tool_list_dir(path: str, workspace: Optional[Path] = None) -> dict:
     except Exception as e:
         return {"error": f"could not list directory: {e}"}
     return {
-        "path": str(resolved.relative_to(base)) or ".",
+        "path": _display_path(resolved, base) or ".",
         "entries": entries,
     }
 
@@ -785,7 +966,7 @@ def tool_read_file(path: str, workspace: Optional[Path] = None) -> dict:
     except Exception as e:
         return {"error": f"read failed: {e}"}
     return {
-        "path": str(resolved.relative_to(base)),
+        "path": _display_path(resolved, base),
         "size": size,
         "content": text,
     }
@@ -839,7 +1020,7 @@ def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
         }
     b64 = base64.standard_b64encode(raw).decode("ascii")
     return {
-        "path": str(resolved.relative_to(base)),
+        "path": _display_path(resolved, base),
         "mime": mime,
         "image_block": {
             "type": "image",
@@ -861,8 +1042,9 @@ def _clean_subprocess_env() -> dict:
     cleaned = [p for p in path_parts if "/venv/" not in p and "/.venv/" not in p and "/virtualenvs/" not in p]
     if cleaned:
         env["PATH"] = ":".join(cleaned)
-    if TEST_MODE:
-        env["TEST_MODE"] = "true"
+    # Suppress the CLI's update-available banner when spawned from the web
+    # agent — otherwise it prepends noise to every tool_result stderr capture.
+    env["PARALLAX_QUIET"] = "1"
     return env
 
 
@@ -872,8 +1054,6 @@ def _stream_parallax_subprocess(
     stdin_payload: Optional[str],
     label: str,
 ) -> str:
-    if cmd and not cmd[0].endswith("python3") and not cmd[0].endswith("python"):
-        cmd = [sys.executable] + cmd
     telemetry.record_event(session.id, "dispatch_start", {"cmd": " ".join(cmd[:3]), "label": label[:200]})
     session.broadcast("dispatch_event", {"phase": "starting", "text": label})
 
@@ -981,7 +1161,7 @@ def _stream_parallax_subprocess(
 def tool_parallax_create(
     session: Session,
     brief: str,
-    count: int = 3,
+    count: int = 1,
     aspect_ratio: str = "3:4",
     ref: Optional[list] = None,
 ) -> str:
@@ -1054,6 +1234,30 @@ def tool_parallax_align(session: Session) -> str:
     return _stream_parallax_subprocess(session, cmd, None, "align: syncing scenes to vo")
 
 
+def tool_parallax_ingest(
+    session: Session,
+    path: str,
+    no_vision: bool = False,
+) -> str:
+    bin_path = _find_parallax_bin()
+    if bin_path is None:
+        return "parallax CLI binary not found on PATH"
+    # Resolve "project_root" sentinel to PROJECT_DIR
+    if path == "project_root":
+        ingest_path = str(PROJECT_DIR)
+    else:
+        try:
+            resolved = _resolve_project_path(path, workspace=session.workspace, read_fallback=True)
+            ingest_path = str(resolved)
+        except PathError as e:
+            return f"invalid path: {e}"
+    cmd = [bin_path, "ingest", ingest_path, "--yes"]
+    if no_vision:
+        cmd.append("--no-vision")
+    label = f"ingest: indexing {path}"
+    return _stream_parallax_subprocess(session, cmd, None, label)
+
+
 def tool_parallax_transcribe(
     session: Session,
     audio: Optional[str] = None,
@@ -1097,11 +1301,12 @@ def tool_edit_manifest(
     if end_s is not None:
         cmd += ["--end-s", str(end_s)]
     if values:
-        cmd += [str(v) for v in values]
+        cmd += [_expand_project_root_token(str(v)) for v in values]
 
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=15,
+            stdin=subprocess.DEVNULL,
             cwd=str(workspace), env=_clean_subprocess_env(),
         )
     except Exception as e:
@@ -1110,6 +1315,677 @@ def tool_edit_manifest(
     if result.returncode != 0:
         return {"error": (result.stderr or result.stdout).strip()}
     return {"output": result.stdout.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Footage indexing tool implementations
+# ---------------------------------------------------------------------------
+
+
+def _load_footage_index() -> list[dict]:
+    """Read footage.jsonl at PROJECT_DIR root. Returns list of entry dicts."""
+    footage_jsonl = PROJECT_DIR / "footage.jsonl"
+    entries = []
+    if not footage_jsonl.exists():
+        return entries
+    try:
+        with open(footage_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"footage.jsonl: bad line skipped: {e}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"footage.jsonl: read failed: {e}", file=sys.stderr, flush=True)
+    return entries
+
+
+_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".mxf", ".webm"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif", ".bmp", ".tiff"}
+_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
+
+# --- Invariant ---
+# Every user-facing content file at PROJECT_DIR root (videos, images, audio)
+# MUST be surfaced in the system prompt via _build_launch_context(). The agent
+# should never have to call list_dir to discover that a user-provided file
+# exists. When you add support for a new content class, extend the extension
+# set AND extend _build_launch_context() to list it. See the CLAUDE.md note
+# on "user content discovery" for the reasoning.
+_CONTENT_EXTENSIONS = _VIDEO_EXTENSIONS | _IMAGE_EXTENSIONS | _AUDIO_EXTENSIONS
+
+
+def _discover_project_content(max_depth: int = 3) -> dict[str, list[Path]]:
+    """
+    Walk PROJECT_DIR for user content up to max_depth levels deep, grouped by
+    class. Skips the parallax/ workspace subtree and hidden directories.
+    Returns {"videos": [...], "images": [...], "audio": [...]}.
+    """
+    workspace_root = (PROJECT_DIR / WORKSPACE_ROOT_NAME).resolve()
+    buckets: dict[str, list[Path]] = {"videos": [], "images": [], "audio": []}
+
+    def _walk(dirpath: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(dirpath.iterdir())
+        except PermissionError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                if entry.resolve() == workspace_root:
+                    continue
+                _walk(entry, depth + 1)
+                continue
+            if not entry.is_file():
+                continue
+            ext = entry.suffix.lower()
+            if ext in _VIDEO_EXTENSIONS:
+                buckets["videos"].append(entry)
+            elif ext in _IMAGE_EXTENSIONS:
+                buckets["images"].append(entry)
+            elif ext in _AUDIO_EXTENSIONS:
+                buckets["audio"].append(entry)
+
+    _walk(PROJECT_DIR, 0)
+    return buckets
+
+
+# Back-compat shim — some callers may still reference the video-only discovery.
+def _discover_project_media(max_depth: int = 3) -> list[Path]:
+    return _discover_project_content(max_depth=max_depth)["videos"]
+
+
+def _build_launch_context() -> str:
+    """
+    Return a markdown block describing all user-provided content at PROJECT_DIR
+    root — videos, images, and audio — so the agent knows what the user has
+    dropped in without having to call list_dir. Returns empty string when
+    nothing is found.
+
+    Invariant: this function is the single source of truth for "what content
+    exists at project_root." If a file class is missing here, the agent will
+    fail to find files of that class. Do not bypass.
+    """
+    try:
+        buckets = _discover_project_content()
+        videos = buckets["videos"]
+        images = buckets["images"]
+        audio = buckets["audio"]
+        if not (videos or images or audio):
+            return ""
+
+        lines: list[str] = ["", "## Launch directory contents"]
+        lines.append(
+            f"PROJECT_DIR (`{PROJECT_DIR}`) contains user-provided files at the "
+            f"project root. Address any of these by prefixing with "
+            f"`project_root/` (e.g. `project_root/image.png`). Do not ask the "
+            f"user to copy files into `input/` — use them where they are."
+        )
+
+        if videos:
+            indexed_paths: set[str] = set()
+            for entry in _load_footage_index():
+                raw = entry.get("path", "")
+                if raw:
+                    p = Path(raw) if Path(raw).is_absolute() else PROJECT_DIR / raw
+                    indexed_paths.add(str(p.resolve()))
+            unindexed = [p for p in videos if str(p.resolve()) not in indexed_paths]
+            indexed_count = len(videos) - len(unindexed)
+            lines.append("")
+            lines.append(
+                f"### Videos ({len(videos)}) — {indexed_count} indexed, "
+                f"{len(unindexed)} not yet indexed"
+            )
+            for p in videos[:20]:
+                marker = "" if str(p.resolve()) in indexed_paths else "  [unindexed]"
+                lines.append(f"  - {p.relative_to(PROJECT_DIR)}{marker}")
+            if len(videos) > 20:
+                lines.append(f"  - …and {len(videos) - 20} more")
+            if unindexed:
+                lines.append(
+                    "**Proactively offer** to run "
+                    "`parallax_ingest(path='project_root')` for unindexed videos."
+                )
+
+        if images:
+            lines.append("")
+            lines.append(f"### Images ({len(images)})")
+            for p in images[:20]:
+                lines.append(f"  - {p.relative_to(PROJECT_DIR)}")
+            if len(images) > 20:
+                lines.append(f"  - …and {len(images) - 20} more")
+
+        if audio:
+            lines.append("")
+            lines.append(f"### Audio ({len(audio)})")
+            for p in audio[:20]:
+                lines.append(f"  - {p.relative_to(PROJECT_DIR)}")
+            if len(audio) > 20:
+                lines.append(f"  - …and {len(audio) - 20} more")
+
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[parallax] launch context scan failed: {e}", file=sys.stderr, flush=True)
+        return ""
+
+
+def _fingerprint_file_server(path: Path) -> str:
+    """SHA256 of the first 4 MB of a file."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(4 * 1024 * 1024))
+    except Exception as e:
+        print(f"[parallax] fingerprint failed ({path}): {e}", file=sys.stderr, flush=True)
+        return ""
+    return h.hexdigest()
+
+
+def _rewrite_footage_jsonl_entry(old_path: str, new_rel_path: str) -> None:
+    """Update the path field of an entry in footage.jsonl matched by old_path.
+    Also updates the YAML source field if present.
+    """
+    footage_jsonl = PROJECT_DIR / "footage.jsonl"
+    if not footage_jsonl.exists():
+        return
+    try:
+        with open(footage_jsonl, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                new_lines.append(line)
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                new_lines.append(line)
+                continue
+            if entry.get("path") == old_path:
+                entry["path"] = new_rel_path
+                new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+                # Also update YAML source field
+                meta_rel = entry.get("meta", "")
+                if meta_rel:
+                    meta = _load_clip_meta(meta_rel)
+                    if meta is not None:
+                        meta["source"] = new_rel_path
+                        _save_clip_meta(meta_rel, meta)
+            else:
+                new_lines.append(line)
+        with open(footage_jsonl, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        print(f"[parallax] footage.jsonl rewrite failed: {e}", file=sys.stderr, flush=True)
+
+
+def _resolve_footage_path(entry: dict) -> tuple:
+    """Resolve the physical path for a footage entry.
+
+    Returns (Path | None, bool) — (resolved_path, was_relocated).
+    - If path exists at recorded location: (path, False)
+    - If missing but fingerprint present and file found elsewhere: auto-relink
+      then return (new_path, True)
+    - If not found: (None, False)
+    """
+    recorded_rel = entry.get("path", "")
+    candidate = PROJECT_DIR / recorded_rel
+    if candidate.exists():
+        return (candidate, False)
+
+    # Can't auto-locate without fingerprint data
+    size_bytes = entry.get("size_bytes")
+    fingerprint = entry.get("fingerprint", "")
+    if not size_bytes or not fingerprint:
+        return (None, False)
+
+    # Scan PROJECT_DIR for a matching file
+    try:
+        for root, _dirs, files in os.walk(PROJECT_DIR):
+            for fname in files:
+                fpath = Path(root) / fname
+                if fpath.suffix.lower() not in _VIDEO_EXTENSIONS:
+                    continue
+                try:
+                    fsize = os.path.getsize(fpath)
+                except Exception:
+                    continue
+                if fsize != size_bytes:
+                    continue
+                # Size matches — verify fingerprint
+                fp = _fingerprint_file_server(fpath)
+                if fp != fingerprint:
+                    continue
+                # Found it — auto-relink
+                new_rel = str(fpath.relative_to(PROJECT_DIR))
+                old_rel = recorded_rel
+                _rewrite_footage_jsonl_entry(old_rel, new_rel)
+                print(
+                    f"[parallax] auto-relinked: {old_rel} → {new_rel}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return (fpath, True)
+    except Exception as e:
+        print(f"[parallax] auto-relink scan failed: {e}", file=sys.stderr, flush=True)
+
+    return (None, False)
+
+
+def _load_clip_meta(meta_rel: str) -> Optional[dict]:
+    """Load _meta YAML for a clip given its relative meta path."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    meta_path = PROJECT_DIR / meta_rel
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"meta yaml read failed ({meta_rel}): {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def _save_clip_meta(meta_rel: str, data: dict) -> None:
+    """Save updated _meta YAML."""
+    try:
+        import yaml
+    except ImportError:
+        print("pyyaml not installed — cannot save meta", file=sys.stderr, flush=True)
+        return
+    meta_path = PROJECT_DIR / meta_rel
+    try:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+    except Exception as e:
+        print(f"meta yaml write failed ({meta_rel}): {e}", file=sys.stderr, flush=True)
+
+
+def _hms_to_seconds(hms: str) -> float:
+    """Convert HH:MM:SS or MM:SS string to float seconds."""
+    parts = hms.strip().split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def tool_list_footage() -> dict:
+    """List all indexed footage clips."""
+    entries = _load_footage_index()
+    if not entries:
+        return {"clips": [], "message": "No footage indexed yet. Run `parallax ingest <path>` to index footage."}
+    clips = []
+    for e in entries:
+        clip: dict = {
+            "path": e.get("path", ""),
+            "duration_s": e.get("duration_s", 0),
+            "scene_count": e.get("scene_count", 0),
+            "indexed_at": e.get("indexed_at", ""),
+        }
+        resolved, relocated = _resolve_footage_path(e)
+        if resolved is None:
+            clip["missing"] = True
+        elif relocated:
+            clip["relocated"] = True
+            clip["new_path"] = str(resolved.relative_to(PROJECT_DIR))
+        clips.append(clip)
+    return {"clips": clips, "total": len(clips)}
+
+
+def tool_search_footage(query: str) -> dict:
+    """Search footage by transcript, scene descriptions, and keywords."""
+    if not query or not query.strip():
+        return {"error": "query must be a non-empty string"}
+    q = query.strip().lower()
+    entries = _load_footage_index()
+    if not entries:
+        return {"matches": [], "message": "No footage indexed yet."}
+
+    matches = []
+    missing_count = 0
+    for entry in entries:
+        resolved, _relocated = _resolve_footage_path(entry)
+        if resolved is None:
+            missing_count += 1
+            continue
+
+        path = entry.get("path", "")
+        meta_rel = entry.get("meta", "")
+        clip_matches = []
+
+        # Search transcript
+        transcript = entry.get("transcript", "") or ""
+        if q in transcript.lower():
+            # Find an excerpt around the match
+            idx = transcript.lower().find(q)
+            start = max(0, idx - 80)
+            end = min(len(transcript), idx + len(q) + 80)
+            excerpt = ("..." if start > 0 else "") + transcript[start:end] + ("..." if end < len(transcript) else "")
+            clip_matches.append({"type": "transcript", "excerpt": excerpt})
+
+        # Search scenes from meta
+        if meta_rel:
+            meta = _load_clip_meta(meta_rel)
+            if meta:
+                for scene in (meta.get("scenes") or []):
+                    desc = (scene.get("description") or "").lower()
+                    kws = " ".join(scene.get("keywords") or []).lower()
+                    if q in desc or q in kws:
+                        clip_matches.append({
+                            "type": "scene",
+                            "start_time": scene.get("start_time", ""),
+                            "end_time": scene.get("end_time", ""),
+                            "description": scene.get("description", ""),
+                            "keywords": scene.get("keywords", []),
+                        })
+
+        if clip_matches:
+            matches.append({
+                "path": path,
+                "duration_s": entry.get("duration_s", 0),
+                "matches": clip_matches,
+            })
+            if len(matches) >= 10:
+                break
+
+    result: dict = {
+        "query": query,
+        "matches": matches,
+        "total_found": len(matches),
+    }
+    if missing_count:
+        result["missing_clips_skipped"] = missing_count
+    return result
+
+
+def tool_analyze_footage_segment(
+    path: str,
+    start_time: str,
+    end_time: str,
+    question: Optional[str] = None,
+) -> dict:
+    """Deep-read a time window of a footage clip via Gemini."""
+    gemini_key = os.environ.get("AI_VIDEO_GEMINI_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        return {"error": "AI_VIDEO_GEMINI_KEY or GEMINI_API_KEY not set"}
+
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        return {"error": "google-genai not installed — run: pip install google-genai"}
+
+    try:
+        import yaml
+    except ImportError:
+        return {"error": "pyyaml not installed — run: pip install pyyaml"}
+
+    # Find matching entry in footage index
+    entries = _load_footage_index()
+    entry = next((e for e in entries if e.get("path", "") == path), None)
+    if entry is None:
+        return {"error": f"clip not found in footage index: {path}. Run `parallax ingest` first."}
+
+    meta_rel = entry.get("meta", "")
+    if not meta_rel:
+        return {"error": f"no meta path for clip: {path}"}
+
+    meta = _load_clip_meta(meta_rel)
+    if meta is None:
+        return {"error": f"could not load meta for clip: {path}"}
+
+    start_s = _hms_to_seconds(start_time)
+    end_s = _hms_to_seconds(end_time)
+
+    client = genai.Client(api_key=gemini_key)
+
+    # Check if gemini_file_uri is still valid; re-upload if not
+    gemini_file_uri = meta.get("gemini_file_uri")
+    if gemini_file_uri:
+        try:
+            f_info = client.files.get(name=gemini_file_uri.split("/")[-1])
+            state_str = str(getattr(f_info, "state", ""))
+            if "ACTIVE" not in state_str:
+                gemini_file_uri = None
+        except Exception:
+            gemini_file_uri = None
+
+    if not gemini_file_uri:
+        # Re-upload — resolve physical path first
+        video_path, _relocated = _resolve_footage_path(entry)
+        if video_path is None:
+            return {
+                "error": (
+                    f"clip file not found on disk and could not be auto-located. "
+                    f"Use relink_footage to point to its new location."
+                )
+            }
+        try:
+            uploaded = client.files.upload(
+                file=str(video_path),
+                config=genai_types.UploadFileConfig(
+                    mime_type="video/mp4",
+                    display_name=video_path.name,
+                ),
+            )
+            import time as _time
+            upload_name = uploaded.name or ""
+            for _ in range(60):
+                f_info = client.files.get(name=upload_name)
+                state_str = str(getattr(f_info, "state", ""))
+                if "ACTIVE" in state_str:
+                    break
+                if "FAILED" in state_str:
+                    return {"error": f"Gemini file upload FAILED: {f_info}"}
+                _time.sleep(5)
+            else:
+                return {"error": "Gemini file never became ACTIVE after 5 minutes"}
+            gemini_file_uri = uploaded.uri or ""
+            meta["gemini_file_uri"] = gemini_file_uri
+            _save_clip_meta(meta_rel, meta)
+        except Exception as e:
+            return {"error": f"failed to re-upload video to Gemini: {e}"}
+
+    # Build prompt with optional question
+    prompt_text = (
+        f"Analyze the segment of this video from {start_time} to {end_time} "
+        f"(seconds {start_s:.1f}–{end_s:.1f}). "
+        "Give a detailed description of everything visible and audible. "
+    )
+    if question:
+        prompt_text += f"\n\nSpecifically answer this question: {question}"
+
+    try:
+        video_part = genai_types.Part(
+            file_data=genai_types.FileData(
+                file_uri=gemini_file_uri,
+                mime_type="video/mp4",
+            ),
+            video_metadata=genai_types.VideoMetadata(
+                start_offset=f"{int(start_s)}s",
+                end_offset=f"{int(end_s)}s",
+            ),
+        )
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[video_part, prompt_text],
+            config=genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        description = (resp.text or "").strip()
+    except Exception as e:
+        return {"error": f"Gemini segment analysis failed: {e}"}
+
+    # Find matching scene by time overlap and append to reads
+    read_entry = {
+        "start_time": start_time,
+        "end_time": end_time,
+        "description": description,
+        "question": question,
+    }
+    scenes = meta.get("scenes") or []
+    matched_scene_idx = None
+    for i, sc in enumerate(scenes):
+        sc_start = _hms_to_seconds(sc.get("start_time", ""))
+        sc_end = _hms_to_seconds(sc.get("end_time", ""))
+        # Overlap: query segment overlaps with scene
+        if sc_start < end_s and sc_end > start_s:
+            matched_scene_idx = i
+            break
+
+    if matched_scene_idx is not None:
+        reads = scenes[matched_scene_idx].setdefault("reads", [])
+        reads.append(read_entry)
+        meta["scenes"] = scenes
+    else:
+        # No matching scene — store in a top-level reads list
+        top_reads = meta.setdefault("reads", [])
+        top_reads.append(read_entry)
+
+    _save_clip_meta(meta_rel, meta)
+
+    return {
+        "path": path,
+        "start_time": start_time,
+        "end_time": end_time,
+        "description": description,
+        "question": question,
+        "matched_scene": matched_scene_idx,
+    }
+
+
+def tool_relink_footage(old_path: str, new_path: str) -> dict:
+    """Update footage.jsonl and YAML meta when a clip has been moved/renamed."""
+    if not old_path or not new_path:
+        return {"error": "old_path and new_path are required"}
+
+    # Verify new path exists
+    new_abs = PROJECT_DIR / new_path
+    try:
+        if not new_abs.exists():
+            return {"error": f"new_path does not exist on disk: {new_path}"}
+    except Exception as e:
+        return {"error": f"could not check new_path: {e}"}
+
+    # Find the entry in the index
+    entries = _load_footage_index()
+    entry = next((e for e in entries if e.get("path", "") == old_path), None)
+    if entry is None:
+        return {"error": f"no footage entry found for old_path: {old_path}"}
+
+    # Optionally verify fingerprint if available
+    fingerprint = entry.get("fingerprint", "")
+    fingerprint_warning = None
+    if fingerprint:
+        try:
+            new_fp = _fingerprint_file_server(new_abs)
+            if new_fp and new_fp != fingerprint:
+                fingerprint_warning = (
+                    "Fingerprint mismatch — this may not be the same file. "
+                    "Proceeding because you explicitly specified the path."
+                )
+        except Exception as e:
+            fingerprint_warning = f"Could not verify fingerprint: {e}"
+
+    # Rewrite footage.jsonl
+    try:
+        _rewrite_footage_jsonl_entry(old_path, new_path)
+    except Exception as e:
+        return {"error": f"failed to update footage.jsonl: {e}"}
+
+    result: dict = {
+        "relinked": True,
+        "old_path": old_path,
+        "new_path": new_path,
+    }
+    if fingerprint_warning:
+        result["warning"] = fingerprint_warning
+    return result
+
+
+def tool_move_to_shared(paths: list, workspace: Optional[Path] = None) -> dict:
+    """Move files from current project into PROJECT_DIR/shared/."""
+    if not paths:
+        return {"error": "paths list is empty"}
+    base = workspace or PROJECT_DIR
+    shared_dir = PROJECT_DIR / "shared"
+    try:
+        shared_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return {"error": f"could not create shared/ directory: {e}"}
+
+    moved = []
+    errors = []
+    for p in paths:
+        try:
+            resolved = _resolve_project_path(p, workspace=base)
+        except PathError as e:
+            errors.append({"path": p, "error": str(e)})
+            continue
+        if not resolved.exists():
+            errors.append({"path": p, "error": "file not found"})
+            continue
+        if not resolved.is_file():
+            errors.append({"path": p, "error": "not a regular file"})
+            continue
+        dest = shared_dir / resolved.name
+        # Avoid collisions: suffix the name if dest exists
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            counter = 1
+            while dest.exists():
+                dest = shared_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+        try:
+            shutil.move(str(resolved), str(dest))
+            moved.append({"from": p, "to": str(dest.relative_to(PROJECT_DIR))})
+        except Exception as e:
+            errors.append({"path": p, "error": f"move failed: {e}"})
+
+    result: dict = {"moved": moved}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def tool_list_shared() -> dict:
+    """List files in PROJECT_DIR/shared/."""
+    shared_dir = PROJECT_DIR / "shared"
+    if not shared_dir.exists():
+        return {"files": [], "message": "shared/ directory does not exist yet"}
+    entries = []
+    try:
+        for entry in sorted(shared_dir.iterdir(), key=lambda p: p.name.lower()):
+            if entry.is_file():
+                try:
+                    st = entry.stat()
+                    entries.append({
+                        "name": entry.name,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                    })
+                except Exception as e:
+                    entries.append({"name": entry.name, "error": str(e)})
+    except Exception as e:
+        return {"error": f"could not list shared/: {e}"}
+    return {"files": entries, "total": len(entries)}
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +2023,10 @@ def _execute_tool_calls(
         session.push_display("tool_use", {"id": tool_id, "name": name, "input": args})
         telemetry.record_event(
             session.id, "tool_use", {"id": tool_id, "name": name, "input": args}
+        )
+        _append_tool_log(
+            session.workspace,
+            {"role": "tool_call", "name": name, "input": args},
         )
 
         try:
@@ -1199,6 +2079,7 @@ def _execute_tool_calls(
                             result = subprocess.run(
                                 [sys.executable, str(script), str(dir_path), "--max", str(max_img)],
                                 capture_output=True, text=True, timeout=30,
+                                stdin=subprocess.DEVNULL,
                             )
                         except Exception as e:
                             msg = f"storyboard failed: {e}"
@@ -1228,7 +2109,7 @@ def _execute_tool_calls(
                                     summary = msg
             elif name == "parallax_create":
                 brief = args.get("brief", "")
-                count = int(args.get("count") or 3)
+                count = int(args.get("count") or 1)
                 aspect = args.get("aspect_ratio") or "3:4"
                 ref = args.get("ref")
                 if not isinstance(brief, str) or not brief.strip():
@@ -1260,6 +2141,14 @@ def _execute_tool_calls(
                 text = tool_parallax_align(session)
                 content_block = [{"type": "text", "text": text}]
                 summary = text[:200]
+            elif name == "parallax_ingest":
+                text = tool_parallax_ingest(
+                    session,
+                    path=args.get("path", "project_root"),
+                    no_vision=bool(args.get("no_vision", False)),
+                )
+                content_block = [{"type": "text", "text": text}]
+                summary = text[:200]
             elif name == "parallax_transcribe":
                 text = tool_parallax_transcribe(
                     session,
@@ -1289,6 +2178,55 @@ def _execute_tool_calls(
                         text = result.get("output") or f"manifest {op} ok"
                 content_block = [{"type": "text", "text": text}]
                 summary = text[:200]
+            elif name == "list_footage":
+                out = tool_list_footage()
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                summary = out.get("error") or f"{out.get('total', 0)} clip(s) indexed"
+            elif name == "search_footage":
+                query = args.get("query", "")
+                if not query:
+                    out = {"error": "query is required"}
+                else:
+                    out = tool_search_footage(query)
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                summary = out.get("error") or f"{out.get('total_found', 0)} match(es) for {query!r}"
+            elif name == "analyze_footage_segment":
+                clip_path = args.get("path", "")
+                start_t = args.get("start_time", "")
+                end_t = args.get("end_time", "")
+                if not clip_path or not start_t or not end_t:
+                    out = {"error": "path, start_time, and end_time are required"}
+                else:
+                    out = tool_analyze_footage_segment(
+                        path=clip_path,
+                        start_time=start_t,
+                        end_time=end_t,
+                        question=args.get("question"),
+                    )
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                summary = out.get("error") or f"analyzed {clip_path} [{start_t}–{end_t}]"
+            elif name == "relink_footage":
+                old_p = args.get("old_path", "")
+                new_p = args.get("new_path", "")
+                if not old_p or not new_p:
+                    out = {"error": "old_path and new_path are required"}
+                else:
+                    out = tool_relink_footage(old_path=old_p, new_path=new_p)
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                summary = out.get("error") or f"relinked {old_p} → {new_p}"
+            elif name == "move_to_shared":
+                paths_arg = args.get("paths", [])
+                if not isinstance(paths_arg, list):
+                    paths_arg = [paths_arg] if paths_arg else []
+                out = tool_move_to_shared(paths_arg, workspace=session.workspace)
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                n_moved = len(out.get("moved", []))
+                n_err = len(out.get("errors", []))
+                summary = f"moved {n_moved} file(s)" + (f", {n_err} error(s)" if n_err else "")
+            elif name == "list_shared":
+                out = tool_list_shared()
+                content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
+                summary = out.get("error") or f"{out.get('total', 0)} file(s) in shared/"
             else:
                 text = f"unknown tool: {name}"
                 content_block = [{"type": "text", "text": text}]
@@ -1312,6 +2250,10 @@ def _execute_tool_calls(
             session.id,
             "tool_result",
             {"id": tool_id, "name": name, "summary": summary},
+        )
+        _append_tool_log(
+            session.workspace,
+            {"role": "tool_result", "name": name, "summary": summary},
         )
 
         results.append(
@@ -1344,6 +2286,17 @@ def _append_chat_turn(workspace: Path, role: str, text: str) -> None:
         print(f"chat.jsonl write failed: {e}", file=sys.stderr, flush=True)
 
 
+def _append_tool_log(workspace: Path, entry: dict) -> None:
+    try:
+        path = _chat_log_path(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({**entry, "ts": time.time()}, ensure_ascii=False) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"chat.jsonl tool write failed: {e}", file=sys.stderr, flush=True)
+
+
 def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
     path = _chat_log_path(workspace)
     if not path.is_file():
@@ -1364,127 +2317,15 @@ def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Mock Anthropic stream for TEST_MODE
-# ---------------------------------------------------------------------------
-
-class _MockUsage:
-    input_tokens = 0
-    output_tokens = 0
-
-
-class _MockTextBlock:
-    type = "text"
-    def __init__(self, text: str):
-        self.text = text
-
-
-class _MockToolUseBlock:
-    type = "tool_use"
-    def __init__(self, tool_id: str, name: str, input_args: dict):
-        self.id = tool_id
-        self.name = name
-        self.input = input_args
-
-
-class _MockFinalMessage:
-    stop_reason: str
-    usage: _MockUsage
-    content: list
-
-    def __init__(self, text_blocks: list, tool_blocks: list):
-        self.content = text_blocks + tool_blocks
-        self.stop_reason = "tool_use" if tool_blocks else "end_turn"
-        self.usage = _MockUsage()
-
-
-class _MockDeltaEvent:
-    type = "content_block_delta"
-    def __init__(self, text: str):
-        self.delta = type("delta", (), {"type": "text_delta", "text": text})()
-
-
-class _MockStreamCtx:
-    """Context manager that mimics the Anthropic streaming interface."""
-
-    def __init__(self, text: str, tool_block: Optional[dict]):
-        self._text = text
-        self._tool_block = tool_block
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-    def __iter__(self):
-        yield _MockDeltaEvent(self._text)
-
-    def get_final_message(self) -> _MockFinalMessage:
-        text_blocks = [_MockTextBlock(self._text)] if self._text else []
-        tool_blocks = []
-        if self._tool_block:
-            tool_blocks.append(
-                _MockToolUseBlock(
-                    self._tool_block["id"],
-                    self._tool_block["name"],
-                    self._tool_block["input"],
-                )
-            )
-        return _MockFinalMessage(text_blocks, tool_blocks)
-
-
-def _mock_anthropic_stream(messages: list, tools: list) -> _MockStreamCtx:
-    """Return a mock stream based on the latest user message content."""
-    user_text = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                user_text = content
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        user_text += block.get("text", "")
-            break
-    lower = user_text.lower()
-    tool_block: Optional[dict] = None
-    reply_text = "TEST_MODE: mock reply. No API call made."
-    if "still" in lower:
-        reply_text = "TEST_MODE: invoking parallax_create for a still."
-        tool_block = {
-            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
-            "name": "parallax_create",
-            "input": {"description": user_text[:200], "output": "stills/mock_still.png"},
-        }
-    elif "compose" in lower:
-        reply_text = "TEST_MODE: invoking parallax_compose."
-        tool_block = {
-            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
-            "name": "parallax_compose",
-            "input": {"manifest": "manifest.json", "output": "output/mock_video.mp4"},
-        }
-    elif "voiceover" in lower:
-        reply_text = "TEST_MODE: invoking parallax_voiceover."
-        tool_block = {
-            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
-            "name": "parallax_voiceover",
-            "input": {"script": user_text[:200], "output": "audio/mock_vo.mp3"},
-        }
-    return _MockStreamCtx(reply_text, tool_block)
-
-
 def run_agent_turn(session: Session, user_text: str) -> None:
     """Agent loop body — runs in a background thread per POST /api/message."""
-    use_mock = TEST_MODE or getattr(session, "test_mode", False)
-    if not use_mock:
-        try:
-            client = _lazy_client()
-        except Exception as e:
-            session.broadcast("error", {"message": str(e)})
-            telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
-            session.broadcast("agent_done", {"ok": False})
-            return
+    try:
+        client = _lazy_client()
+    except Exception as e:
+        session.broadcast("error", {"message": str(e)})
+        telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
+        session.broadcast("agent_done", {"ok": False})
+        return
 
     user_content: list[dict] = [{"type": "text", "text": user_text}]
     session.messages.append({"role": "user", "content": user_content})
@@ -1492,7 +2333,7 @@ def run_agent_turn(session: Session, user_text: str) -> None:
     telemetry.record_event(session.id, "user_message", {"text": user_text})
     _append_chat_turn(session.workspace, "user", user_text)
 
-    hop_prompt = _load_hop_prompt()
+    head_of_production_prompt = _load_head_of_production_prompt()
 
     MAX_ITER = 12
     for _iter in range(MAX_ITER):
@@ -1501,18 +2342,13 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             return
 
         try:
-            _stream_ctx = (
-                _mock_anthropic_stream(session.messages, TOOL_SCHEMAS)
-                if use_mock
-                else client.messages.stream(  # type: ignore[union-attr]
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=hop_prompt,
-                    tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
-                    messages=session.messages,  # type: ignore[arg-type]
-                )
-            )
-            with _stream_ctx as stream:
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=head_of_production_prompt,
+                tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
+                messages=session.messages,  # type: ignore[arg-type]
+            ) as stream:
                 for event in stream:
                     if session.cancel_event.is_set():
                         break
@@ -1742,6 +2578,10 @@ class CreateProjectRequest(BaseModel):
     name: str
 
 
+class RenameProjectRequest(BaseModel):
+    new_name: str
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app + lifespan
 # ---------------------------------------------------------------------------
@@ -1756,10 +2596,11 @@ async def lifespan(app: FastAPI):
             _ensure_workspace(_workspace_for(None, "main"))
         except Exception as e:
             print(f"parallax-web: default workspace scaffold failed: {e}", file=sys.stderr)
+            server_log.log_exception("workspace_scaffold_failed", e)
+    port = int(os.environ.get("_PARALLAX_PORT", "0"))
+    host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
     try:
         registry.install_shutdown_hooks()
-        port = int(os.environ.get("_PARALLAX_PORT", "0"))
-        host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
         registry.register(
             cwd=str(PROJECT_DIR),
             host=host,
@@ -1768,15 +2609,41 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         print(f"parallax-web: registry register failed: {e}", file=sys.stderr)
+        server_log.log_exception("registry_register_failed", e)
+    if os.environ.get("PARALLAX_WEB_NO_BROWSER") != "1" and port:
+        url = f"http://{host}:{port}/"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            print(f"parallax-web: webbrowser.open failed: {e}", file=sys.stderr)
+            server_log.log_exception("webbrowser_open_failed", e, url=url)
     yield
     # Shutdown
     try:
         registry.deregister()
-    except Exception:
-        pass
+    except Exception as e:
+        server_log.log_exception("registry_deregister_failed", e)
+    server_log.log("shutdown")
 
 
 app = FastAPI(title="parallax-web", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _log_uncaught_exception(request: Request, exc: Exception):
+    server_log.log_exception(
+        "request_error",
+        exc,
+        path=str(request.url.path),
+        method=request.method,
+    )
+    if isinstance(exc, HTTPException):
+        raise exc
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"internal server error: {type(exc).__name__}"},
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -1796,31 +2663,37 @@ if STATIC_DIR.is_dir():
 # ---------------------------------------------------------------------------
 
 
+def _serve_shell(request: Request) -> FileResponse:
+    _require_auth(request)
+    shell = STATIC_DIR / "app.html"
+    if not shell.is_file():
+        raise HTTPException(status_code=404, detail="app.html not found")
+    return FileResponse(str(shell), media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/")
 async def serve_index(request: Request):
-    _require_auth(request)
-    index = STATIC_DIR / "index.html"
-    if not index.is_file():
-        raise HTTPException(status_code=404, detail="index.html not found")
-    return FileResponse(str(index), media_type="text/html", headers={"Cache-Control": "no-store"})
+    return _serve_shell(request)
+
+
+@app.get("/timeline")
+async def serve_timeline_page(request: Request):
+    return _serve_shell(request)
 
 
 @app.get("/costs")
 async def serve_costs_page(request: Request):
-    _require_auth(request)
-    page = STATIC_DIR / "costs.html"
-    if not page.is_file():
-        raise HTTPException(status_code=404, detail="costs.html not found")
-    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
+    return _serve_shell(request)
 
 
 @app.get("/manifest")
 async def serve_manifest_page(request: Request):
-    _require_auth(request)
-    page = STATIC_DIR / "manifest.html"
-    if not page.is_file():
-        raise HTTPException(status_code=404, detail="manifest.html not found")
-    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
+    return _serve_shell(request)
+
+
+@app.get("/media")
+async def serve_media_page(request: Request):
+    return _serve_shell(request)
 
 
 @app.get("/media/{rel_path:path}")
@@ -2209,9 +3082,9 @@ async def api_upload(request: Request):
         raise HTTPException(status_code=500, detail=f"read failed: {e}")
 
     if not file_data:
-        raise HTTPException(status_code=400, detail="file too large or empty (max 500 MB)")
-    if len(file_data) > 500 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="file too large (max 500 MB)")
+        raise HTTPException(status_code=400, detail="file too large or empty (max 50 MB)")
+    if len(file_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large (max 50 MB)")
 
     filename = upload_file.filename or ""
     filename = os.path.basename(filename)
@@ -2355,6 +3228,114 @@ async def api_delete_project(name: str, request: Request):
     return JSONResponse({"ok": True, "deleted": name})
 
 
+def _archive_root(user: Optional[str] = None) -> Path:
+    if PER_USER_WORKSPACES and user:
+        return _users_root() / _sanitize_name(user) / ".archive"
+    return _workspace_root() / ".archive"
+
+
+@app.get("/api/projects/archived")
+async def api_list_archived_projects(request: Request):
+    _require_auth(request)
+    user = _get_user(request)
+    root = _archive_root(user)
+    projects = []
+    try:
+        if root.exists():
+            for entry in sorted(root.iterdir()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    meta_file = entry / "_meta.json"
+                    archived_date = None
+                    if meta_file.exists():
+                        try:
+                            meta = json.loads(meta_file.read_text())
+                            archived_date = meta.get("archived_date")
+                        except Exception:
+                            pass
+                    projects.append({"name": entry.name, "archived_date": archived_date})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to list archived: {e}")
+    return JSONResponse({"projects": projects})
+
+
+@app.post("/api/projects/{name}/archive")
+async def api_archive_project(name: str, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(name or "")
+    if not name or name == "main":
+        raise HTTPException(status_code=400, detail="cannot archive 'main' project")
+    current = _get_project(request) or "main"
+    if name == current:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot archive the active project '{name}'. Switch to another project first.",
+        )
+    user = _get_user(request)
+    workspace = _workspace_for(user, name)
+    if not workspace.is_dir():
+        raise HTTPException(status_code=404, detail=f"project '{name}' not found")
+    archive_root = _archive_root(user)
+    archive_root.mkdir(parents=True, exist_ok=True)
+    dest = archive_root / name
+    if dest.exists():
+        raise HTTPException(status_code=400, detail=f"archived project '{name}' already exists — delete it first")
+    try:
+        import datetime as _dt
+        shutil.move(str(workspace), str(dest))
+        (dest / "_meta.json").write_text(json.dumps({"archived_date": _dt.date.today().isoformat()}))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to archive: {e}")
+    return JSONResponse({"ok": True, "archived": name})
+
+
+@app.post("/api/projects/{name}/unarchive")
+async def api_unarchive_project(name: str, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    user = _get_user(request)
+    src = _archive_root(user) / name
+    if not src.is_dir():
+        raise HTTPException(status_code=404, detail=f"archived project '{name}' not found")
+    dest = _workspace_for(user, name)
+    if dest.exists():
+        raise HTTPException(status_code=400, detail=f"project '{name}' already exists in active workspace")
+    try:
+        meta_file = src / "_meta.json"
+        if meta_file.exists():
+            meta_file.unlink()
+        shutil.move(str(src), str(dest))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to unarchive: {e}")
+    return JSONResponse({"ok": True, "unarchived": name})
+
+
+@app.post("/api/projects/{name}/rename")
+async def api_rename_project(name: str, body: RenameProjectRequest, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(name or "")
+    new_name = _sanitize_name(body.new_name or "")
+    if not name or not new_name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if name == "main":
+        raise HTTPException(status_code=400, detail="cannot rename 'main' project")
+    if name == new_name:
+        return JSONResponse({"ok": True, "name": name})
+    user = _get_user(request)
+    workspace = _workspace_for(user, name)
+    if not workspace.is_dir():
+        raise HTTPException(status_code=404, detail=f"project '{name}' not found")
+    new_workspace = _workspace_for(user, new_name)
+    if new_workspace.exists():
+        raise HTTPException(status_code=400, detail=f"project '{new_name}' already exists")
+    try:
+        workspace.rename(new_workspace)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to rename: {e}")
+    return JSONResponse({"ok": True, "name": new_name})
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -2375,12 +3356,6 @@ def find_free_port() -> int:
 
 def preflight() -> None:
     """Validate required environment before spawning the server."""
-    if TEST_MODE:
-        print(
-            "parallax-web: TEST_MODE enabled — API key not required, mock stream active",
-            flush=True,
-        )
-        return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "parallax-web: ANTHROPIC_API_KEY is not set. "
@@ -2408,22 +3383,36 @@ def main() -> int:
     host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
     bind_host = "0.0.0.0" if host != "127.0.0.1" else "127.0.0.1"
     url = f"http://{host}:{port}/"
+    auth_on = bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
     print(f"parallax-web: project  = {PROJECT_DIR}")
     print(f"parallax-web: model    = {MODEL}")
     print(f"parallax-web: url      = {url}")
-    if os.environ.get("PARALLAX_WEB_PASSWORD"):
+    try:
+        _content = _discover_project_content()
+        _nv, _ni, _na = len(_content["videos"]), len(_content["images"]), len(_content["audio"])
+        if _nv or _ni or _na:
+            print(
+                f"parallax-web: content  = {_nv} video, {_ni} image, {_na} audio at project_root"
+            )
+        else:
+            print("parallax-web: content  = (none at project_root)")
+    except Exception as _e:
+        print(f"parallax-web: content  = scan failed ({_e})")
+    if auth_on:
         print("parallax-web: auth     = enabled (Basic Auth)")
     else:
         print("parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
+    server_log.log(
+        "startup",
+        project_dir=str(PROJECT_DIR),
+        host=host,
+        port=port,
+        model=MODEL,
+        auth=auth_on,
+    )
 
     # Pass port to lifespan via env so the registry gets the real port
     os.environ["_PARALLAX_PORT"] = str(port)
-
-    if os.environ.get("PARALLAX_WEB_NO_BROWSER") != "1":
-        try:
-            webbrowser.open(url)
-        except Exception as e:
-            print(f"parallax-web: webbrowser.open failed: {e}", file=sys.stderr)
 
     import uvicorn
     uvicorn.run(

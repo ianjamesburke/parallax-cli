@@ -58,8 +58,8 @@ def transcribe(audio_path: str) -> dict:
             result = _transcribe_faster_whisper(audio_path)
         except ImportError as e:
             raise RuntimeError(
-                "[transcription] Neither whisperx nor faster-whisper is installed. "
-                "Run: pip install whisperx  OR  pip install faster-whisper"
+                "Neither whisperx nor faster-whisper is installed. "
+                "Run: uv add whisperx  OR  uv add faster-whisper"
             ) from e
         except Exception as e:
             raise RuntimeError(f"[transcription] faster-whisper failed for {audio_path}: {e}") from e

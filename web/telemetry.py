@@ -44,6 +44,12 @@ from typing import Any, Iterator, Optional
 
 
 LOG_PATH = Path(os.path.expanduser("~/.parallax/events.jsonl"))
+ROTATED_LOG_PATH = Path(os.path.expanduser("~/.parallax/events.jsonl.1"))
+
+# Rotate when the active log exceeds this size. Checked once per server boot
+# (in init_db), not per-write — keeps the hot path free of stat() calls. One
+# backup file is kept; anything older than the previous rotation is discarded.
+_MAX_LOG_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # A single process-wide lock around append writes. POSIX guarantees that
 # writes smaller than PIPE_BUF (4KB on macOS) are atomic even without locks,
@@ -62,12 +68,24 @@ def _get_user() -> str:
 def init_db() -> None:
     """
     Ensure the log directory + file exist. Returns nothing — the name is kept
-    for compatibility with the old SQLite API call sites.
+    for compatibility with the old SQLite API call sites. Also performs a
+    one-shot rotation check: if the active log is over _MAX_LOG_BYTES, it
+    rotates to events.jsonl.1 (overwriting any prior backup) and starts fresh.
     """
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         if not LOG_PATH.exists():
             LOG_PATH.touch()
+            return
+        try:
+            if LOG_PATH.stat().st_size > _MAX_LOG_BYTES:
+                if ROTATED_LOG_PATH.exists():
+                    ROTATED_LOG_PATH.unlink()
+                LOG_PATH.rename(ROTATED_LOG_PATH)
+                LOG_PATH.touch()
+        except Exception as e:
+            # Rotation failure is non-fatal — keep writing to the old file.
+            print(f"telemetry: rotation skipped: {e}", file=sys.stderr, flush=True)
     except Exception as e:
         print(
             f"telemetry: failed to init log at {LOG_PATH}: {e}",
@@ -106,14 +124,20 @@ def _append(event: dict[str, Any]) -> None:
 
 def _iter_events() -> Iterator[dict[str, Any]]:
     """
-    Yield every event in the log, in append order. Malformed lines are
-    skipped with a stderr warning — the log must keep being readable even if
-    one line gets corrupted.
+    Yield every event in the log, in append order. Reads the rotated backup
+    (events.jsonl.1) before the active file so sessions that straddle a
+    rotation still replay in order. Malformed lines are skipped with a stderr
+    warning — the log must keep being readable even if one line gets corrupted.
     """
-    if not LOG_PATH.exists():
-        return
+    for path in (ROTATED_LOG_PATH, LOG_PATH):
+        if not path.exists():
+            continue
+        yield from _iter_events_from(path)
+
+
+def _iter_events_from(path: Path) -> Iterator[dict[str, Any]]:
     try:
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for lineno, raw in enumerate(f, 1):
                 raw = raw.strip()
                 if not raw:
