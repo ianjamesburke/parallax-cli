@@ -752,6 +752,21 @@ VOICE_SHORTCUTS = {
 }
 
 
+def _require_whisperx() -> None:
+    """
+    Check that whisperx is importable. Exits 2 with a clear error if not.
+    Call at the top of any command that needs whisperx, before spending API credits.
+    """
+    try:
+        import whisperx  # noqa: F401
+    except ImportError:
+        print(
+            "ERROR: whisperx not installed. Run: uv pip install whisperx",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def _whisperx_transcribe(audio_path: Path, language: str = "en", model: str = "base.en") -> tuple:
     """
     Run WhisperX phoneme-level forced alignment on an audio file.
@@ -1010,6 +1025,11 @@ def cmd_voiceover(args) -> int:
     voice_name = voice_input.title() if voice_input.lower() in VOICE_SHORTCUTS else voice_input
 
     _test_mode_vo = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    # Preflight: verify whisperx is importable before spending ElevenLabs credits.
+    # Skip in TEST_MODE (uses macOS say) and when --no-transcribe is passed.
+    if not _test_mode_vo and not getattr(args, "no_transcribe", False):
+        _require_whisperx()
 
     # Structured request + cost events fire for both real and test paths
     # so the costs page can fold projected voiceover spend.
