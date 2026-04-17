@@ -3234,10 +3234,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Pick a python interpreter: prefer a web/.venv if present, otherwise
-    # fall back to the current interpreter.
-    venv_py = web_dir / ".venv" / "bin" / "python3"
-    python_bin = str(venv_py) if venv_py.is_file() else (_shutil.which("python3") or sys.executable)
+    # Pick a python interpreter: prefer repo-root .venv (uv-managed), then
+    # legacy web/.venv, then system python3.
+    root_venv_py = REPO_ROOT / ".venv" / "bin" / "python3"
+    web_venv_py = web_dir / ".venv" / "bin" / "python3"
+    if root_venv_py.is_file():
+        python_bin = str(root_venv_py)
+    elif web_venv_py.is_file():
+        python_bin = str(web_venv_py)
+    else:
+        python_bin = _shutil.which("python3") or sys.executable
 
     if not test_mode:
         # Probe for the anthropic package; if missing, tell the user how to fix.

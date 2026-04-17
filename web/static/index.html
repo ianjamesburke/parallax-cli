@@ -26,12 +26,25 @@
           </div>
           <div class="chat-meta">
             <span class="status-dot" id="status-dot" title="idle"></span>
-            <span class="model-name" id="model-name">claude-sonnet-4-6</span>
             <span class="project-badge" id="project-badge" title="active project workspace">main</span>
+            <a class="header-link" id="manifest-link" href="/manifest" title="view project manifest">manifest ↗</a>
+            <a class="header-link" id="costs-link" href="/costs" title="view cost report">costs ↗</a>
+            <button type="button" class="header-link" id="finder-btn" title="open project folder in Finder">finder ↗</button>
           </div>
         </header>
 
-        <div class="messages" id="messages"></div>
+        <div class="messages" id="messages">
+          <div class="welcome" id="welcome">
+            <div class="welcome-title">Welcome to Parallax</div>
+            <div class="welcome-sub">A short-form video studio driven by natural language.</div>
+            <ul class="welcome-list">
+              <li><b>Brief the Head of Production.</b> Describe what you want — a 3-scene Ken Burns ad, a character study, a mood piece — and it handles stills, voiceover, pacing, and final render.</li>
+              <li><b>Upload reference images</b> via the gallery on the right. They're selected as references by default, so the next generation uses them image-to-image via Gemini.</li>
+              <li><b>Type "TEST MODE" anywhere in your brief</b> to run the full pipeline without spending API credits — placeholder stills + macOS voice.</li>
+              <li><b>Projects</b> live under <code>parallax/users/&lt;you&gt;/&lt;project&gt;/</code>. Create one via the <b>+</b> in the sidebar; files at the launch-dir root are shared across every project.</li>
+            </ul>
+          </div>
+        </div>
         <div class="thinking-bar hidden" id="thinking-bar">
           <span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>
           <span class="thinking-label" id="thinking-label">Thinking</span>
@@ -61,8 +74,6 @@
       <section class="media">
         <header class="media-header">
           <div class="project-label" id="project-label">—</div>
-          <a class="btn ghost btn-sm" id="drive-btn" href="#" target="_blank" rel="noopener" style="display:none">Drive ↗</a>
-          <button type="button" class="btn ghost btn-sm" id="drive-set-btn" title="Set your Google Drive folder link">Drive…</button>
         </header>
 
         <div class="player-wrap" id="player-wrap">
@@ -81,11 +92,11 @@
           <button type="button" class="btn ghost btn-sm" id="upload-btn" title="Upload an image">
             + Upload
           </button>
-          <input type="file" id="upload-input" accept="image/*,video/*" multiple style="display:none" />
+          <input type="file" id="upload-input" accept="image/*" multiple style="display:none" />
         </div>
         <div class="gallery dropzone" id="gallery">
-          <div class="gallery-empty" id="gallery-empty" style="cursor:pointer" onclick="document.getElementById('upload-input').click()">
-            Drag images or video here, or click to upload
+          <div class="gallery-empty" id="gallery-empty">
+            Drag images here or click <strong>+ Upload</strong>
           </div>
         </div>
       </section>
