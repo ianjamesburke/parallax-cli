@@ -52,6 +52,11 @@ import telemetry  # noqa: E402
 import costs  # noqa: E402
 import registry  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# TEST_MODE — set TEST_MODE=1 to run without paid API calls
+# ---------------------------------------------------------------------------
+TEST_MODE: bool = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes", "on")
+
 
 def _fal_whoami() -> dict:
     """
@@ -856,6 +861,8 @@ def _clean_subprocess_env() -> dict:
     cleaned = [p for p in path_parts if "/venv/" not in p and "/.venv/" not in p and "/virtualenvs/" not in p]
     if cleaned:
         env["PATH"] = ":".join(cleaned)
+    if TEST_MODE:
+        env["TEST_MODE"] = "true"
     return env
 
 
@@ -1357,15 +1364,127 @@ def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Mock Anthropic stream for TEST_MODE
+# ---------------------------------------------------------------------------
+
+class _MockUsage:
+    input_tokens = 0
+    output_tokens = 0
+
+
+class _MockTextBlock:
+    type = "text"
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _MockToolUseBlock:
+    type = "tool_use"
+    def __init__(self, tool_id: str, name: str, input_args: dict):
+        self.id = tool_id
+        self.name = name
+        self.input = input_args
+
+
+class _MockFinalMessage:
+    stop_reason: str
+    usage: _MockUsage
+    content: list
+
+    def __init__(self, text_blocks: list, tool_blocks: list):
+        self.content = text_blocks + tool_blocks
+        self.stop_reason = "tool_use" if tool_blocks else "end_turn"
+        self.usage = _MockUsage()
+
+
+class _MockDeltaEvent:
+    type = "content_block_delta"
+    def __init__(self, text: str):
+        self.delta = type("delta", (), {"type": "text_delta", "text": text})()
+
+
+class _MockStreamCtx:
+    """Context manager that mimics the Anthropic streaming interface."""
+
+    def __init__(self, text: str, tool_block: Optional[dict]):
+        self._text = text
+        self._tool_block = tool_block
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def __iter__(self):
+        yield _MockDeltaEvent(self._text)
+
+    def get_final_message(self) -> _MockFinalMessage:
+        text_blocks = [_MockTextBlock(self._text)] if self._text else []
+        tool_blocks = []
+        if self._tool_block:
+            tool_blocks.append(
+                _MockToolUseBlock(
+                    self._tool_block["id"],
+                    self._tool_block["name"],
+                    self._tool_block["input"],
+                )
+            )
+        return _MockFinalMessage(text_blocks, tool_blocks)
+
+
+def _mock_anthropic_stream(messages: list, tools: list) -> _MockStreamCtx:
+    """Return a mock stream based on the latest user message content."""
+    user_text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                user_text = content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        user_text += block.get("text", "")
+            break
+    lower = user_text.lower()
+    tool_block: Optional[dict] = None
+    reply_text = "TEST_MODE: mock reply. No API call made."
+    if "still" in lower:
+        reply_text = "TEST_MODE: invoking parallax_create for a still."
+        tool_block = {
+            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
+            "name": "parallax_create",
+            "input": {"description": user_text[:200], "output": "stills/mock_still.png"},
+        }
+    elif "compose" in lower:
+        reply_text = "TEST_MODE: invoking parallax_compose."
+        tool_block = {
+            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
+            "name": "parallax_compose",
+            "input": {"manifest": "manifest.json", "output": "output/mock_video.mp4"},
+        }
+    elif "voiceover" in lower:
+        reply_text = "TEST_MODE: invoking parallax_voiceover."
+        tool_block = {
+            "id": f"mock_tu_{uuid.uuid4().hex[:8]}",
+            "name": "parallax_voiceover",
+            "input": {"script": user_text[:200], "output": "audio/mock_vo.mp3"},
+        }
+    return _MockStreamCtx(reply_text, tool_block)
+
+
 def run_agent_turn(session: Session, user_text: str) -> None:
     """Agent loop body — runs in a background thread per POST /api/message."""
-    try:
-        client = _lazy_client()
-    except Exception as e:
-        session.broadcast("error", {"message": str(e)})
-        telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
-        session.broadcast("agent_done", {"ok": False})
-        return
+    use_mock = TEST_MODE or getattr(session, "test_mode", False)
+    if not use_mock:
+        try:
+            client = _lazy_client()
+        except Exception as e:
+            session.broadcast("error", {"message": str(e)})
+            telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
+            session.broadcast("agent_done", {"ok": False})
+            return
 
     user_content: list[dict] = [{"type": "text", "text": user_text}]
     session.messages.append({"role": "user", "content": user_content})
@@ -1382,13 +1501,18 @@ def run_agent_turn(session: Session, user_text: str) -> None:
             return
 
         try:
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=hop_prompt,
-                tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
-                messages=session.messages,  # type: ignore[arg-type]
-            ) as stream:
+            _stream_ctx = (
+                _mock_anthropic_stream(session.messages, TOOL_SCHEMAS)
+                if use_mock
+                else client.messages.stream(  # type: ignore[union-attr]
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=hop_prompt,
+                    tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
+                    messages=session.messages,  # type: ignore[arg-type]
+                )
+            )
+            with _stream_ctx as stream:
                 for event in stream:
                     if session.cancel_event.is_set():
                         break
@@ -2085,9 +2209,9 @@ async def api_upload(request: Request):
         raise HTTPException(status_code=500, detail=f"read failed: {e}")
 
     if not file_data:
-        raise HTTPException(status_code=400, detail="file too large or empty (max 50 MB)")
-    if len(file_data) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="file too large (max 50 MB)")
+        raise HTTPException(status_code=400, detail="file too large or empty (max 500 MB)")
+    if len(file_data) > 500 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large (max 500 MB)")
 
     filename = upload_file.filename or ""
     filename = os.path.basename(filename)
@@ -2251,6 +2375,12 @@ def find_free_port() -> int:
 
 def preflight() -> None:
     """Validate required environment before spawning the server."""
+    if TEST_MODE:
+        print(
+            "parallax-web: TEST_MODE enabled — API key not required, mock stream active",
+            flush=True,
+        )
+        return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "parallax-web: ANTHROPIC_API_KEY is not set. "
