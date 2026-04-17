@@ -7,7 +7,7 @@ medium = balanced quality/cost, high = top-tier.
 Pricing verified 2026-04-16 from fal.ai/pricing and model pages.
 
 VIDEO TIER PICKS
-  low:    fal-ai/ltx-video        $0.02/clip   (LTX-Video, research-grade but ships fast clips cheaply)
+  low:    fal-ai/ltx-2.3/text-to-video  $0.02/clip  (LTX-2.3, supports aspect_ratio param)
   medium: fal-ai/wan-t2v          $0.20/clip (480p) / $0.40/clip (720p)  (Wan 2.1, solid quality)
   high:   fal-ai/kling-video/v1.6/standard/text-to-video  ~$0.056/sec (Kling 1.6, cinematic quality)
 
@@ -54,10 +54,10 @@ class ModelSpec:
 
 VIDEO_MODELS: dict[Tier, ModelSpec] = {
     "low": ModelSpec(
-        model_id="fal-ai/ltx-video",
+        model_id="fal-ai/ltx-2.3/text-to-video",
         tier="low",
         kind="video",
-        description="LTX-Video — fast, cheap text-to-video, research-grade",
+        description="LTX-2.3 — fast, cheap text-to-video with aspect_ratio support",
         price_note="$0.02/clip (flat)",
         size_map=_ASPECT_TO_VIDEO_SIZE,
     ),

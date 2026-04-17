@@ -2,6 +2,20 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [FIX] fal video `--aspect` now wired correctly for all tiers
+
+Root cause was two-fold: (1) the low tier used model ID `fal-ai/ltx-video` which accepts no dimension params at all — silently produced 768x512 (3:2 landscape) regardless of `--aspect`. Fixed by upgrading to `fal-ai/ltx-2.3/text-to-video` which supports `aspect_ratio` + `resolution` params. (2) The `_build_video_args` builder was passing `width`/`height` for LTX instead of `aspect_ratio`/`resolution`. Wan and Kling were already passing `aspect_ratio` correctly.
+
+Per-model aspect param table:
+- `fal-ai/ltx-2.3/text-to-video` (low): `aspect_ratio` enum, `"9:16"` or `"16:9"` only. Duration is int 6/8/10 (snapped from requested seconds).
+- `fal-ai/wan-t2v` (medium): `aspect_ratio` enum, `"9:16"` or `"16:9"` only.
+- `fal-ai/kling-video/v1.6/standard/text-to-video` (high): `aspect_ratio` enum, `"9:16"`, `"16:9"`, or `"1:1"`.
+- All image tiers (FLUX): `image_size` enum via `_ASPECT_TO_IMAGE_SIZE`, all 4 values work.
+
+Passing `1:1` to low/medium now fails fast with a clear error (exit 2) instead of silently dropping the param.
+
+**Breaks if:** `parallax fal video low --prompt X --aspect 9:16 --output /tmp/x.mp4` produces a file where `ffprobe width > height` (i.e. landscape instead of vertical).
+
 ## 2026-04-17 — [CHANGED] Replace ffmpeg drawtext with PIL transparent-PNG overlay system
 
 `drawtext` was causing two recurring failures: (1) font path lookup brittle on macOS (Homebrew ffmpeg-full required, stock ffmpeg missing libfreetype), and (2) shell-escape hell for quotes/punctuation in caption text causing silently wrong renders or hard crashes.

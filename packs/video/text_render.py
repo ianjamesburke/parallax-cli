@@ -157,8 +157,8 @@ def _render_block_background(text: str, video_size: tuple[int, int]) -> Image.Im
     blocks: list[tuple[str, int, int]] = []
     for word in words:
         bbox = draw.textbbox((0, 0), word, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
+        tw = int(bbox[2] - bbox[0])
+        th = int(bbox[3] - bbox[1])
         blocks.append((word, tw, th))
 
     # Total row width

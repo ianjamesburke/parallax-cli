@@ -55,38 +55,53 @@ def _build_video_args(
     aspect: str,
     seed: int | None,
 ) -> dict:
-    """Build the model-specific arguments dict for video generation."""
-    size_val = spec.size_map.get(aspect, "portrait_9_16")
+    """Build the model-specific arguments dict for video generation.
+
+    Aspect support per model:
+      ltx-2.3 (low):   aspect_ratio param — "9:16" or "16:9" only
+      wan-t2v (medium): aspect_ratio param — "9:16" or "16:9" only
+      kling-video (high): aspect_ratio param — "9:16", "16:9", or "1:1"
+    """
     args: dict = {
         "prompt": prompt,
     }
 
     mid = spec.model_id
 
-    if "ltx-video" in mid:
-        # LTX-Video accepts: prompt, negative_prompt, num_inference_steps,
-        # guidance_scale, num_frames, fps, width, height, seed
-        # Approximate frame count from duration (LTX default fps=25)
-        fps = 25
-        args["num_frames"] = duration * fps
-        args["fps"] = fps
-        # video_size not supported — use width/height
-        if aspect == "9:16":
-            args["width"] = 576
-            args["height"] = 1024
-        elif aspect == "16:9":
-            args["width"] = 1024
-            args["height"] = 576
-        else:  # 1:1
-            args["width"] = 720
-            args["height"] = 720
+    if "ltx-2.3" in mid:
+        # LTX-2.3 uses aspect_ratio enum + resolution (not width/height).
+        # Supported: "9:16", "16:9". "1:1" is not supported — fail fast.
+        if aspect not in ("9:16", "16:9"):
+            raise ValueError(
+                f"LTX-2.3 (low) does not support aspect ratio '{aspect}'. "
+                "Supported: 9:16, 16:9"
+            )
+        args["aspect_ratio"] = aspect
+        args["resolution"] = "1080p"
+        # LTX-2.3 duration is an enum: 6, 8, or 10 (seconds, as string).
+        # Snap requested duration to nearest valid value.
+        _ltx_durations = [6, 8, 10]
+        snapped = min(_ltx_durations, key=lambda d: abs(d - duration))
+        args["duration"] = snapped
 
     elif "wan-t2v" in mid:
+        # Wan 2.1 uses aspect_ratio enum. Supported: "9:16", "16:9" only.
+        if aspect not in ("9:16", "16:9"):
+            raise ValueError(
+                f"Wan (medium) does not support aspect ratio '{aspect}'. "
+                "Supported: 9:16, 16:9"
+            )
         args["aspect_ratio"] = aspect
         # resolution key controls 480p vs 720p cost
         args["resolution"] = "480p"
 
     elif "kling-video" in mid:
+        # Kling 1.6 supports "9:16", "16:9", "1:1".
+        if aspect not in ("9:16", "16:9", "1:1"):
+            raise ValueError(
+                f"Kling (high) does not support aspect ratio '{aspect}'. "
+                "Supported: 9:16, 16:9, 1:1"
+            )
         args["aspect_ratio"] = aspect
         args["duration"] = str(duration)  # Kling takes string "5" or "10"
 
@@ -141,7 +156,11 @@ def generate_video(
         print("[parallax fal] ERROR: fal-client not installed. Run: uv add fal-client", file=sys.stderr)
         return 1
 
-    model_args = _build_video_args(spec, prompt, duration, aspect, seed)
+    try:
+        model_args = _build_video_args(spec, prompt, duration, aspect, seed)
+    except ValueError as e:
+        print(f"[parallax fal] ERROR: {e}", file=sys.stderr)
+        return 2
 
     _emit(use_json, event="queued", model=spec.model_id, tier=spec.tier)
 

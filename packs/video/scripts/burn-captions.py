@@ -30,6 +30,8 @@ try:
     from packs.video.text_render import render_caption as _render_caption, list_styles as _list_styles
     _TEXT_RENDER_AVAILABLE = True
 except ImportError:
+    _render_caption = None  # type: ignore[assignment]
+    _list_styles = None  # type: ignore[assignment]
     _TEXT_RENDER_AVAILABLE = False
 
 # Social safe zones — match generate-caption.py
