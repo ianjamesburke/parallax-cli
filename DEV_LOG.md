@@ -2,6 +2,24 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [FIX] Six-bug session: inline image previews, motion routing, compose logging, fal types
+
+**P1/P4 — parallax_create and make_storyboard tool results never showed inline previews.** Root cause: `_stream_parallax_subprocess` returned a plain string; the tool_result broadcast had no image payload; `appendToolResult` in the UI only rendered text. Fix: `_stream_parallax_subprocess` now accepts an optional `_collected` dict and accumulates `still_generated` event paths into it. `tool_parallax_create` returns a dict `{summary, still_paths}`. The executor embeds each still as a base64 image block for the model AND computes workspace-relative paths for the UI. The `tool_result` broadcast now carries `images: [rel_path, ...]`. `appendToolResult` in `app.js` renders an image strip below the summary. `make_storyboard` does the same for its output PNG. CSS strip styles added.
+
+**P2 — Agent reconstructed filenames from memory instead of tool_result paths.** Added rule to `head_of_production_prompt.md`: always use exact paths from the most recent tool_result — never reconstruct filenames from reasoning. This is enforced only by prompt; the inline image fix (P1) also removes the incentive by making the paths visually obvious in the UI.
+
+**P3 — Agent auto-routed motion verbs to Ken Burns without offering AI video.** Added rule to HoP prompt: when user has an image AND uses a motion verb, always offer two explicit options (Ken Burns free vs fal i2v ~$0.02) and ask before proceeding. Registered `parallax_fal_video` in TOOL_SCHEMAS with executor wired to `parallax fal video <tier> --image`.
+
+**P5 — Compose run log had one line despite 21s run.** `cmd_compose` had `setup_run_logging` called but no `log.info` entries for normal progress — only fail paths called `log=log`. Added log entries at: start, manifest loaded, per-scene start/done (still and video), assembly start, mux start, complete.
+
+**P6 — Pyright type errors in fal wrapper.** `client.py`: `str(image_path)` → `Path(image_path)` for `upload_file` PathLike param. `cli.py`: `end_frame_flag` None guard changed to `is not None` with explicit `str()` cast before `Path()`.
+
+**Breaks if:**
+- `parallax_create` tool result in the chat pane shows no inline images after a successful generation (P1).
+- `make_storyboard` tool result in the chat pane shows no contact-sheet image (P4).
+- HoP agent responds to "can you animate this?" with an immediate Ken Burns compose rather than offering both options (P3).
+- `parallax compose` run log has only "run logging started" with no stage entries (P5).
+
 ## 2026-04-16 — [CHANGED] fal video i2v: image-to-video, start/end-frame anchoring, audio flag
 
 Extended the fal.ai video generation surface with image-to-video (i2v) support across all three tiers. Passing `--image PATH` to `parallax fal video` now routes to the i2v endpoint; without it the existing t2v path is unchanged.
