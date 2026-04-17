@@ -2,6 +2,18 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [FIX] Three caption/text_render bugs — static caption burn, block_background wrap, stroke width
+
+Three bugs fixed in one pass:
+
+1. `captions.text` silently ignored when no `vo_manifest.json` exists. Root cause: compose only entered the caption branch when `vo_manifest_path_full` was present. Added an `elif` static-caption path: renders one PNG via `render_caption()`, overlays for full video duration with `between(t,0,<dur>)`. No new CLI flags — manifest drives it.
+
+2. `_render_block_background` laid all words on a single row, clipping at 4+ words. Added a greedy row packer: words accumulate on a row until the next would exceed `w - 2*safe_margin`, then a new row starts. Each row is independently centered. `FORWARD` drops to row 2 on a 5-word headline.
+
+3. Stroke width on `outline_white_on_black` and `outline_black_on_white` was `max(3, int(4*w/1080))` — visibly thin at 1080px. Bumped to `max(3, int(6*w/1080))` for both styles.
+
+**Breaks if:** `parallax compose` on a manifest with `captions.enabled: true` and `captions.text` set but no VO produces a video with no visible caption text; or a 5-word `block_background` headline overflows the frame edge; or outline-style text appears with a thin/barely-visible stroke.
+
 ## 2026-04-17 — [FIX] fal video `--aspect` now wired correctly for all tiers
 
 Root cause was two-fold: (1) the low tier used model ID `fal-ai/ltx-video` which accepts no dimension params at all — silently produced 768x512 (3:2 landscape) regardless of `--aspect`. Fixed by upgrading to `fal-ai/ltx-2.3/text-to-video` which supports `aspect_ratio` + `resolution` params. (2) The `_build_video_args` builder was passing `width`/`height` for LTX instead of `aspect_ratio`/`resolution`. Wan and Kling were already passing `aspect_ratio` correctly.

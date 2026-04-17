@@ -29,7 +29,7 @@ _FONTS_DIR = _REPO_ROOT / "assets" / "fonts"
 _SAFE_BOTTOM_FRAC = 0.333   # ~640px on 1920h
 
 # Padding used in block_background style (px at 1080px wide; scales with width)
-_BLOCK_PAD_BASE = 12
+_BLOCK_PAD_BASE = 20
 _BLOCK_PAD_REF_W = 1080
 
 
@@ -78,10 +78,10 @@ class _StyleSpec:
 # ---------------------------------------------------------------------------
 
 def _render_outline_black_on_white(text: str, video_size: tuple[int, int]) -> Image.Image:
-    """Black text, white stroke, Inter SemiBold, bottom-center, 72pt."""
+    """Black text, white stroke, Inter SemiBold, bottom-center, 96pt."""
     w, h = video_size
-    pt = _pt_to_px(72, w)
-    stroke_w = max(3, int(4 * w / 1080))
+    pt = _pt_to_px(96, w)
+    stroke_w = max(3, int(6 * w / 1080))
 
     font = _load_font("Inter-SemiBold.ttf", pt)
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -108,7 +108,7 @@ def _render_outline_white_on_black(text: str, video_size: tuple[int, int]) -> Im
     """White text, black stroke, Inter SemiBold, bottom-center, 72pt."""
     w, h = video_size
     pt = _pt_to_px(72, w)
-    stroke_w = max(3, int(4 * w / 1080))
+    stroke_w = max(3, int(6 * w / 1080))
 
     font = _load_font("Inter-SemiBold.ttf", pt)
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -143,7 +143,7 @@ def _render_block_background(text: str, video_size: tuple[int, int]) -> Image.Im
     pt = _pt_to_px(84, w)
     pad = max(8, int(_BLOCK_PAD_BASE * w / _BLOCK_PAD_REF_W))
     gap = max(4, int(8 * w / _BLOCK_PAD_REF_W))
-    bg_color = (0, 0, 0, 230)   # near-opaque black
+    bg_color = (220, 20, 180, 240)   # vivid magenta — punches against both dark and light regions
 
     font = _load_font("Anton-Regular.ttf", pt)
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -161,32 +161,54 @@ def _render_block_background(text: str, video_size: tuple[int, int]) -> Image.Im
         th = int(bbox[3] - bbox[1])
         blocks.append((word, tw, th))
 
-    # Total row width
     block_h = max(th for _, _, th in blocks) + pad * 2
-    total_w = sum(tw + pad * 2 for _, tw, _ in blocks) + gap * (len(blocks) - 1)
+    safe_margin = pad
+    max_row_w = w - 2 * safe_margin
 
-    # Center horizontally; position at top-center safe zone (~20% from top)
-    start_x = (w - total_w) // 2
+    # Greedy row packer: wrap to a new row when adding the next word would exceed max_row_w.
+    rows: list[list[tuple[str, int, int]]] = []
+    current_row: list[tuple[str, int, int]] = []
+    current_row_w = 0
+    for word_data in blocks:
+        _, tw, _ = word_data
+        word_slot_w = tw + pad * 2
+        needed = current_row_w + word_slot_w + (gap if current_row else 0)
+        if current_row and needed > max_row_w:
+            rows.append(current_row)
+            current_row = [word_data]
+            current_row_w = word_slot_w
+        else:
+            current_row.append(word_data)
+            current_row_w = current_row_w + (gap if len(current_row) > 1 else 0) + word_slot_w
+    if current_row:
+        rows.append(current_row)
+
+    # Position starting at top-center safe zone (~20% from top)
+    row_gap = pad
     y_top = int(h * 0.20)
 
-    x = start_x
-    for word, tw, th in blocks:
-        rect_x0 = x
-        rect_y0 = y_top
-        rect_x1 = x + tw + pad * 2
-        rect_y1 = y_top + block_h
+    y = y_top
+    for row in rows:
+        row_total_w = sum(tw + pad * 2 for _, tw, _ in row) + gap * (len(row) - 1)
+        x = (w - row_total_w) // 2
+        for word, tw, th in row:
+            rect_x0 = x
+            rect_y0 = y
+            rect_x1 = x + tw + pad * 2
+            rect_y1 = y + block_h
 
-        draw.rectangle([rect_x0, rect_y0, rect_x1, rect_y1], fill=bg_color)
+            draw.rectangle([rect_x0, rect_y0, rect_x1, rect_y1], fill=bg_color)
 
-        # Text inside the block — baseline-align vertically
-        bbox = draw.textbbox((0, 0), word, font=font)
-        text_offset_y = (block_h - (bbox[3] - bbox[1])) // 2 - bbox[1]
-        draw.text(
-            (rect_x0 + pad - bbox[0], rect_y0 + text_offset_y),
-            word, font=font,
-            fill=(255, 255, 255, 255),
-        )
-        x += tw + pad * 2 + gap
+            # Text inside the block — baseline-align vertically
+            bbox = draw.textbbox((0, 0), word, font=font)
+            text_offset_y = (block_h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            draw.text(
+                (rect_x0 + pad - bbox[0], rect_y0 + text_offset_y),
+                word, font=font,
+                fill=(255, 255, 255, 255),
+            )
+            x += tw + pad * 2 + gap
+        y += block_h + row_gap
 
     return img
 

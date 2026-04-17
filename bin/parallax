@@ -2045,6 +2045,53 @@ def cmd_compose(args) -> int:
             else:
                 print(f"[parallax] WARNING: burn-captions.py not found, skipping captions",
                       file=sys.stderr)
+        elif captions_enabled and captions_cfg.get("text"):
+            # Static-caption path: no vo_manifest, but captions.text is set.
+            # Render one PNG and overlay it for the full video duration.
+            static_text = captions_cfg["text"]
+            caption_style = captions_cfg.get("style", "outline_white_on_black")
+            print(f"[parallax] burning static caption (style={caption_style})...", end=" ", flush=True)
+            try:
+                from packs.video.text_render import render_caption as _render_caption
+                caption_png = _render_caption(static_text, caption_style, (res_w, res_h))
+                # Get video duration for the enable expression
+                try:
+                    dur_probe = _sp.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    vid_dur = float(dur_probe.stdout.strip()) if dur_probe.returncode == 0 else 9999
+                except Exception:
+                    vid_dur = 9999
+                static_captioned = output_dir / f"{concept_id}_v{version}_captioned.mp4"
+                ov_result = _sp.run(
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                     "-i", str(output_path),
+                     "-i", str(caption_png),
+                     "-filter_complex",
+                     f"[0:v][1:v]overlay=0:0:enable='between(t,0,{vid_dur:.3f})'[outv]",
+                     "-map", "[outv]", "-map", "0:a?",
+                     "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                     "-c:a", "copy",
+                     str(static_captioned)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if ov_result.returncode != 0:
+                    print(f"FAILED\n{ov_result.stderr[-500:]}", file=sys.stderr)
+                    emitter.emit("error", message="static caption overlay failed",
+                                 where="cmd_compose.static_caption")
+                else:
+                    print("done")
+                    static_captioned.replace(output_path)
+                    emitter.emit("captions_burned", output_path=str(output_path), mode="static")
+                try:
+                    caption_png.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"ERROR burning static caption: {e}", file=sys.stderr)
+                emitter.emit("error", message=str(e), where="cmd_compose.static_caption")
 
         emitter.emit("assembly_complete", output_path=str(output_path))
 
