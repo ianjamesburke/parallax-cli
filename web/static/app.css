@@ -701,6 +701,23 @@ body {
   overflow: hidden;
 }
 
+.tool-image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.tool-inline-img {
+  max-width: 180px;
+  max-height: 240px;
+  border-radius: 4px;
+  object-fit: cover;
+  cursor: pointer;
+}
+.tool-inline-img:hover {
+  opacity: 0.85;
+}
+
 .dispatch-strip {
   align-self: stretch;
   display: flex;

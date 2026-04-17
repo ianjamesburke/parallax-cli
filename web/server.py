@@ -1058,6 +1058,7 @@ def _stream_parallax_subprocess(
     cmd: list[str],
     stdin_payload: Optional[str],
     label: str,
+    _collected: Optional[dict] = None,
 ) -> str:
     telemetry.record_event(session.id, "dispatch_start", {"cmd": " ".join(cmd[:3]), "label": label[:200]})
     session.broadcast("dispatch_event", {"phase": "starting", "text": label})
@@ -1118,6 +1119,9 @@ def _stream_parallax_subprocess(
                 path = evt.get("output_path") or evt.get("path")
                 if isinstance(path, str) and path:
                     last_output_path = path
+                if evt.get("type") == "still_generated" and isinstance(path, str) and path:
+                    if _collected is not None:
+                        _collected.setdefault("still_paths", []).append(path)
                 if evt.get("type") == "error":
                     last_error = evt.get("message") or evt.get("error") or ""
     except Exception as e:
@@ -1169,10 +1173,11 @@ def tool_parallax_create(
     count: int = 1,
     aspect_ratio: str = "3:4",
     ref: Optional[list] = None,
-) -> str:
+) -> dict:
+    """Returns {"summary": str, "still_paths": [absolute_path, ...]}"""
     bin_path = _find_parallax_bin()
     if bin_path is None:
-        return "parallax CLI binary not found on PATH"
+        return {"summary": "parallax CLI binary not found on PATH", "still_paths": []}
     if not ref and session.selected_refs:
         ref = list(session.selected_refs)
     resolved_refs = []
@@ -1181,9 +1186,9 @@ def tool_parallax_create(
             try:
                 p = _resolve_project_path(r, workspace=session.workspace, read_fallback=True)
             except PathError as e:
-                return f"invalid ref path {r!r}: {e}"
+                return {"summary": f"invalid ref path {r!r}: {e}", "still_paths": []}
             if not p.exists():
-                return f"ref image not found: {r}"
+                return {"summary": f"ref image not found: {r}", "still_paths": []}
             resolved_refs.append(str(p))
     spec = {"brief": brief, "count": count, "aspect_ratio": aspect_ratio}
     if resolved_refs:
@@ -1191,7 +1196,9 @@ def tool_parallax_create(
     cmd = [bin_path, "create", "--stdin", "--json"]
     ref_label = f", refs={len(resolved_refs)}" if resolved_refs else ""
     label = f"create: {brief[:100]} (count={count}, aspect={aspect_ratio}{ref_label})"
-    return _stream_parallax_subprocess(session, cmd, json.dumps(spec), label)
+    collected: dict = {}
+    summary = _stream_parallax_subprocess(session, cmd, json.dumps(spec), label, _collected=collected)
+    return {"summary": summary, "still_paths": collected.get("still_paths", [])}
 
 
 def tool_parallax_compose(session: Session) -> str:
@@ -2034,6 +2041,10 @@ def _execute_tool_calls(
             {"role": "tool_call", "name": name, "input": args},
         )
 
+        # Per-tool state populated by branches below; used when building tool_result broadcast.
+        images_rel: list[str] = []
+        _storyboard_rel_path: Optional[str] = None
+
         try:
             if name == "list_dir":
                 out = tool_list_dir(args.get("path", "."), workspace=session.workspace)
@@ -2108,6 +2119,11 @@ def _execute_tool_calls(
                                         {"type": "text", "text": f"storyboard of {raw_path} ({max_img} images max)"},
                                     ]
                                     summary = f"storyboard: {out_path.name}"
+                                    # Expose workspace-relative path so UI can render inline.
+                                    try:
+                                        _storyboard_rel_path = str(out_path.relative_to(session.workspace))
+                                    except ValueError:
+                                        pass  # storyboard outside workspace — skip preview
                                 except Exception as e:
                                     msg = f"could not read storyboard output: {e}"
                                     content_block = [{"type": "text", "text": msg}]
@@ -2118,13 +2134,36 @@ def _execute_tool_calls(
                 aspect = args.get("aspect_ratio") or "3:4"
                 ref = args.get("ref")
                 if not isinstance(brief, str) or not brief.strip():
-                    text = "error: brief is required and must be a non-empty string"
+                    result_text = "error: brief is required and must be a non-empty string"
+                    result_paths: list[str] = []
                 else:
-                    text = tool_parallax_create(
+                    create_result = tool_parallax_create(
                         session, brief=brief, count=count, aspect_ratio=aspect, ref=ref,
                     )
-                content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                    result_text = create_result["summary"]
+                    result_paths = create_result["still_paths"]
+                # Build the model-facing content block: text summary + each still as an image.
+                content_block = [{"type": "text", "text": result_text}]
+                for still_abs in result_paths:
+                    try:
+                        raw = Path(still_abs).read_bytes()
+                        b64 = base64.standard_b64encode(raw).decode("ascii")
+                        content_block.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+                        })
+                    except Exception as img_err:
+                        print(f"parallax_create: could not embed still {still_abs}: {img_err}",
+                              file=sys.stderr, flush=True)
+                summary = result_text[:200]
+                # Convert absolute paths → workspace-relative for the UI media endpoint.
+                images_rel: list[str] = []
+                for still_abs in result_paths:
+                    try:
+                        rel = str(Path(still_abs).relative_to(session.workspace))
+                        images_rel.append(rel)
+                    except ValueError:
+                        pass
             elif name == "parallax_compose":
                 text = tool_parallax_compose(session)
                 content_block = [{"type": "text", "text": text}]
@@ -2245,12 +2284,19 @@ def _execute_tool_calls(
             content_block = [{"type": "text", "text": text}]
             summary = text
 
-        session.broadcast(
-            "tool_result", {"id": tool_id, "name": name, "summary": summary}
-        )
-        session.push_display(
-            "tool_result", {"id": tool_id, "name": name, "summary": summary}
-        )
+        # Attach inline image paths for tools that produce visuals.
+        _tool_images: list[str] = []
+        if name == "parallax_create":
+            _tool_images = images_rel
+        elif name == "make_storyboard" and _storyboard_rel_path:
+            _tool_images = [_storyboard_rel_path]
+
+        _tr_payload: dict = {"id": tool_id, "name": name, "summary": summary}
+        if _tool_images:
+            _tr_payload["images"] = _tool_images
+
+        session.broadcast("tool_result", _tr_payload)
+        session.push_display("tool_result", _tr_payload)
         telemetry.record_event(
             session.id,
             "tool_result",

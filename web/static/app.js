@@ -157,6 +157,21 @@ function appendToolResult(ev) {
     summary.className = "tool-summary";
     summary.textContent = ev.summary || "(no result)";
     card.appendChild(summary);
+    // Render inline previews for tools that return image paths.
+    const images = ev.images;
+    if (Array.isArray(images) && images.length > 0) {
+      const strip = document.createElement("div");
+      strip.className = "tool-image-strip";
+      for (const rel of images) {
+        const img = document.createElement("img");
+        img.className = "tool-inline-img";
+        img.src = `/media/${rel}`;
+        img.alt = rel.split("/").pop() || rel;
+        img.loading = "lazy";
+        strip.appendChild(img);
+      }
+      card.appendChild(strip);
+    }
   }
   scrollToBottom();
 }
