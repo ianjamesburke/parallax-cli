@@ -2,6 +2,26 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [FIX] Five bugs: trim alias, whisperx preflight, audio upload, fit:cover, resolution
+
+**Fix 1 — trim_start/trim_end silent drop:** Agents repeatedly write `trim_start`/`trim_end` in manifests but the compose pipeline only reads `start_s`/`end_s`. Root cause: no alias normalization at load time. Added `normalize_scenes_in_manifest()` in `manifest_schema.py` that maps aliases at load time with a WARNING, then rejects any remaining unknown field with a hard ERROR and the full known-fields list. Alias map: `trim_start→start_s`, `trim_end→end_s`, `start→start_s`, `end→end_s`. Known fields: action, base_scene, duration, end_s, estimated_duration_s, filter, fit, index, motion, overlay_text, rotate, source, start_s, starting_frame, still, still_path, text_overlay, type, video_clip, vo_text, voiceover_text.
+
+**Fix 2 — whisperx preflight:** `cmd_voiceover` called ElevenLabs first, then tried `import whisperx` — user paid for credits then got `ModuleNotFoundError`. New `_require_whisperx()` helper checks importability at the top of `cmd_voiceover` before any API call. Exits 2 with `ERROR: whisperx not installed. Run: uv pip install whisperx`. Skipped in TEST_MODE and when `--no-transcribe` is passed.
+
+**Fix 3 — audio file upload:** `/api/upload` silently routed audio files to `input/` but the manifest convention is `audio/<file>` for `voiceover.audio_file`. Now `.mp3/.wav/.m4a/.aac/.ogg/.flac` route to `workspace/audio/`. compose already resolves `voiceover.audio_file` relative to `cwd` — no compose change needed.
+
+**Fix 4 — fit: cover for video scenes:** compose always letterboxed/pillarboxed (contain). New optional scene field `fit: cover | contain` (default `contain` for backward compat). Cover uses `force_original_aspect_ratio=increase,crop=W:H` — scale up so shorter dim fills output, then crop center. Verified: 1920x1080 source → 1080x1920 output with `fit: cover` shows no black bars.
+
+**Fix 5 — config.resolution honored:** `cmd_compose` read only `output_resolution` and fell back to `1080x1920`, ignoring `config.resolution` entirely. Priority is now: `config.resolution > output_resolution > 1080x1920`. Malformed WxH strings fail fast. Verified: `config.resolution: 1920x1080` → output is 1920x1080.
+
+**Breaks if:**
+- A manifest scene with `trim_start: 5` loaded via `load_manifest()` does not print a WARNING to stderr and the key is not renamed `start_s` in the returned dict.
+- A manifest scene with `mystery_field: foo` loaded via `load_manifest()` does not exit 1 with "unknown scene field(s)".
+- `parallax voiceover` (without TEST_MODE, whisperx absent) makes an ElevenLabs API call before printing the install error.
+- Audio file upload (mp3/wav/m4a) lands in `input/` instead of `audio/`.
+- A video scene with `fit: cover` produces black bars in the output (letterbox instead of crop-fill).
+- `config.resolution: 1920x1080` in manifest produces a portrait 1080x1920 output.
+
 ## 2026-04-17 — [CHANGED] Async video thumbnail generation + caching
 
 New `GET /thumb?path=<rel>` endpoint on the web server generates a JPEG poster frame for any workspace-relative video path. First request spawns ffmpeg in a threadpool (`run_in_executor`) — cache miss runs in ~155ms for a typical 6s clip. Subsequent requests serve from `.parallax/thumbs/<sha1>.jpg` (sub-millisecond). Cache key = sha1(absolute_path + mtime), so any file modification busts the cache automatically.
