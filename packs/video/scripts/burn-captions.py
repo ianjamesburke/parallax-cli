@@ -16,12 +16,21 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from manifest_schema import load_manifest
+
+# text_render lives in packs/video/ (two levels up from scripts/)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+try:
+    from packs.video.text_render import render_caption as _render_caption, list_styles as _list_styles
+    _TEXT_RENDER_AVAILABLE = True
+except ImportError:
+    _TEXT_RENDER_AVAILABLE = False
 
 # Social safe zones — match generate-caption.py
 SAFE_BOTTOM = 640   # px from bottom where caption baseline sits
@@ -328,6 +337,102 @@ def burn(
     print(f"  Captions burned: {output_path} ({size_mb:.1f}MB)")
 
 
+def burn_pil(
+    video_path: str,
+    words: list[dict],
+    output_path: str,
+    words_per_chunk: int | None,
+    style: str,
+):
+    """PIL-based caption burn path.
+
+    Renders one transparent PNG per caption chunk via text_render, then chains
+    them as ffmpeg overlay inputs with enable= time windows. No drawtext, no
+    libfreetype dependency, no shell-escape hell.
+    """
+    if not _TEXT_RENDER_AVAILABLE:
+        raise RuntimeError(
+            "[burn-captions] text_render module not importable — "
+            "cannot use PIL caption style. Check packs/video/text_render.py."
+        )
+
+    if not words:
+        print("ERROR: no word timestamps provided — cannot burn captions.", file=sys.stderr)
+        sys.exit(1)
+
+    if words_per_chunk is not None:
+        chunks = chunk_words(words, words_per_chunk)
+        print(f"  {len(words)} words → {len(chunks)} caption chunks ({words_per_chunk} words/chunk, legacy mode)")
+    else:
+        chunks = smart_chunk_words(words)
+        print(f"  {len(words)} words → {len(chunks)} caption chunks (smart per-word mode)")
+
+    # Clamp each chunk's end to the next chunk's start to prevent overlap
+    for i in range(len(chunks) - 1):
+        if chunks[i]["end"] > chunks[i + 1]["start"]:
+            chunks[i]["end"] = chunks[i + 1]["start"]
+
+    width, height = probe_resolution(video_path)
+    video_size = (width, height)
+
+    tmp_pngs: list[Path] = []
+    try:
+        # Render one PNG per chunk
+        for chunk in chunks:
+            try:
+                p = _render_caption(chunk["text"], style, video_size)
+                tmp_pngs.append(p)
+            except Exception as e:
+                raise RuntimeError(
+                    f"[burn-captions] PIL render failed for chunk '{chunk['text']}': {e}"
+                ) from e
+
+        # Build ffmpeg command: base video + N PNG inputs, chained overlay filters
+        # [0:v][1:v]overlay=0:0:enable='between(t,s,e)'[v1];
+        # [v1][2:v]overlay=0:0:enable='between(t,s,e)'[v2]; ...
+        cmd = [
+            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", video_path,
+        ]
+        for p in tmp_pngs:
+            cmd += ["-i", str(p)]
+
+        filter_parts = []
+        for i, (chunk, _png) in enumerate(zip(chunks, tmp_pngs)):
+            in_label = "[0:v]" if i == 0 else f"[pv{i}]"
+            out_label = f"[pv{i + 1}]"
+            start = round(chunk["start"], 3)
+            end = round(chunk["end"], 3)
+            filter_parts.append(
+                f"{in_label}[{i + 1}:v]overlay=0:0:enable='between(t,{start},{end})'{out_label}"
+            )
+
+        final_label = f"[pv{len(chunks)}]"
+        filter_complex = ";".join(filter_parts)
+
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", final_label, "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            output_path,
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"[burn-captions] ffmpeg overlay failed burning PIL captions onto {video_path}: {e}"
+            ) from e
+
+    finally:
+        for p in tmp_pngs:
+            p.unlink(missing_ok=True)
+
+    size_mb = Path(output_path).stat().st_size / 1024 / 1024
+    print(f"  Captions burned (PIL/{style}): {output_path} ({size_mb:.1f}MB)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Burn word-by-word captions onto assembled video")
     parser.add_argument("--manifest", required=True, help="Path to manifest.yaml")
@@ -349,6 +454,12 @@ def main():
                         help="Padding in pixels around text inside the block background (default: 12)")
     parser.add_argument("--safe-bottom", dest="safe_bottom", type=int, default=SAFE_BOTTOM,
                         help=f"Pixels from the bottom of the frame where captions sit (default: {SAFE_BOTTOM})")
+    parser.add_argument("--style", dest="pil_style", default=None,
+                        help=(
+                            "PIL caption style name from text_render.py "
+                            "(outline_white_on_black, outline_black_on_white, block_background). "
+                            "When set, overrides --block-bg and uses the PIL render path."
+                        ))
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -424,9 +535,21 @@ def main():
         print(f"  Caption style: block-bg (color={effective_block_color}, padding={effective_block_padding}px)")
 
     print(f"Burning captions onto: {video_path.name}")
-    burn(str(video_path), words, output_path, args.words_per_chunk,
-         block_bg=effective_block_bg, block_color=effective_block_color, block_padding=effective_block_padding,
-         safe_bottom=args.safe_bottom)
+
+    # Route to PIL-based burn when --style is a known text_render style
+    pil_style = args.pil_style
+    if pil_style is None and manifest.get("captions", {}).get("style"):
+        pil_style = manifest["captions"]["style"]
+
+    if pil_style and _TEXT_RENDER_AVAILABLE and pil_style in _list_styles():
+        print(f"  Caption render: PIL/{pil_style}")
+        burn_pil(str(video_path), words, output_path, args.words_per_chunk, style=pil_style)
+    else:
+        if pil_style and not _TEXT_RENDER_AVAILABLE:
+            print(f"  Warning: --style={pil_style} requested but text_render not available; falling back to drawtext", file=sys.stderr)
+        burn(str(video_path), words, output_path, args.words_per_chunk,
+             block_bg=effective_block_bg, block_color=effective_block_color, block_padding=effective_block_padding,
+             safe_bottom=args.safe_bottom)
     print(f"\nNext: open {output_path}")
 
 

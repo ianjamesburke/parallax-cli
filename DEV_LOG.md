@@ -2,6 +2,21 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [CHANGED] Replace ffmpeg drawtext with PIL transparent-PNG overlay system
+
+`drawtext` was causing two recurring failures: (1) font path lookup brittle on macOS (Homebrew ffmpeg-full required, stock ffmpeg missing libfreetype), and (2) shell-escape hell for quotes/punctuation in caption text causing silently wrong renders or hard crashes.
+
+New path: render RGBA transparent PNGs via `PIL.ImageDraw.text(stroke_width=N)` in `packs/video/text_render.py`, then overlay via `-filter_complex "[0:v][1:v]overlay=0:0:enable='between(t,s,e)'"`. Fonts bundled in `assets/fonts/` (Inter SemiBold, Anton Regular, DM Sans Medium — all OFL).
+
+Three styles registered: `outline_white_on_black` (white text/black stroke/Inter, bottom-center), `outline_black_on_white` (inverted), `block_background` (Anton, per-word solid black rectangles, top-center, 84pt). All verified by frame-sample against a test video.
+
+Wired into:
+- `burn-captions.py`: `--style <name>` triggers `burn_pil()` which chains N overlay inputs (one PNG per caption chunk) with time-windowed `enable=` expressions. Falls back to drawtext if style is not a PIL style.
+- `bin/parallax` headline path: uses `text_render.render_headline()` directly for PIL styles; falls back to `generate-caption.py` subprocess for legacy style names (`title`, `banner`).
+- `bin/parallax` caption path: reads `manifest.captions.style` (default `outline_white_on_black`) and passes `--style` to burn script.
+
+**Breaks if:** `burn-captions.py --style outline_white_on_black` exits non-zero or produces video with no captions visible; or `parallax compose` on a manifest with `captions.enabled: true, captions.style: outline_white_on_black` burns no caption text; or any caption text with apostrophes/commas crashes the render (the whole point of this change — PIL has no escape requirements).
+
 ## 2026-04-17 — [FIX] `parallax fal image --output` now honors caller-specified extension
 
 `packs/video/fal/client.py` previously overrode the caller's output suffix with the URL's extension — so `--output foo.png` silently wrote `foo.jpg` (fal serves Flux results as jpeg). This broke any automated flow whose manifest referenced the expected path. Now: if `output_path` has a suffix, save to that exact path; only infer from the URL when the caller omitted the suffix. Found during the e2e script-first test run.

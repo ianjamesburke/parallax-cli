@@ -1915,53 +1915,72 @@ def cmd_compose(args) -> int:
                 headline_end = None
 
             if headline_text:
-                gen_caption_script = BUNDLED_SCRIPTS / "generate-caption.py"
-                if not gen_caption_script.exists():
-                    print(f"[parallax] WARNING: generate-caption.py not found, skipping headline",
-                          file=sys.stderr)
-                else:
-                    headline_png = Path(tmpdir) / "headline.png"
-                    print(f"[parallax] rendering headline: {headline_text!r}...", end=" ", flush=True)
+                headline_png = Path(tmpdir) / "headline.png"
+                print(f"[parallax] rendering headline: {headline_text!r} (style={headline_style})...", end=" ", flush=True)
+                headline_rendered = False
+                try:
+                    # PIL-based render path: use text_render for the three bundled styles.
+                    # Falls back to generate-caption.py for legacy style names.
+                    import sys as _sys_inner
+                    _packs_dir = Path(__file__).parent.parent / "packs" / "video"
+                    if str(_packs_dir.parent.parent) not in _sys_inner.path:
+                        _sys_inner.path.insert(0, str(_packs_dir.parent.parent))
+                    from packs.video.text_render import render_headline as _render_headline, list_styles as _list_styles
+                    res_w, res_h = (int(x) for x in resolution.split("x"))
+                    if headline_style in _list_styles():
+                        png_path = _render_headline(headline_text, headline_style, (res_w, res_h))
+                        import shutil as _shutil
+                        _shutil.copy(str(png_path), str(headline_png))
+                        png_path.unlink(missing_ok=True)
+                        headline_rendered = True
+                    else:
+                        # Legacy generate-caption.py path for non-PIL styles
+                        gen_caption_script = BUNDLED_SCRIPTS / "generate-caption.py"
+                        if gen_caption_script.exists():
+                            gen_cmd = [sys.executable, str(gen_caption_script),
+                                 "--text", headline_text,
+                                 "--style", headline_style,
+                                 "--resolution", resolution,
+                                 "--output", str(headline_png)]
+                            if headline_position:
+                                gen_cmd += ["--position", headline_position]
+                            result = _sp.run(gen_cmd, capture_output=True, text=True, timeout=60)
+                            if result.returncode != 0:
+                                print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                            else:
+                                headline_rendered = True
+                        else:
+                            print(f"WARNING: generate-caption.py not found and style '{headline_style}' is not a PIL style, skipping", file=sys.stderr)
+                except Exception as e:
+                    print(f"ERROR rendering headline: {e}", file=sys.stderr)
+
+                if headline_rendered and headline_png.exists():
+                    print("done")
+                    # Burn the PNG over the video for the requested window
+                    with_headline = output_dir / f"{concept_id}_v{version}_headlined.mp4"
+                    enable_expr = f"between(t,{headline_start},{headline_end})" if headline_end is not None else f"gte(t,{headline_start})"
+                    print(f"[parallax] burning headline overlay...", end=" ", flush=True)
                     try:
-                        gen_cmd = [sys.executable, str(gen_caption_script),
-                             "--text", headline_text,
-                             "--style", headline_style,
-                             "--resolution", resolution,
-                             "--output", str(headline_png)]
-                        if headline_position:
-                            gen_cmd += ["--position", headline_position]
-                        result = _sp.run(
-                            gen_cmd,
-                            capture_output=True, text=True, timeout=60,
+                        ov_result = _sp.run(
+                            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                             "-i", str(output_path),
+                             "-i", str(headline_png),
+                             "-filter_complex",
+                             f"[0:v][1:v]overlay=0:0:enable='{enable_expr}'[outv]",
+                             "-map", "[outv]", "-map", "0:a?",
+                             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                             "-c:a", "copy",
+                             str(with_headline)],
+                            capture_output=True, text=True, timeout=300,
                         )
-                        if result.returncode != 0:
-                            print(f"FAILED\n{result.stderr[-500:]}", file=sys.stderr)
+                        if ov_result.returncode != 0:
+                            print(f"FAILED\n{ov_result.stderr[-500:]}", file=sys.stderr)
                         else:
                             print("done")
-                            # Burn the PNG over the video for the requested window
-                            with_headline = output_dir / f"{concept_id}_v{version}_headlined.mp4"
-                            enable_expr = f"between(t,{headline_start},{headline_end})" if headline_end is not None else f"gte(t,{headline_start})"
-                            print(f"[parallax] burning headline overlay...", end=" ", flush=True)
-                            ov_result = _sp.run(
-                                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                                 "-i", str(output_path),
-                                 "-i", str(headline_png),
-                                 "-filter_complex",
-                                 f"[0:v][1:v]overlay=0:0:enable='{enable_expr}'[outv]",
-                                 "-map", "[outv]", "-map", "0:a?",
-                                 "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                 "-c:a", "copy",
-                                 str(with_headline)],
-                                capture_output=True, text=True, timeout=300,
-                            )
-                            if ov_result.returncode != 0:
-                                print(f"FAILED\n{ov_result.stderr[-500:]}", file=sys.stderr)
-                            else:
-                                print("done")
-                                with_headline.replace(output_path)
-                                emitter.emit("headline_burned", text=headline_text)
+                            with_headline.replace(output_path)
+                            emitter.emit("headline_burned", text=headline_text)
                     except Exception as e:
-                        print(f"ERROR: {e}", file=sys.stderr)
+                        print(f"ERROR burning headline overlay: {e}", file=sys.stderr)
 
         # ── Caption burn ─────────────────────────────────────────────────────
         # If voiceover and vo_manifest both exist AND manifest.captions.enabled
@@ -1995,15 +2014,20 @@ def cmd_compose(args) -> int:
                 stub_path.write_text(_yaml.dump(stub_manifest))
 
                 captioned_path = output_dir / f"{concept_id}_v{version}_captioned.mp4"
-                print(f"[parallax] burning captions...", end=" ", flush=True)
+                # Resolve caption style: manifest.captions.style wins; default outline_white_on_black
+                caption_style = captions_cfg.get("style", "outline_white_on_black")
+                print(f"[parallax] burning captions (style={caption_style})...", end=" ", flush=True)
+                burn_cmd = [
+                    sys.executable, str(burn_script),
+                    "--manifest", str(stub_path),
+                    "--video", str(output_path),
+                    "--vo-manifest", str(vo_manifest_path_full),
+                    "--output", str(captioned_path),
+                    "--style", caption_style,
+                ]
                 try:
                     result = _sp.run(
-                        [sys.executable, str(burn_script),
-                         "--manifest", str(stub_path),
-                         "--video", str(output_path),
-                         "--vo-manifest", str(vo_manifest_path_full),
-                         "--output", str(captioned_path),
-                         "--block-bg"],
+                        burn_cmd,
                         capture_output=True, text=True, timeout=600,
                     )
                     if result.returncode != 0:
@@ -3605,14 +3629,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fal_video.add_argument(
         "tier", choices=["low", "medium", "high"],
-        help="quality/cost tier: low (LTX-Video $0.02), medium (Wan 2.1 $0.20), high (Kling 1.6 ~$0.056/s)",
+        help="quality/cost tier: low (LTX-2.3 $0.02), medium (Wan 2.1 $0.20), high (Kling 1.6 ~$0.056/s)",
     )
     p_fal_video.add_argument("--prompt", required=True, help="text prompt for video generation")
     p_fal_video.add_argument("--duration", type=int, default=5, metavar="SECONDS",
                              help="clip duration in seconds (default: 5)")
     p_fal_video.add_argument(
         "--aspect", default="9:16", choices=["9:16", "16:9", "1:1"],
-        help="output aspect ratio (default: 9:16)",
+        help=(
+            "output aspect ratio (default: 9:16). "
+            "low (LTX): 9:16, 16:9 only. "
+            "medium (Wan): 9:16, 16:9 only. "
+            "high (Kling): 9:16, 16:9, 1:1."
+        ),
     )
     p_fal_video.add_argument("--seed", type=int, default=None,
                              help="random seed for reproducibility")
