@@ -2976,6 +2976,122 @@ async def serve_project_file(rel_path: str, request: Request):
     )
 
 
+# ---------------------------------------------------------------------------
+# Thumbnail generation + caching
+# ---------------------------------------------------------------------------
+
+# 1×1 transparent GIF — served as fallback when ffmpeg fails
+_THUMB_FALLBACK_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!"
+    b"\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00"
+    b"\x00\x02\x02D\x01\x00;"
+)
+
+
+def _thumb_cache_path(video_path: Path) -> Path:
+    """Return the cache jpg path for *video_path*.
+
+    Key = sha1(absolute_path + str(mtime)) so any modification busts the cache.
+    """
+    try:
+        mtime = str(video_path.stat().st_mtime)
+    except OSError:
+        mtime = "0"
+    key = hashlib.sha1(f"{video_path.resolve()}\x00{mtime}".encode()).hexdigest()
+    thumb_dir = video_path.parent.parent / ".parallax" / "thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    return thumb_dir / f"{key}.jpg"
+
+
+def _generate_thumb_sync(video_path: Path, out_path: Path) -> bool:
+    """Run ffmpeg to extract a poster frame.  Returns True on success."""
+    import subprocess as _sp
+
+    # Probe duration so we can pick a sensible seek time.
+    seek_time = 1.0
+    try:
+        probe = _sp.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration",
+                "-of", "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        raw = probe.stdout.strip().split("\n")[0]
+        duration = float(raw) if raw and raw != "N/A" else 0.0
+        if duration > 0:
+            seek_time = min(1.0, duration / 10)
+        else:
+            seek_time = 0.0
+    except Exception as e:
+        server_log.log.warning(f"thumb: ffprobe failed for {video_path}: {e}")
+        seek_time = 0.0
+
+    try:
+        result = _sp.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(seek_time),
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "4",
+                str(out_path),
+            ],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode != 0:
+            server_log.log.warning(
+                f"thumb: ffmpeg exited {result.returncode} for {video_path}: "
+                f"{result.stderr[:200]}"
+            )
+            return False
+        return out_path.is_file()
+    except Exception as e:
+        server_log.log.warning(f"thumb: ffmpeg exception for {video_path}: {e}")
+        return False
+
+
+@app.get("/thumb")
+async def serve_thumb(request: Request, path: str = Query(...)):
+    """Return a JPEG poster-frame thumbnail for a workspace-relative video path.
+
+    First call triggers async ffmpeg generation + caches to .parallax/thumbs/.
+    Subsequent calls serve from cache (sub-100 ms).
+    Falls back to a 1×1 transparent GIF on ffmpeg failure so the UI never breaks.
+    """
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    try:
+        video_path = _resolve_project_path(path, workspace=workspace, read_fallback=True)
+    except PathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not video_path.is_file():
+        raise HTTPException(status_code=404, detail=f"not found: {path}")
+
+    try:
+        cache_path = _thumb_cache_path(video_path)
+    except Exception as e:
+        server_log.log.warning(f"thumb: cache path error for {path}: {e}")
+        return Response(content=_THUMB_FALLBACK_GIF, media_type="image/gif")
+
+    if not cache_path.is_file():
+        # Generate in threadpool so we don't block the asyncio event loop.
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(None, _generate_thumb_sync, video_path, cache_path)
+        if not ok:
+            return Response(content=_THUMB_FALLBACK_GIF, media_type="image/gif")
+
+    return FileResponse(
+        str(cache_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.get("/api/gallery")
 async def api_gallery(request: Request):
     _require_auth(request)

@@ -157,18 +157,30 @@ function appendToolResult(ev) {
     summary.className = "tool-summary";
     summary.textContent = ev.summary || "(no result)";
     card.appendChild(summary);
-    // Render inline previews for tools that return image paths.
+    // Render inline previews for tools that return image/video paths.
     const images = ev.images;
     if (Array.isArray(images) && images.length > 0) {
       const strip = document.createElement("div");
       strip.className = "tool-image-strip";
+      const VIDEO_EXTS = new Set(["mp4", "mov", "webm", "mkv", "m4v", "avi"]);
       for (const rel of images) {
-        const img = document.createElement("img");
-        img.className = "tool-inline-img";
-        img.src = `/media/${rel}`;
-        img.alt = rel.split("/").pop() || rel;
-        img.loading = "lazy";
-        strip.appendChild(img);
+        const ext = (rel.split(".").pop() || "").toLowerCase();
+        if (VIDEO_EXTS.has(ext)) {
+          const vid = document.createElement("video");
+          vid.className = "tool-inline-img";
+          vid.src = `/media/${rel}`;
+          vid.poster = `/thumb?path=${encodeURIComponent(rel)}`;
+          vid.controls = true;
+          vid.preload = "none";
+          strip.appendChild(vid);
+        } else {
+          const img = document.createElement("img");
+          img.className = "tool-inline-img";
+          img.src = `/media/${rel}`;
+          img.alt = rel.split("/").pop() || rel;
+          img.loading = "lazy";
+          strip.appendChild(img);
+        }
       }
       card.appendChild(strip);
     }
@@ -560,6 +572,7 @@ function renderGallery(data) {
       el.controls = true;
       el.src = expected;
       el.dataset.src = expected;
+      el.poster = `/thumb?path=${encodeURIComponent(active.path)}`;
       player.appendChild(el);
     }
     const currentVideo = player.querySelector("video");
@@ -596,7 +609,9 @@ function renderGallery(data) {
     for (const v of videos) {
       const item = document.createElement("div");
       item.className = "video-item" + (v.path === state.activeVideo ? " active" : "");
-      item.innerHTML = `<span class="video-item-icon">▶</span><span class="video-item-name">${escapeHtml(v.name)}</span>`;
+      item.dataset.path = v.path;
+      const thumbSrc = `/thumb?path=${encodeURIComponent(v.path)}`;
+      item.innerHTML = `<img class="video-item-thumb" src="${thumbSrc}" alt="" loading="lazy"><span class="video-item-name">${escapeHtml(v.name)}</span>`;
       const vDl = document.createElement("a");
       vDl.className = "video-item-download";
       vDl.title = "Download";
@@ -1251,6 +1266,7 @@ function initVersionSelect() {
       el.controls = true;
       el.src = expected;
       el.dataset.src = expected;
+      el.poster = `/thumb?path=${encodeURIComponent(path)}`;
       player.innerHTML = "";
       player.appendChild(el);
     }

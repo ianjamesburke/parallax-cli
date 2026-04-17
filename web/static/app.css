@@ -1005,6 +1005,14 @@ body {
   color: var(--fg);
 }
 .video-item-icon { color: var(--accent); }
+.video-item-thumb {
+  width: 40px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex-shrink: 0;
+  background: var(--bg-3);
+}
 .video-item-name {
   flex: 1;
   overflow: hidden;

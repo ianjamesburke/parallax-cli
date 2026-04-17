@@ -2,6 +2,16 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [CHANGED] Async video thumbnail generation + caching
+
+New `GET /thumb?path=<rel>` endpoint on the web server generates a JPEG poster frame for any workspace-relative video path. First request spawns ffmpeg in a threadpool (`run_in_executor`) — cache miss runs in ~155ms for a typical 6s clip. Subsequent requests serve from `.parallax/thumbs/<sha1>.jpg` (sub-millisecond). Cache key = sha1(absolute_path + mtime), so any file modification busts the cache automatically.
+
+Seek heuristic: `min(1.0s, duration/10)` via ffprobe. Falls back to `ss 0` if ffprobe fails. Handles videos with no audio stream (ffmpeg `-vframes 1` works regardless). On ffmpeg failure, returns a 1×1 transparent GIF so the UI never shows a broken image.
+
+Client changes: main player `<video>` element gets `poster=/thumb?path=...`, player swap code gets same, video-list items get a 40×28px thumbnail img replacing the ▶ icon. Tool results with video paths (mp4/mov/webm/mkv/m4v/avi) now render `<video controls preload=none poster=...>` instead of `<img>`.
+
+**Breaks if:** video items in the gallery sidebar show a broken-image icon instead of a thumbnail (endpoint not reachable or ffmpeg not on PATH); or the main player shows no poster frame before playback begins; or a `GET /thumb?path=...` request blocks the event loop visibly (would mean `run_in_executor` not working).
+
 ## 2026-04-16 — [FIX] Four cascade bugs: update nag, tool-result truncation, is_error, ingest --yes
 
 Root cause: the vibes1 session had `tool_parallax_ingest` passing `--yes` (not a valid flag for `parallax ingest`), causing argparse `rc=2`. The stderr was then truncated to 200 chars — which happened to be dominated by the update nag — so the agent never saw the argparse error and misread the failure as success.
