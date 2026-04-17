@@ -143,7 +143,7 @@ def _render_block_background(text: str, video_size: tuple[int, int]) -> Image.Im
     pt = _pt_to_px(84, w)
     pad = max(8, int(_BLOCK_PAD_BASE * w / _BLOCK_PAD_REF_W))
     gap = max(4, int(8 * w / _BLOCK_PAD_REF_W))
-    bg_color = (220, 20, 180, 240)   # vivid magenta — punches against both dark and light regions
+    bg_color = (0, 0, 0, 240)   # solid black with slight transparency
 
     font = _load_font("Anton-Regular.ttf", pt)
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
