@@ -2198,7 +2198,9 @@ def cmd_manifest_edit(args) -> int:
         manifest["scenes"] = scenes
 
     elif op == "set-voice":
-        # set-voice <name_or_id>
+        # set-voice <name_or_id_or_audio_file>
+        # If the value looks like an audio file path (ends in .mp3/.wav/.aiff etc.),
+        # also write voiceover.audio_file so compose can mux it without a separate step.
         if not args.values:
             print("[parallax] ERROR: set-voice needs a voice name or id", file=sys.stderr)
             return 1
@@ -2207,6 +2209,10 @@ def cmd_manifest_edit(args) -> int:
             "voice_name": voice_input,
             "voice_id": voice_input,
         }
+        # If it's an audio file path, wire it to the compose mux key as well
+        _audio_exts = (".mp3", ".wav", ".aiff", ".m4a", ".ogg", ".flac")
+        if any(voice_input.lower().endswith(ext) for ext in _audio_exts):
+            manifest.setdefault("voiceover", {})["audio_file"] = voice_input
 
     elif op == "enable-captions":
         manifest["captions"] = {"enabled": True}
@@ -2765,6 +2771,7 @@ def cmd_generate_voice(args: argparse.Namespace) -> int:
     TEST_MODE: writes a silent WAV stub of approximate duration.
     """
     import subprocess as _sp
+    import shutil as _shutil
 
     cwd = Path.cwd()
     sys.path.insert(0, str(REPO_ROOT))
@@ -2805,11 +2812,11 @@ def cmd_generate_voice(args: argparse.Namespace) -> int:
     # Determine whether to use macOS `say`
     use_say = (
         engine == "say"
-        or (test_mode and sys.platform == "darwin" and _sp.which("say"))
+        or (test_mode and sys.platform == "darwin" and _shutil.which("say"))
     )
 
     if use_say:
-        if sys.platform != "darwin" or not _sp.which("say"):
+        if sys.platform != "darwin" or not _shutil.which("say"):
             print(
                 "[parallax] WARNING: --engine say requires macOS with `say` installed; "
                 "falling back to silent stub.",
@@ -2916,6 +2923,37 @@ def cmd_generate_video(args: argparse.Namespace) -> int:
     print("      https://buymeacoffee.com/ianjamesbu8")
     print("")
     return 0
+
+
+def cmd_fal_video(args: argparse.Namespace) -> int:
+    """
+    Generate a video via fal.ai.
+
+    Dispatches to packs/video/fal/cli.py which holds all the real logic.
+    Kept thin here so bin/parallax stays readable.
+    Exit: 0=success, 1=API/download error, 2=invalid params.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    from packs.video.fal.cli import cmd_fal_video as _impl
+    return _impl(args)
+
+
+def cmd_fal_image(args: argparse.Namespace) -> int:
+    """
+    Generate an image via fal.ai.
+
+    Exit: 0=success, 1=API/download error, 2=invalid params.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    from packs.video.fal.cli import cmd_fal_image as _impl
+    return _impl(args)
+
+
+def cmd_fal_models(args: argparse.Namespace) -> int:
+    """List the fal.ai tier→model mapping."""
+    sys.path.insert(0, str(REPO_ROOT))
+    from packs.video.fal.cli import cmd_fal_models as _impl
+    return _impl(args)
 
 
 def cmd_script_write(args: argparse.Namespace) -> int:
@@ -3552,6 +3590,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the chat UI in TEST_MODE — mock LLM + image/video/voiceover calls, no API key required",
     )
     p_chat.set_defaults(func=cmd_chat)
+
+    # ── fal ───────────────────────────────────────────────────────────────────
+    p_fal = sub.add_parser(
+        "fal",
+        help="generate video/image via fal.ai (tier-based cost ladder: low/medium/high)",
+    )
+    fal_sub = p_fal.add_subparsers(dest="fal_cmd", required=True)
+
+    # fal video
+    p_fal_video = fal_sub.add_parser(
+        "video",
+        help="text-to-video generation (low=$0.02/clip, medium=$0.20/clip, high=~$0.056/sec)",
+    )
+    p_fal_video.add_argument(
+        "tier", choices=["low", "medium", "high"],
+        help="quality/cost tier: low (LTX-Video $0.02), medium (Wan 2.1 $0.20), high (Kling 1.6 ~$0.056/s)",
+    )
+    p_fal_video.add_argument("--prompt", required=True, help="text prompt for video generation")
+    p_fal_video.add_argument("--duration", type=int, default=5, metavar="SECONDS",
+                             help="clip duration in seconds (default: 5)")
+    p_fal_video.add_argument(
+        "--aspect", default="9:16", choices=["9:16", "16:9", "1:1"],
+        help="output aspect ratio (default: 9:16)",
+    )
+    p_fal_video.add_argument("--seed", type=int, default=None,
+                             help="random seed for reproducibility")
+    p_fal_video.add_argument("--output", metavar="PATH",
+                             help="output file path (default: ./parallax-out/<timestamp>-<tier>.mp4)")
+    p_fal_video.add_argument("--json", action="store_true",
+                             help="emit NDJSON progress events to stdout")
+    p_fal_video.set_defaults(func=cmd_fal_video)
+
+    # fal image
+    p_fal_image = fal_sub.add_parser(
+        "image",
+        help="text-to-image generation (low=FLUX schnell, medium=FLUX dev, high=FLUX pro)",
+    )
+    p_fal_image.add_argument(
+        "tier", choices=["low", "medium", "high"],
+        help="quality/cost tier: low (FLUX schnell ~$0.003), medium (FLUX dev ~$0.025), high (FLUX pro ~$0.05)",
+    )
+    p_fal_image.add_argument("--prompt", required=True, help="text prompt for image generation")
+    p_fal_image.add_argument(
+        "--aspect", default="9:16", choices=["9:16", "16:9", "1:1", "4:5"],
+        help="output aspect ratio (default: 9:16)",
+    )
+    p_fal_image.add_argument("--seed", type=int, default=None,
+                             help="random seed for reproducibility")
+    p_fal_image.add_argument("--output", metavar="PATH",
+                             help="output file path (default: ./parallax-out/<timestamp>-<tier>.png)")
+    p_fal_image.add_argument("--json", action="store_true",
+                             help="emit NDJSON progress events to stdout")
+    p_fal_image.set_defaults(func=cmd_fal_image)
+
+    # fal models
+    p_fal_models = fal_sub.add_parser("models", help="list tier→model mapping")
+    p_fal_models.add_argument("--json", action="store_true",
+                              help="emit NDJSON rows to stdout")
+    p_fal_models.set_defaults(func=cmd_fal_models)
 
     return parser
 

@@ -2,6 +2,56 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-17 — [FIX] `parallax fal image --output` now honors caller-specified extension
+
+`packs/video/fal/client.py` previously overrode the caller's output suffix with the URL's extension — so `--output foo.png` silently wrote `foo.jpg` (fal serves Flux results as jpeg). This broke any automated flow whose manifest referenced the expected path. Now: if `output_path` has a suffix, save to that exact path; only infer from the URL when the caller omitted the suffix. Found during the e2e script-first test run.
+
+**Breaks if:** `parallax fal image low --prompt X --output /tmp/x.png` produces `/tmp/x.jpg` instead of `/tmp/x.png`.
+
+## 2026-04-17 — [DECISION] E2E verification pass — three parallel agent-driven flows
+
+Ran three parallel Sonnet sub-agents each simulating a real-user flow end-to-end with low-tier paid APIs (~$0.05 total spend). All three produced valid 9:16 mp4 output.
+
+- **Product-first** (image → variants → video → VO + headline): surfaced bugs 1–3 below, all fixed in this session. Headline overlay "STAY HYDRATED." burned correctly over hero frame.
+- **Footage-edit** (mixed 1080×1920 + 1920×1080 clips → 9:16 test edit): horizontal clips correctly pillarboxed with black bars, not stretched. `compose`'s `scale + pad` filter handles orientation mixing cleanly.
+- **Script-first** (script → VO → stills → Ken Burns → captions): caption word "one day," fires at 9.033s matching the VO manifest. Ken Burns motion confirmed via pixel diff. Surfaced bug 4 (above).
+
+All three agents fell back to Option B (direct CLI) rather than driving the HoP agent via `parallax web`'s HTTP API. The tool layer is validated; **the HoP agent's ability to orchestrate these tools is NOT verified by this pass** — that's a separate test pass worth running.
+
+**Deferred issues from this run** (not fixed, candidates for .plexi/backlog or issues):
+- LTX-Video image-to-video ignores aspect flag (outputs 3:2 regardless).
+- No top-level `parallax captions` command — captions require hand-editing `captions.enabled: true` into the manifest.
+- `parallax ingest` uses a stub for Gemini Vision in TEST_MODE — real visual-description path unverified here.
+- `drawtext` missing from stock homebrew ffmpeg — caption/headline burn will fail on a clean machine.
+- WhisperX emits noisy `torchcodec` dylib warnings on every run.
+
+**Breaks if:** the next e2e pass reintroduces any of bugs 1–4 listed in adjacent entries.
+
+## 2026-04-17 — [FIX] Three bugs found in e2e product-ad run (image aspect, voice shutil, manifest mux key)
+
+**Bug 1 — Flux schnell image aspect ratio rejected by API.** `_ASPECT_TO_IMAGE_SIZE` in `packs/video/fal/models.py` mapped `"9:16"` → `"portrait_9_16"`, but fal.ai's Flux models only accept `"portrait_16_9"` for tall/portrait orientation. The enum names the aspect ratio of the short-edge/long-edge pair (landscape_16_9 = wide, portrait_16_9 = tall) — not WxH order. Fixed by changing the 9:16 key to `"portrait_16_9"`.
+
+**Bug 2 — `generate voice --engine say` crashes with `AttributeError: module 'subprocess' has no attribute 'which'`.** `cmd_generate_voice` imports `subprocess as _sp` then calls `_sp.which("say")` — but `subprocess` has no `which`; that's `shutil.which`. Added `import shutil as _shutil` and replaced both `_sp.which` calls with `_shutil.which`.
+
+**Bug 3 — `manifest set-voice <file>` doesn't wire to compose mux.** `set-voice` writes `manifest["voice"]["voice_name"]`; compose's audio-mux step reads `manifest["voiceover"]["audio_file"]` — different keys. The voiceover file is set but silently not muxed (compose runs without audio). Workaround: manually add `voiceover: {audio_file: ...}` to manifest.yaml. `set-voice` should either write to `voiceover.audio_file` or compose should read both key shapes.
+
+**Breaks if:** `parallax fal image low --aspect 9:16` returns a 422 aspect-ratio error (bug 1 regressed); `parallax generate voice --engine say "text"` exits with AttributeError (bug 2 regressed); compose run on a manifest with `voice.voice_name` set produces a video with no audio stream (bug 3 unfixed).
+
+## 2026-04-16 — [CHANGED] parallax fal — video/image generation subcommand group
+
+New `parallax fal video <tier>` and `parallax fal image <tier>` commands backed by fal.ai. Three-tier cost ladder for both media kinds:
+
+**Video:** low = `fal-ai/ltx-video` ($0.02/clip), medium = `fal-ai/wan-t2v` ($0.20/clip 480p), high = `fal-ai/kling-video/v1.6/standard/text-to-video` (~$0.056/sec).
+**Image (scaffold):** low = `fal-ai/flux/schnell` (~$0.003), medium = `fal-ai/flux/dev` (~$0.025), high = `fal-ai/flux-pro/v1.1` (~$0.05).
+
+Implementation lives in `packs/video/fal/` (models.py tier registry, client.py submit/poll/download, cli.py handlers). Wired into `bin/parallax` as `fal` subcommand group. `fal-client==0.13.2` added to pyproject.toml. TEST_MODE writes a 1s black mp4 (video) or blank PNG (image) via ffmpeg and emits fake NDJSON events — no API key required.
+
+**Live test (low tier):** `parallax fal video low --prompt "..." --duration 3 --aspect 9:16 --output /tmp/parallax-fal-live-low.mp4` → h264, 5.0s, 768×512, ~9 MB. Note: LTX-Video ignores `--duration` below its minimum (~5s); the param is passed through but the model clips it. Duration is respected by Kling (medium/high tiers).
+
+**Gotcha:** `fal_client.subscribe()` emits `Queued` status objects during polling — these don't carry `.logs`; the `_on_update` handler catches `AttributeError` and emits a generic "processing…" log instead. Don't add `.logs` attribute access outside the `InProgress` branch.
+
+**Breaks if:** `parallax fal models` exits non-zero or prints no rows; `TEST_MODE=1 parallax fal video low --prompt x` exits non-zero or fails to write an mp4 to `./parallax-out/`; `parallax fal video low --prompt x` (live) exits non-zero when FAL_KEY is set.
+
 ## 2026-04-16 — [CHANGED] Branch consolidation: beta → main, single-worktree state
 
 Wiped the multi-branch/multi-worktree setup. End state: one branch (`main`), one worktree, origin untouched.
