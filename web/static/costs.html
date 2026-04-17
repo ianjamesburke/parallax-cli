@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parallax — Cost Report</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <style>
+      /* Page-scoped layout on top of shared app.css palette */
+      body {
+        overflow-y: auto;
+      }
+      .costs-page {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 32px 28px 80px;
+      }
+      .costs-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        padding-bottom: 18px;
+        border-bottom: 1px solid var(--line);
+        margin-bottom: 24px;
+      }
+      .costs-header .brand-name {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .costs-header .brand-sub {
+        color: var(--fg-dim);
+        margin-left: 10px;
+        font-size: 13px;
+      }
+      .costs-header .back-link {
+        color: var(--fg-dim);
+        text-decoration: none;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+      .costs-header .back-link:hover {
+        color: var(--accent);
+      }
+
+      .fal-bar {
+        font-family: var(--mono);
+        font-size: 12px;
+        padding: 10px 14px;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        color: var(--fg-dim);
+        margin-bottom: 28px;
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .fal-bar .fal-label {
+        color: var(--fg-mute);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 10px;
+      }
+      .fal-bar .fal-value {
+        color: var(--fg);
+      }
+      .fal-bar.fal-ok .fal-value {
+        color: var(--ok);
+      }
+      .fal-bar.fal-err .fal-value {
+        color: var(--err);
+      }
+
+      .grand-total {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        padding: 14px 18px;
+        background: var(--bg-3);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        margin-bottom: 32px;
+      }
+      .grand-total .label {
+        font-family: var(--mono);
+        color: var(--fg-mute);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 11px;
+      }
+      .grand-total .amount {
+        font-family: var(--mono);
+        font-size: 24px;
+        color: var(--accent);
+        font-variant-numeric: tabular-nums;
+      }
+
+      section.cost-section {
+        margin-bottom: 36px;
+      }
+      section.cost-section > h2 {
+        font-size: 14px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--fg-dim);
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 8px;
+        margin: 0 0 14px;
+      }
+      section.cost-section .section-total {
+        float: right;
+        font-family: var(--mono);
+        color: var(--accent);
+        font-variant-numeric: tabular-nums;
+      }
+
+      table.cost-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: var(--mono);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      table.cost-table th,
+      table.cost-table td {
+        text-align: right;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      table.cost-table th:first-child,
+      table.cost-table td:first-child {
+        text-align: left;
+      }
+      table.cost-table thead th {
+        color: var(--fg-mute);
+        text-transform: uppercase;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        font-weight: 500;
+      }
+      table.cost-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+      table.cost-table td.num {
+        color: var(--fg);
+      }
+      table.cost-table td.cost {
+        color: var(--accent);
+      }
+      table.cost-table .empty {
+        color: var(--fg-mute);
+        font-style: italic;
+        text-align: center;
+        padding: 14px;
+      }
+
+      .sub-label {
+        font-family: var(--mono);
+        font-size: 10px;
+        color: var(--fg-mute);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin: 18px 0 6px;
+      }
+
+      .pricing-note {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--fg-mute);
+        margin-top: 8px;
+      }
+
+      .errors {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--err);
+        margin-top: 6px;
+      }
+
+      .loading {
+        font-family: var(--mono);
+        color: var(--fg-mute);
+        padding: 40px 0;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="costs-page">
+      <header class="costs-header">
+        <div>
+          <span class="brand-name">Parallax</span>
+          <span class="brand-sub">Cost Report</span>
+        </div>
+        <a href="/" class="back-link">&larr; back to chat</a>
+      </header>
+
+      <div id="fal-bar" class="fal-bar">
+        <span class="fal-label">Fal key</span>
+        <span class="fal-value">loading…</span>
+      </div>
+
+      <div class="grand-total">
+        <span class="label">Grand total</span>
+        <span class="amount" id="grand-total">—</span>
+      </div>
+
+      <div id="report-body">
+        <div class="loading">Loading cost report…</div>
+      </div>
+    </div>
+
+    <script>
+      const fmtUSD = (n) =>
+        "$" +
+        (Number(n) || 0).toLocaleString(undefined, {
+          minimumFractionDigits: 4,
+          maximumFractionDigits: 6,
+        });
+      const fmtInt = (n) => (Number(n) || 0).toLocaleString();
+
+      function renderFal(fal) {
+        const bar = document.getElementById("fal-bar");
+        const val = bar.querySelector(".fal-value");
+        bar.classList.remove("fal-ok", "fal-err");
+        if (!fal || !fal.configured) {
+          val.textContent = "not configured";
+          return;
+        }
+        if (fal.error) {
+          bar.classList.add("fal-err");
+          val.textContent = fal.error;
+          return;
+        }
+        bar.classList.add("fal-ok");
+        val.textContent = fal.identity || "configured";
+      }
+
+      function llmTable(llm) {
+        const rows = (llm.models || [])
+          .map(
+            (m) => `
+          <tr>
+            <td>${m.model || "unknown"}</td>
+            <td class="num">${fmtInt(m.input_tokens)}</td>
+            <td class="num">${fmtInt(m.output_tokens)}</td>
+            <td class="num">${fmtInt(m.session_count)}</td>
+            <td class="cost">${fmtUSD(m.cost_usd)}</td>
+          </tr>`,
+          )
+          .join("");
+        const tbody = rows
+          ? rows
+          : `<tr><td class="empty" colspan="5">no LLM activity recorded</td></tr>`;
+        let html = `
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Input tok</th>
+                <th>Output tok</th>
+                <th>Sessions</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>${tbody}</tbody>
+          </table>`;
+        if (llm.by_user && llm.by_user.length) {
+          const urows = llm.by_user
+            .map(
+              (u) => `
+            <tr>
+              <td>${u.user || "unknown"}</td>
+              <td class="num">${fmtInt(u.input_tokens)}</td>
+              <td class="num">${fmtInt(u.output_tokens)}</td>
+              <td class="num">${fmtInt(u.session_count)}</td>
+              <td class="cost">${fmtUSD(u.cost_usd)}</td>
+            </tr>`,
+            )
+            .join("");
+          html += `
+            <div class="sub-label">per user</div>
+            <table class="cost-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Input tok</th>
+                  <th>Output tok</th>
+                  <th>Sessions</th>
+                  <th>Cost</th>
+                </tr>
+              </thead>
+              <tbody>${urows}</tbody>
+            </table>`;
+        }
+        return html;
+      }
+
+      function imageTable(img) {
+        const html = `
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Images</th>
+                <th>Test-mode skipped</th>
+                <th>$/image</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>${img.model || "unknown"}</td>
+                <td class="num">${fmtInt(img.image_count)}</td>
+                <td class="num">${fmtInt(img.skipped_test_mode)}</td>
+                <td class="num">${fmtUSD(img.usd_per_image)}</td>
+                <td class="cost">${fmtUSD(img.total_cost_usd)}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="pricing-note">
+            Pricing constant is a placeholder. Verify against Gemini image
+            pricing before trusting this number.
+          </div>`;
+        return html;
+      }
+
+      function projectedTable(bucket, label) {
+        const entries = (bucket && bucket.entries) || [];
+        const total = bucket && bucket.total_cost_usd || 0;
+        if (!entries.length) {
+          return `
+            <div class="sub-label">${label} · ${fmtUSD(total)}</div>
+            <table class="cost-table">
+              <tbody>
+                <tr><td class="empty" colspan="5">no ${label} runs</td></tr>
+              </tbody>
+            </table>`;
+        }
+        const rows = entries
+          .map(
+            (e) => `
+          <tr>
+            <td>${e.provider || "?"}</td>
+            <td>${e.model || "?"}</td>
+            <td class="num">${fmtInt(e.call_count)}</td>
+            <td class="num">${fmtInt(e.quantity)} ${e.unit || ""}</td>
+            <td class="cost">${fmtUSD(e.usd)}</td>
+          </tr>`,
+          )
+          .join("");
+        return `
+          <div class="sub-label">${label} · ${fmtUSD(total)}</div>
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Calls</th>
+                <th>Units</th>
+                <th>Projected</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      }
+
+      function videoTable(video) {
+        const vo = video.voiceover || {};
+        const cp = video.compose || {};
+        return `
+          <div class="sub-label">voiceover (ElevenLabs)</div>
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th>Runs</th>
+                <th>Words</th>
+                <th>~Chars</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>voiceover</td>
+                <td class="num">${fmtInt(vo.count)}</td>
+                <td class="num">${fmtInt(vo.word_total)}</td>
+                <td class="num">${fmtInt(vo.char_estimate)}</td>
+                <td class="cost">${fmtUSD(vo.total_cost_usd)}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="sub-label">ken burns / compose</div>
+          <table class="cost-table">
+            <thead>
+              <tr>
+                <th>Step</th>
+                <th>Runs</th>
+                <th>Test-mode skipped</th>
+                <th>$/run</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>compose</td>
+                <td class="num">${fmtInt(cp.count)}</td>
+                <td class="num">${fmtInt(cp.skipped_test_mode)}</td>
+                <td class="num">${fmtUSD(cp.usd_per_run)}</td>
+                <td class="cost">${fmtUSD(cp.total_cost_usd)}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="pricing-note">
+            Voiceover charged per character. Words → chars uses a
+            ${fmtInt(vo.chars_per_word)}x estimate. Verify rates before billing.
+          </div>`;
+      }
+
+      async function load() {
+        const qs = new URLSearchParams(window.location.search);
+        const user = qs.get("user") || "";
+        const url = user
+          ? "/api/costs?user=" + encodeURIComponent(user)
+          : "/api/costs";
+        let report;
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error("http " + r.status);
+          report = await r.json();
+        } catch (e) {
+          document.getElementById("report-body").innerHTML =
+            '<div class="errors">failed to load /api/costs: ' +
+            String(e) +
+            "</div>";
+          return;
+        }
+
+        renderFal(report.fal);
+        document.getElementById("grand-total").textContent = fmtUSD(
+          report.grand_total_usd,
+        );
+
+        const body = document.getElementById("report-body");
+        const userLabel = report.user_filter
+          ? " (user: " + report.user_filter + ")"
+          : " (all users)";
+        const errsHtml =
+          report.errors && report.errors.length
+            ? '<div class="errors">errors: ' +
+              report.errors.join("; ") +
+              "</div>"
+            : "";
+        body.innerHTML = `
+          <section class="cost-section">
+            <h2>
+              LLM${userLabel}
+              <span class="section-total">${fmtUSD(
+                report.llm.total_cost_usd,
+              )}</span>
+            </h2>
+            ${llmTable(report.llm)}
+          </section>
+
+          <section class="cost-section">
+            <h2>
+              Image generation
+              <span class="section-total">${fmtUSD(
+                report.image.total_cost_usd,
+              )}</span>
+            </h2>
+            ${imageTable(report.image)}
+          </section>
+
+          <section class="cost-section">
+            <h2>
+              Video / voiceover
+              <span class="section-total">${fmtUSD(
+                report.video.total_cost_usd,
+              )}</span>
+            </h2>
+            ${videoTable(report.video)}
+          </section>
+
+          <section class="cost-section">
+            <h2>
+              Projected spend
+              <span class="section-total">${fmtUSD(
+                (report.projected?.real?.total_cost_usd || 0) +
+                (report.projected?.test_mode?.total_cost_usd || 0),
+              )}</span>
+            </h2>
+            <div class="pricing-note">
+              Fold of <code>cost_estimated</code> events emitted by
+              <code>core/instrumented.py</code> — every dispatch logs its
+              projected provider cost before running. TEST MODE runs show
+              "would have cost" so dry-runs double as a cost estimator.
+              Pricing from <code>core/pricing.py</code>.
+            </div>
+            ${projectedTable(report.projected?.real, "real runs")}
+            ${projectedTable(report.projected?.test_mode, "test mode")}
+          </section>
+
+          ${errsHtml}
+        `;
+      }
+
+      load();
+    </script>
+  </body>
+</html>

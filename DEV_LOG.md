@@ -38,6 +38,161 @@ Session `005933acd2…` looped on `read_image` returning "file does not exist" f
 **Systemic fix:** extracted `_safe_filename()` as the canonical sanitizer (ASCII alnum + `._-`; everything else → `_`) and added `_ensure_safe_name()` which renames unsafe files in place during `tool_list_dir` enumeration. Two choke points now enforce the invariant: HTTP upload (already sanitized — refactored to reuse the helper) and any directory listing the agent performs. Files with unsafe names literally cannot survive first contact with the agent. Rejected: fuzzy-matching fallback in `_resolve_project_path` — hides the problem instead of eliminating it, and two-way magic is worse than one-way renames.
 
 Documented as an invariant in `CLAUDE.md` so future file-producing paths route through `_safe_filename()` rather than reinventing.
+## 2026-04-15 — [CHANGED] web/server.py: Flask → FastAPI
+
+Replaced stdlib http.server with FastAPI + uvicorn. SSE streaming now uses sse-starlette
+EventSourceResponse (proper async, no manual write/flush). All request bodies are Pydantic
+models. Auto-generated OpenAPI docs available at /docs.
+
+**Breaks if:** `parallax web` fails to start, SSE stream from /api/stream/<id> stops
+delivering incremental tokens, or any existing frontend fetch call gets a 422
+instead of the expected response shape.
+
+## 2026-04-15 — [CHANGED] generate voice --engine say + Mode 2 e2e test
+
+Added macOS `say` as a first-class voice engine option. `parallax generate voice --engine say`
+calls `say -v <voice>` (free, offline, no API key) and converts AIFF→MP3 via ffmpeg.
+TEST_MODE on macOS now defaults to `say` when available — output is real speech, not silence.
+Falls back to silent stub on non-macOS or if `say` is missing.
+
+Mode 2 Ken Burns Draft e2e test added: `generate still` → `compose` → verify real MP4.
+This is the first test that exercises the full ffmpeg render path against TEST_MODE stills.
+
+**Breaks if:** `parallax generate voice --engine say "hello"` exits non-zero on macOS with ffmpeg
+installed, or if Mode 2 test fails because `compose` can't read the stub PNG from `generate still`.
+
+## 2026-04-15 — [CHANGED] V2 command surface added to beta (generate, script, ingest, web)
+
+Added all V2 command groups alongside existing V1 commands — no breakage, addition only.
+V1 commands (`run`, `create`, `animate`, `voiceover`, `transcribe`, `align`, `chat`) remain
+for backward compat; retirement in V3 when V2 is proven stable.
+
+New commands:
+- `generate still|voice|video` — V2 image/audio/video generation group. `still` delegates
+  to existing Gemini path (real mode) or creates a real solid-color PNG via ffmpeg (TEST_MODE).
+  `voice` adapts `cmd_voiceover`. `video` is a stub pointing to fal.ai (not yet built).
+- `script write|rewrite` — write/rewrite scripts via Claude. TEST_MODE returns a deterministic
+  seed-based placeholder so tests are fully offline.
+- `ingest <path>` — transcription + index for video files. `--estimate` dry-runs cost projection
+  (zero API calls). Full WhisperX bulk ingest deferred — single-file path still via `transcribe`.
+- `web` — alias for `chat`. V2 name per spec.
+- `project list` — alias for `projects`. V2 subcommand name.
+- `manifest validate` — new op added to existing manifest command. Validates sequential
+  scene numbers, positive durations, resolution format, fps whitelist, missing stills.
+
+TEST_MODE improvement: `generate still` now writes real PNG files (ffmpeg solid-color) instead
+of the V1 `b"TEST_PLACEHOLDER"` bytes. Downstream `compose` can now actually run on TEST_MODE
+stills without ffmpeg choking on invalid image data.
+
+Two V2 e2e tests added to `test/test_cli.py`:
+- Mode 1: `generate still` — verifies real PNG header + manifest creation.
+- Mode 3: `script write --out` — verifies structured script file written.
+
+**Breaks if:** `parallax generate still "brief"` exits non-zero in TEST_MODE, or `parallax script
+write "brief" --out f.txt` exits non-zero in TEST_MODE — these are now covered by CI.
+
+## 2026-04-14 — [DECISION] Instrumented logging + pricing table (beta)
+
+Every external provider call (Gemini image, ElevenLabs voiceover) now
+emits `request_intended` + `cost_estimated` events via `core/instrumented.py`
+before dispatching, reading rates from `core/pricing.py`. Real-mode and
+TEST_MODE emit the same shape, so TEST MODE doubles as a dry-run cost
+estimator and the costs page can fold projected spend alongside actual.
+
+**Why this shape:** parallax had ~100 scattered `TEST_MODE` branches and
+zero structured capture of what was being requested — neither real nor
+test runs were auditable. A provider-interface refactor is the right
+long-term move, but I scoped down to a two-function helper that the
+existing CLI can call from inline. Same observable events; no big-bang
+rewrite. The two helpers are deliberately tiny so they can be lifted
+into a `plexi_harness` package later without dragging parallax internals
+with them.
+
+**Rejected:** full `ImageGenerator`/`TTS` provider abstraction (too much
+for one session, regression-heavy), runtime pricing fetches (no provider
+publishes a stable identity/pricing endpoint, and a network call per
+dispatch is a latency bomb). `core/pricing.py` carries a `LAST_VERIFIED`
+date instead — update the file quarterly.
+
+## 2026-04-14 — [DECISION] beta layout: flatten `.parallax/` → `parallax/users/<user>/<project>/`
+
+Breaking path change on the `beta` branch. Hidden `.parallax/` at cwd
+root is gone; everything parallax-managed now lives at a visible
+`parallax/users/<user>/<project>/` nested workspace. Raw media at the
+launch dir root is shared across every user/project via a two-tier
+sandbox in `_resolve_project_path(read_fallback=True)`: writes target
+the per-user workspace, but relative reads fall through to PROJECT_DIR
+when the workspace-side path doesn't exist.
+
+**Why:** the old layout had three problems — the hidden dotdir was
+invisible to users browsing their projects, the per-user mode was
+gated on network-access/password flags (so local dev never triggered
+it), and raw uploaded media lived inside a specific project with no
+way to share across variations. The new layout makes the filesystem
+structure legible, always nests per-user, and lets the user drop raw
+files at the master dir once and reference them from any project.
+
+**Rejected:** writing a migrator from old to new layout (beta is a new
+branch, users still on main keep the old layout; a migrator would
+double the code paths we'd have to maintain), keeping `.parallax/` but
+adding a `users/` subdir (still hides the nested work from casual
+inspection). `~/.parallax/` paths in the user's HOME (events log,
+update cache, server registry) are unchanged — those are global,
+cross-project state and don't need the visibility fix.
+
+## 2026-04-14 — [FIX] Reference image prepend regression in /api/message
+
+`POST /api/message` used to prepend `[Reference images selected: ...]`
+to the user turn so Claude could see selected refs and pass them into
+`parallax_create(ref=[...])`. An earlier TEST MODE trigger edit in the
+same handler silently removed the block — the Edit call replaced the
+whole `session = get_or_create_session(...)` + prepend block with just
+the trigger check, and the prepend was lost. Result: refs went
+straight to the floor; Gemini got a text-only brief.
+
+**Root cause:** I wrote the Edit `old_string` / `new_string` too wide
+and didn't re-read the removed lines to verify what I was discarding.
+Restored the prepend AND went further — `Session.selected_refs` now
+persists per message, and `tool_parallax_create` auto-injects them
+into the `ref` arg whenever Claude forgets to set it explicitly.
+
+**What NOT to do next time:** on Edit calls that delete surrounding
+code as a side effect, grep for any feature tag in the removed region
+before running the tool. The regression would have been caught by a
+pre-edit `grep -n reference_images web/server.py`.
+
+## 2026-04-14 — [GOTCHA] Python pipe buffering + `PARALLAX_BIN` override for tests
+
+The baseline Playwright test hung for ~15 minutes on its first run
+because `parallax chat` spawns `python -m parallax_web` without `-u`
+and its `print("parallax-web: url = ...")` line sits in a 4KB stdout
+buffer forever when the parent pipes stdout. Fix: set
+`PYTHONUNBUFFERED=1` in the child env — `start_server()` in
+`test/playwright/_helpers.py` now does this by default.
+
+**Separately:** `shutil.which("parallax")` resolves to
+`~/.local/bin/parallax` which symlinks to the *main* worktree's
+`bin/parallax`. A test that launches a worktree's server ends up
+invoking main's CLI binary, so any CLI changes on a feature branch are
+silently bypassed. Added `PARALLAX_BIN` env var override to
+`_find_parallax_bin()` so tests can pin the binary, and the shared
+test helper sets it automatically.
+
+**What NOT to do next time:** trust `print()` to line-buffer on a
+piped subprocess, or trust PATH resolution inside a worktree.
+
+## 2026-04-14 — [CHANGED] Server registry at `~/.parallax/servers.json`
+
+`web/registry.py` records `{pid, cwd, host, port, user, started_at}`
+for every running parallax-web process at home-dir scope. Each server
+registers on startup and deregisters on normal exit / SIGINT / SIGTERM
+via `install_shutdown_hooks()`; readers auto-prune entries whose pid
+is dead. `GET /api/servers` exposes the live list.
+
+**Why home-dir, not project-dir:** the user wanted multi-server +
+cross-workspace discovery. A per-project file would only see one
+server at a time; a home-dir list spans every launch dir. Aligns with
+the existing `~/.parallax/events.jsonl` telemetry log.
 
 ## 2026-04-13 — [CHANGED] Web UI sidebar, update command, install bootstrap
 

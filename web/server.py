@@ -3,10 +3,10 @@ server.py — parallax-web: localhost HTTP + SSE chat server backed by
 the Anthropic SDK and a custom tool-use agent loop.
 
 Design:
-    - stdlib http.server for routing + SSE (no Flask/FastAPI)
+    - FastAPI + uvicorn for routing, SSE, and static files
     - `anthropic` SDK for the model, streaming via client.messages.stream(...)
     - One agent thread per session, fed from POST /api/message
-    - SSE fan-out via a per-session queue.Queue read by GET /api/stream/<id>
+    - SSE fan-out via sse-starlette EventSourceResponse + per-session queue.Queue
     - SQLite telemetry via telemetry.py
     - Gallery: stills/ and output/ + drafts/, mtime-sorted
 
@@ -16,27 +16,32 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import socket
-import socketserver
 import subprocess
-import tempfile
 import sys
 import threading
 import time
 import traceback
 import uuid
 import webbrowser
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from typing import Any, List, Optional
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 # Local package imports
 _HERE = Path(__file__).resolve().parent
@@ -44,20 +49,67 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import telemetry  # noqa: E402
+import costs  # noqa: E402
+import registry  # noqa: E402
+
+
+def _fal_whoami() -> dict:
+    """
+    Best-effort fetch of the fal account identity if FAL_KEY / FAL_API_KEY is
+    set on the server process. Returns a dict shaped like:
+        {"configured": bool, "identity": Optional[str], "error": Optional[str]}
+    Never raises — network errors, missing key, and bad JSON all collapse
+    to `configured=False` with an error string (when relevant).
+    """
+    key = os.environ.get("FAL_KEY") or os.environ.get("FAL_API_KEY")
+    if not key:
+        return {"configured": False, "identity": None, "error": None}
+
+    import urllib.request
+    import urllib.error
+
+    url = "https://rest.alpha.fal.ai/"  # TODO: verify fal identity route
+    req = urllib.request.Request(url, headers={"Authorization": f"Key {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            body = resp.read(4096)
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception:
+                data = None
+            identity = None
+            if isinstance(data, dict):
+                identity = (
+                    data.get("name")
+                    or data.get("email")
+                    or data.get("user")
+                    or data.get("id")
+                )
+            if not identity:
+                masked = key[:6] + "…" + key[-4:] if len(key) > 12 else "****"
+                identity = f"key {masked}"
+            return {"configured": True, "identity": identity, "error": None}
+    except urllib.error.HTTPError as e:
+        return {
+            "configured": True,
+            "identity": None,
+            "error": f"fal http {e.code}",
+        }
+    except Exception as e:
+        return {
+            "configured": True,
+            "identity": None,
+            "error": f"fal fetch failed: {e}",
+        }
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-TEST_MODE = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes", "on")
-
 MODEL = os.environ.get("PARALLAX_WEB_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = 16384
 
-# USD per million tokens. Used to compute per-session cost from usage deltas.
-# Numbers track Anthropic's public pricing. Prompt-cache pricing would be
-# different but we don't emit cache_control blocks yet.
 MODEL_PRICES = {
     "claude-sonnet-4-6":   {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-5":   {"input": 3.00, "output": 15.00},
@@ -70,10 +122,14 @@ MODEL_PRICES = {
 
 def _model_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     price = MODEL_PRICES.get(model) or MODEL_PRICES.get("claude-sonnet-4-6")
+    if price is None:
+        return 0.0
     return (
         (input_tokens / 1_000_000.0) * price["input"]
         + (output_tokens / 1_000_000.0) * price["output"]
     )
+
+
 MAX_TEXT_FILE_BYTES = 256 * 1024
 ALLOWED_IMAGE_MIMES = {
     "image/png",
@@ -86,19 +142,17 @@ PROJECT_DIR = Path(os.environ.get("PARALLAX_PROJECT_DIR", os.getcwd())).resolve(
 STATIC_DIR = _HERE / "static"
 HOP_PROMPT_PATH = _HERE / "hop_prompt.md"
 
-# When True, every user gets their own subdirectory under PROJECT_DIR.
-# Enabled automatically when the server is network-accessible (PARALLAX_WEB_HOST
-# set) or password-protected. Opt out explicitly with PARALLAX_SINGLE_USER=1
-# for a known single-user local setup.
 _network_accessible = bool(os.environ.get("PARALLAX_WEB_HOST"))
 PER_USER_WORKSPACES = (
     not bool(os.environ.get("PARALLAX_SINGLE_USER"))
     and (
-        bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
-        or bool(os.environ.get("PARALLAX_PER_USER_WORKSPACES"))
+        bool(os.environ.get("PARALLAX_PER_USER_WORKSPACES"))
+        or bool(os.environ.get("PARALLAX_WEB_PASSWORD"))
         or _network_accessible
     )
 )
+
+WORKSPACE_ROOT_NAME = "parallax"
 
 
 def _sanitize_name(name: str) -> str:
@@ -112,36 +166,46 @@ _sanitize_user = _sanitize_name
 
 
 def _ensure_workspace(workspace: Path) -> None:
-    """Scaffold the canonical project layout in workspace if missing."""
+    """Scaffold the canonical workspace layout if any piece is missing."""
     workspace.mkdir(parents=True, exist_ok=True)
-    for sub in ("stills", "input", "output", "drafts", "audio", ".parallax"):
+    for sub in ("stills", "input", "output", "drafts", "audio", "logs"):
         (workspace / sub).mkdir(exist_ok=True)
 
 
-def _workspace_for(user: Optional[str], project: Optional[str] = None) -> Path:
+def _workspace_root() -> Path:
+    return PROJECT_DIR / WORKSPACE_ROOT_NAME
+
+
+def _users_root() -> Path:
+    return _workspace_root() / "users"
+
+
+def _workspace_for(
+    user: Optional[str],
+    project: Optional[str] = None,
+    scaffold: bool = False,
+) -> Path:
     """
     Resolve the working directory for a user + project pair.
 
-    Layout:
-      single user mode:     PROJECT_DIR/                          (no isolation)
-      per-user mode:        PROJECT_DIR/<user>/<project>/         (full isolation)
-                            project defaults to "main"
-
-    Two browser tabs with different `?project=` values are completely
-    isolated and can run jobs in parallel without manifest collisions.
+    New layout (beta):
+        PROJECT_DIR/parallax/<project>/                  (single-user default)
+        PROJECT_DIR/parallax/users/<user>/<project>/     (per-user mode)
     """
-    if not PER_USER_WORKSPACES or not user:
-        return PROJECT_DIR
-    user_safe = _sanitize_name(user)
     project_safe = _sanitize_name(project or "main")
-    workspace = (PROJECT_DIR / user_safe / project_safe).resolve()
-    # Safety: must be inside PROJECT_DIR
+    if not PER_USER_WORKSPACES or not user:
+        workspace = (_workspace_root() / project_safe).resolve()
+    else:
+        user_safe = _sanitize_name(user)
+        workspace = (_users_root() / user_safe / project_safe).resolve()
     try:
-        workspace.relative_to(PROJECT_DIR)
+        workspace.relative_to(_workspace_root())
     except ValueError:
-        workspace = PROJECT_DIR / "anon" / "main"
-    _ensure_workspace(workspace)
+        workspace = _users_root() / "anon" / "main"
+    if scaffold:
+        _ensure_workspace(workspace)
     return workspace
+
 
 PARALLAX_CANDIDATES = (
     os.path.expanduser("~/.local/bin/parallax"),
@@ -152,6 +216,9 @@ PARALLAX_CANDIDATES = (
 
 
 def _find_parallax_bin() -> Optional[str]:
+    override = os.environ.get("PARALLAX_BIN")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
     which = shutil.which("parallax")
     if which:
         return which
@@ -180,88 +247,52 @@ class PathError(ValueError):
     pass
 
 
-def _safe_filename(filename: str) -> str:
+def _resolve_project_path(
+    user_path: str,
+    workspace: Optional[Path] = None,
+    read_fallback: bool = False,
+) -> Path:
     """
-    Canonical filename sanitizer. Strips to basename, keeps ASCII alnum and
-    `._-`, collapses any run of other chars (spaces, unicode whitespace like
-    U+202F, punctuation) to a single underscore, trims underscores, caps at
-    200 chars. Returns "" if nothing safe remains.
-
-    THE INVARIANT: every file under a workspace must already be a safe name.
-    Filenames with spaces or non-ASCII characters break path round-tripping
-    through the LLM (it normalizes U+202F to ASCII space, ASCII space to %20,
-    etc.) and cause "file not found" loops. Sanitize on ingest AND on
-    enumeration so the agent never sees an unsafe name.
+    Resolve `user_path` relative to a workspace and verify it stays inside
+    the master PROJECT_DIR tree.
     """
-    filename = os.path.basename(filename)
-    out = []
-    prev_us = False
-    for c in filename:
-        if (c.isascii() and c.isalnum()) or c in "._-":
-            out.append(c)
-            prev_us = False
-        elif not prev_us:
-            out.append("_")
-            prev_us = True
-    return "".join(out).strip("_")[:200]
-
-
-def _ensure_safe_name(entry: Path) -> Path:
-    """
-    If `entry`'s basename is not already safe, rename it in place to a safe
-    name (disambiguating against collisions). Returns the (possibly new) path.
-    Silently returns the original path on any failure — enumeration must not
-    break because of a rename hiccup.
-    """
-    name = entry.name
-    safe = _safe_filename(name)
-    if safe == name and safe:
-        return entry
-    if not safe:
-        safe = "file"
-    parent = entry.parent
-    stem, dot, ext = safe.rpartition(".")
-    base, suffix = (stem, dot + ext) if dot else (safe, "")
-    candidate = parent / safe
-    i = 1
-    while candidate.exists() and candidate != entry:
-        candidate = parent / f"{base}_{i}{suffix}"
-        i += 1
-    try:
-        if candidate != entry:
-            entry.rename(candidate)
-        return candidate
-    except Exception:
-        return entry
-
-
-def _resolve_project_path(user_path: str, workspace: Optional[Path] = None) -> Path:
-    """
-    Resolve `user_path` against the workspace (or PROJECT_DIR if no workspace
-    is given) and verify the result stays inside it. Rejects absolute paths
-    that escape, '..' traversal, and symlinks that point outside.
-    """
-    base = workspace or PROJECT_DIR
     if not isinstance(user_path, str) or not user_path:
         raise PathError("path must be a non-empty string")
+    workspace = workspace or PROJECT_DIR
     p = Path(user_path)
+    escaped = False
     if not p.is_absolute():
-        p = base / p
+        candidate = workspace / p
+        try:
+            resolved = candidate.resolve()
+        except Exception as e:
+            raise PathError(f"could not resolve path: {e}") from e
+        try:
+            resolved.relative_to(workspace)
+            if not read_fallback or resolved.exists():
+                return resolved
+            escaped = True
+        except ValueError:
+            escaped = True
+        if escaped:
+            candidate = PROJECT_DIR / p
+    else:
+        candidate = p
     try:
-        resolved = p.resolve()
+        resolved = candidate.resolve()
     except Exception as e:
         raise PathError(f"could not resolve path: {e}") from e
     try:
-        resolved.relative_to(base)
+        resolved.relative_to(PROJECT_DIR)
     except ValueError as e:
         raise PathError(
-            f"path {user_path!r} escapes workspace {base}"
+            f"path {user_path!r} escapes project {PROJECT_DIR}"
         ) from e
     return resolved
 
 
 # ---------------------------------------------------------------------------
-# Event formatting for dispatch NDJSON (ported from parallax-app/chat.py)
+# Event formatting for dispatch NDJSON
 # ---------------------------------------------------------------------------
 
 
@@ -316,28 +347,32 @@ def format_dispatch_event(evt: dict) -> str:
 
 
 class Session:
-    """
-    Per-session state: chat history, SSE subscribers, cancel flag, dispatch
-    bookkeeping. One instance per session_id.
-    """
-
     def __init__(self, session_id: str, user: Optional[str] = None, project: Optional[str] = None) -> None:
         self.id = session_id
         self.user = user or os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
         self.project = project or "main"
-        self.workspace = _workspace_for(self.user, self.project)
-        self.messages: list[dict[str, Any]] = []  # Anthropic messages format
-        self.display_log: list[dict[str, Any]] = []  # normalized for /api/session
+        self.workspace = _workspace_for(self.user, self.project, scaffold=True)
+        self.messages: list[dict[str, Any]] = []
+        self.display_log: list[dict[str, Any]] = []
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
         self.cancel_event = threading.Event()
-        self.pending_interrupt_text: Optional[str] = None
         self.agent_thread: Optional[threading.Thread] = None
         self.dispatch_proc: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
         self.created_at = time.time()
+        self.test_mode = False
+        self.selected_refs: list[str] = []
+        try:
+            self._hydrate_from_chat_log()
+        except Exception as e:
+            print(f"session hydrate failed: {e}", file=sys.stderr, flush=True)
+        for turn in (_load_chat_history(self.workspace) or []):
+            self.display_log.append({
+                "kind": f"{turn.get('role', 'user')}_message" if turn.get("role") == "user" else "assistant_text",
+                "data": {"text": turn.get("text") or ""},
+                "ts": turn.get("ts") or time.time(),
+            })
         telemetry.create_session(session_id, str(self.workspace), MODEL, user=self.user)
-
-    # ---- SSE fan-out ------------------------------------------------------
 
     def subscribe(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=512)
@@ -358,13 +393,24 @@ class Session:
             try:
                 q.put_nowait(evt)
             except queue.Full:
-                # drop — client is too slow, they'll re-sync on refresh
                 pass
-
-    # ---- display log ------------------------------------------------------
 
     def push_display(self, kind: str, data: Any) -> None:
         self.display_log.append({"kind": kind, "data": data, "ts": time.time()})
+
+    def _hydrate_from_chat_log(self) -> None:
+        turns = _load_chat_history(self.workspace)
+        if not turns:
+            return
+        for turn in turns:
+            role = turn.get("role")
+            text = turn.get("text") or ""
+            if not text or role not in ("user", "assistant"):
+                continue
+            self.messages.append({
+                "role": role,
+                "content": [{"type": "text", "text": text}],
+            })
 
 
 SESSIONS: dict[str, Session] = {}
@@ -376,8 +422,6 @@ def get_or_create_session(session_id: Optional[str], user: Optional[str] = None,
     with SESSIONS_LOCK:
         if session_id and session_id in SESSIONS:
             existing = SESSIONS[session_id]
-            # Reject if the session belongs to a different user — don't let one
-            # user resume another's session, even with a valid session_id.
             if PER_USER_WORKSPACES and user and existing.user != user:
                 print(
                     f"session {session_id}: user mismatch (owner={existing.user!r}, "
@@ -473,31 +517,6 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "preview_video",
-        "description": (
-            "Produce a contact sheet of frames + waveform from a video file. "
-            "The output is a single image: evenly-spaced frames with timecodes, "
-            "plus a waveform strip under each row showing audio level and silence "
-            "regions. Use this BEFORE calling parallax_compose over an existing "
-            "video or making edits based on video content — it is the only way "
-            "to actually see what is in a video."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Video path relative to project root (e.g. 'output/latest.mp4').",
-                },
-                "frames": {
-                    "type": "integer",
-                    "description": "Total frames to extract across the whole video (default: 12).",
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
         "name": "parallax_create",
         "description": (
             "Generate new still images from a text brief using the Parallax CLI. "
@@ -530,7 +549,7 @@ TOOL_SCHEMAS = [
                 "ref": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Reference image paths (relative to project root) for image-to-image generation. Use this when the user wants a new image based on one they uploaded.",
+                    "description": "Reference image paths (relative to project root) for image-to-image generation.",
                 },
             },
             "required": ["brief"],
@@ -539,31 +558,24 @@ TOOL_SCHEMAS = [
     {
         "name": "edit_manifest",
         "description": (
-            "Edit .parallax/manifest.yaml — the source of truth for what gets rendered. "
+            "Edit cwd/manifest.yaml — the source of truth for what gets rendered. "
             "The manifest has a `scenes` list; each scene is either a still scene "
             "(with `still`, `duration`, optional `motion`) or a video scene (with "
             "`type: video`, `source`, optional `start_s`/`end_s`). Both scene types "
             "support `vo_text`.\n\n"
             "Operations:\n"
-            "  set-scenes — replace the still scenes list. `values` is a list of specs in the form "
-            "'still_path:duration:motion'. Example: ['stills/a.png:3:zoom_in']\n"
-            "  add-scene — append one still scene. `values` is ['still_path']. Use `duration`/`motion` fields.\n"
-            "  add-video-scene — append a video scene. `values` is ['video_path']. Use `start_s`/`end_s`/`duration` fields.\n"
+            "  set-scenes — replace the still scenes list.\n"
+            "  add-scene — append one still scene.\n"
+            "  add-video-scene — append a video scene.\n"
             "  remove-scene — `values` is ['<number>'].\n"
             "  reorder — `values` is ['1,3,2'] (comma-separated scene numbers).\n"
-            "  set-vo — set the voiceover text for a scene. `values` is ['<scene_number>', '<vo text>']\n"
-            "  set-voice — pick the voiceover voice. `values` is ['<voice_name_or_id>']. "
-            "Shortcuts: george, rachel, domi, bella, antoni, arnold.\n"
-            "  set-headline — set a static headline overlay for the whole video. "
-            "`values` is ['<headline text>'] or ['<text>', '<style>'] or ['<text>', '<style>', '<position>']. "
-            "Style defaults to 'title' — a transparent top-safe-zone overlay suitable for text over Ken Burns video. "
-            "Other styles: 'caption' (bottom safe zone, for subtitle-like lines), "
-            "'banner' (FULL-SCREEN solid-background title card that COVERS the video — only use when the user explicitly wants a title card, never as a default). "
-            "Position options: top | bottom | center (default depends on style).\n"
+            "  set-vo — set the voiceover text for a scene.\n"
+            "  set-voice — pick the voiceover voice.\n"
+            "  set-headline — set a static headline overlay for the whole video.\n"
             "  clear-headline — remove the headline overlay.\n"
-            "  enable-captions / disable-captions — toggle word-by-word caption burn in compose.\n"
-            "  set — set an arbitrary top-level key. `values` is ['<key>', '<value>'].\n"
-            "  show — print the current manifest. No values.\n\n"
+            "  enable-captions / disable-captions — toggle word-by-word caption burn.\n"
+            "  set — set an arbitrary top-level key.\n"
+            "  show — print the current manifest.\n\n"
             "ALWAYS use this tool to change the manifest. NEVER ask the user to edit YAML manually."
         ),
         "input_schema": {
@@ -616,12 +628,7 @@ TOOL_SCHEMAS = [
             "Generate an ElevenLabs voiceover AND auto-transcribe with WhisperX. "
             "Reads `vo_text` from each scene in the manifest, concatenates, and "
             "synthesizes the audio. Then automatically runs WhisperX phoneme-level "
-            "forced alignment to produce precise word-level timestamps, saved to "
-            "audio/vo_manifest.json. The WhisperX pass is mandatory and not "
-            "configurable — there is no other transcription path in parallax.\n\n"
-            "BEFORE calling this: each scene that should have spoken audio must "
-            "have a `vo_text` field set via edit_manifest set-vo. Optionally set "
-            "the voice via edit_manifest set-voice or pass it directly here.\n\n"
+            "forced alignment to produce precise word-level timestamps.\n\n"
             "Voice shortcuts: george, rachel, domi, bella, antoni, arnold.\n\n"
             "Output: audio/voiceover.mp3 + audio/vo_manifest.json (whisperx)."
         ),
@@ -647,12 +654,8 @@ TOOL_SCHEMAS = [
         "name": "parallax_transcribe",
         "description": (
             "Run WhisperX phoneme-level forced alignment on an audio file. "
-            "THE SINGULAR transcription path in parallax — there is no fallback "
-            "and no other backend. Every audio that needs word-level timestamps "
-            "MUST go through this command.\n\n"
-            "Use this when you need to re-transcribe an existing audio file (e.g. "
-            "after manual edits or trim-silence). For new voiceovers, parallax_voiceover "
-            "already auto-runs WhisperX so you don't need to call this separately."
+            "THE SINGULAR transcription path in parallax.\n\n"
+            "Use this when you need to re-transcribe an existing audio file."
         ),
         "input_schema": {
             "type": "object",
@@ -677,8 +680,7 @@ TOOL_SCHEMAS = [
         "description": (
             "Remove silent gaps from audio/voiceover.mp3 and rewrite "
             "vo_manifest.json word timestamps proportionally. Run AFTER "
-            "parallax_voiceover and BEFORE parallax_align. Optional — only use "
-            "if the voiceover has noticeable dead air."
+            "parallax_voiceover and BEFORE parallax_align."
         ),
         "input_schema": {
             "type": "object",
@@ -689,12 +691,8 @@ TOOL_SCHEMAS = [
         "name": "parallax_align",
         "description": (
             "Align each scene's duration to its vo_text word timing. Reads "
-            "audio/vo_manifest.json (WhisperX-derived), matches scene vo_text "
-            "first words to spoken words, and rewrites scene durations so the "
-            "visual timing exactly matches when the words are spoken. Run AFTER "
-            "voiceover (and trim-silence if used) and BEFORE compose.\n\n"
-            "This is the 'retie the manifest' step that makes scene cuts land "
-            "on sentence boundaries automatically."
+            "audio/vo_manifest.json, matches scene vo_text first words to spoken "
+            "words, and rewrites scene durations. Run AFTER voiceover and BEFORE compose."
         ),
         "input_schema": {
             "type": "object",
@@ -704,15 +702,8 @@ TOOL_SCHEMAS = [
     {
         "name": "parallax_compose",
         "description": (
-            "Render the project EXACTLY as specified in .parallax/manifest.yaml. "
-            "This is the canonical render path — deterministic, no globbing, no "
-            "fallbacks. Compose is one command that does ALL post-processing: "
-            "scene clip rendering (Ken Burns for stills, trim+scale for video "
-            "scenes), concat, audio mux (if voiceover exists), headline overlay "
-            "(if manifest.headline is set), word-by-word caption burn (if "
-            "manifest.captions.enabled is true).\n\n"
-            "Always run edit_manifest first to set the scenes. For polished "
-            "videos with audio, run voiceover → align → compose in that order. "
+            "Render the project EXACTLY as specified in cwd/manifest.yaml. "
+            "Always run edit_manifest first to set the scenes. "
             "Output: an mp4 in output/, plus output/latest.mp4 symlink."
         ),
         "input_schema": {
@@ -740,13 +731,7 @@ def tool_list_dir(path: str, workspace: Optional[Path] = None) -> dict:
         return {"error": f"not a directory: {path}"}
     entries = []
     try:
-        raw_entries = list(resolved.iterdir())
-        # Sanitize any unsafe filenames in place before enumeration so the
-        # agent never sees names it can't round-trip (see _safe_filename).
-        normalized = []
-        for e in raw_entries:
-            normalized.append(_ensure_safe_name(e) if e.is_file() else e)
-        for entry in sorted(normalized, key=lambda p: p.name.lower()):
+        for entry in sorted(resolved.iterdir(), key=lambda p: p.name.lower()):
             try:
                 st = entry.stat()
                 entries.append(
@@ -802,11 +787,6 @@ def tool_read_file(path: str, workspace: Optional[Path] = None) -> dict:
 
 
 def _sniff_image_mime(head: bytes) -> Optional[str]:
-    """
-    Detect the actual image format from the file header. Extensions lie —
-    Gemini sometimes returns JPEG bytes saved as .png, and Anthropic's API
-    rejects mime/content mismatches with a hard 400.
-    """
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):
@@ -819,12 +799,6 @@ def _sniff_image_mime(head: bytes) -> Optional[str]:
 
 
 def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
-    """
-    Returns a dict with either {"error": ...} or
-    {"image_block": {...}, "path": ..., "mime": ...}.
-    The image_block is a valid Anthropic image content block (source.type=base64).
-    Mime type is sniffed from the file header, not the extension.
-    """
     base = workspace or PROJECT_DIR
     try:
         resolved = _resolve_project_path(path, workspace=base)
@@ -838,8 +812,6 @@ def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
         raw = resolved.read_bytes()
     except Exception as e:
         return {"error": f"read failed: {e}"}
-
-    # Sniff the actual format from magic bytes; fall back to extension.
     mime = _sniff_image_mime(raw[:16])
     if mime is None:
         ext_mime, _ = mimetypes.guess_type(str(resolved))
@@ -876,23 +848,14 @@ def tool_read_image(path: str, workspace: Optional[Path] = None) -> dict:
 
 
 def _clean_subprocess_env() -> dict:
-    """
-    Build an env dict that strips the parent process's venv so the parallax
-    CLI runs in its own installed Python (where its dependencies live).
-    Without this, a venv-launched server poisons every subprocess with a
-    Python interpreter that doesn't have parallax's deps.
-    """
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
-    # Rebuild PATH: strip any path that looks like a venv bin
     path_parts = env.get("PATH", "").split(":")
     cleaned = [p for p in path_parts if "/venv/" not in p and "/.venv/" not in p and "/virtualenvs/" not in p]
     if cleaned:
         env["PATH"] = ":".join(cleaned)
-    if TEST_MODE:
-        env["TEST_MODE"] = "true"
     return env
 
 
@@ -902,19 +865,15 @@ def _stream_parallax_subprocess(
     stdin_payload: Optional[str],
     label: str,
 ) -> str:
-    """
-    Common subprocess runner: spawn parallax, stream NDJSON events back to
-    the session SSE channel, return a short summary string.
-    """
-    # Run CLI subprocesses with the current (venv) interpreter so all installed
-    # deps (pyyaml, anthropic, etc.) are available — not the system python3 from
-    # the shebang line, which may be missing packages.
     if cmd and not cmd[0].endswith("python3") and not cmd[0].endswith("python"):
         cmd = [sys.executable] + cmd
     telemetry.record_event(session.id, "dispatch_start", {"cmd": " ".join(cmd[:3]), "label": label[:200]})
     session.broadcast("dispatch_event", {"phase": "starting", "text": label})
 
     try:
+        subproc_env = _clean_subprocess_env()
+        if getattr(session, "test_mode", False):
+            subproc_env["TEST_MODE"] = "true"
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
@@ -923,7 +882,7 @@ def _stream_parallax_subprocess(
             text=True,
             bufsize=1,
             cwd=str(session.workspace),
-            env=_clean_subprocess_env(),
+            env=subproc_env,
         )
     except Exception as e:
         msg = f"failed to spawn parallax: {e}"
@@ -1022,12 +981,13 @@ def tool_parallax_create(
     bin_path = _find_parallax_bin()
     if bin_path is None:
         return "parallax CLI binary not found on PATH"
-    # Validate any reference paths are inside the workspace
+    if not ref and session.selected_refs:
+        ref = list(session.selected_refs)
     resolved_refs = []
     if ref:
         for r in ref:
             try:
-                p = _resolve_project_path(r, workspace=session.workspace)
+                p = _resolve_project_path(r, workspace=session.workspace, read_fallback=True)
             except PathError as e:
                 return f"invalid ref path {r!r}: {e}"
             if not p.exists():
@@ -1116,10 +1076,6 @@ def tool_edit_manifest(
     start_s: Optional[float] = None,
     end_s: Optional[float] = None,
 ) -> dict:
-    """
-    Edit the manifest by shelling out to `parallax manifest <op> ...` from
-    the user's workspace. Returns {"output": str, "error": Optional[str]}.
-    """
     bin_path = _find_parallax_bin()
     if bin_path is None:
         return {"error": "parallax CLI binary not found on PATH"}
@@ -1154,105 +1110,6 @@ def tool_edit_manifest(
 # ---------------------------------------------------------------------------
 
 
-class _MockStream:
-    """Minimal context-manager stream that mimics the Anthropic SDK streaming interface."""
-
-    def __init__(self, messages: list[dict], tools: list[dict]):
-        # Determine what to emit based on the last user message text.
-        last_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                content = m.get("content") or []
-                # If the last user message is tool_results, don't trigger tool_use again
-                if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
-                    break
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        last_text = c.get("text", "").lower()
-                        break
-            if last_text:
-                break
-
-        TOOL_TRIGGER_MAP = {
-            "still": ("parallax_create", {"brief": "a test still image", "count": 1}),
-            "compose": ("parallax_compose", {"script": "test_compose"}),
-            "voiceover": ("parallax_voiceover", {"text": "test voiceover", "filename": "test_vo.mp3"}),
-        }
-
-        self._tool_use: Optional[dict] = None
-        for kw, (tool_name, tool_input) in TOOL_TRIGGER_MAP.items():
-            if kw in last_text:
-                # Verify the tool actually exists in TOOL_SCHEMAS before emitting
-                schema_names = {s.get("name") for s in tools}
-                if tool_name in schema_names:
-                    self._tool_use = {
-                        "type": "tool_use",
-                        "id": f"mock_tool_{uuid.uuid4().hex[:8]}",
-                        "name": tool_name,
-                        "input": tool_input,
-                    }
-                break
-
-        self._text = "TEST_MODE: mock reply. No API call made."
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        pass
-
-    def __iter__(self):
-        # Yield a synthetic text_delta event so the streaming path emits assistant_delta
-        class _Delta:
-            type = "text_delta"
-            def __init__(self, t): self.text = t
-        class _Event:
-            type = "content_block_delta"
-            def __init__(self, t): self.delta = _Delta(t)
-        yield _Event(self._text)
-
-    def get_final_message(self):
-        """Return an object mimicking anthropic.types.Message."""
-        class _FakeUsage:
-            input_tokens = 0
-            output_tokens = 0
-
-        class _TextBlock:
-            type = "text"
-            def __init__(self, text):
-                self.text = text
-
-        class _ToolUseBlock:
-            type = "tool_use"
-            def __init__(self, id, name, input):
-                self.id = id
-                self.name = name
-                self.input = input
-
-        class _FakeMessage:
-            def __init__(self, text_block, tool_block):
-                self.usage = _FakeUsage()
-                self.content: list = [text_block]
-                if tool_block:
-                    self.content.append(tool_block)
-                    self.stop_reason = "tool_use"
-                else:
-                    self.stop_reason = "end_turn"
-
-        tool_block = None
-        if self._tool_use:
-            tool_block = _ToolUseBlock(
-                self._tool_use["id"],
-                self._tool_use["name"],
-                self._tool_use["input"],
-            )
-        return _FakeMessage(_TextBlock(self._text), tool_block)
-
-
-def _mock_anthropic_stream(messages: list[dict], tools: list[dict]) -> _MockStream:
-    return _MockStream(messages, tools)
-
-
 def _lazy_client():
     try:
         import anthropic  # noqa: F401
@@ -1271,10 +1128,6 @@ def _lazy_client():
 def _execute_tool_calls(
     session: Session, tool_uses: list[dict]
 ) -> list[dict]:
-    """
-    Run each tool_use block and return a list of tool_result content blocks
-    suitable for the next user turn.
-    """
     results: list[dict] = []
     for tu in tool_uses:
         name = tu.get("name")
@@ -1336,10 +1189,6 @@ def _execute_tool_calls(
                     else:
                         script = _HERE.parent / "tools" / "storyboard.py"
                         try:
-                            # Use the venv's Python (sys.executable). Runtime
-                            # deps like Pillow must be installed in the venv
-                            # via web/requirements.txt — do NOT side-step the
-                            # venv by reaching out to system python.
                             result = subprocess.run(
                                 [sys.executable, str(script), str(dir_path), "--max", str(max_img)],
                                 capture_output=True, text=True, timeout=30,
@@ -1370,63 +1219,6 @@ def _execute_tool_calls(
                                     msg = f"could not read storyboard output: {e}"
                                     content_block = [{"type": "text", "text": msg}]
                                     summary = msg
-            elif name == "preview_video":
-                raw_path = (args.get("path") or "").strip()
-                frames = int(args.get("frames") or 12)
-                if not raw_path:
-                    content_block = [{"type": "text", "text": "error: path is required"}]
-                    summary = "preview_video: missing path"
-                else:
-                    try:
-                        vid_path = _resolve_project_path(raw_path, workspace=session.workspace)
-                    except PathError as pe:
-                        content_block = [{"type": "text", "text": f"error: {pe}"}]
-                        summary = str(pe)
-                    else:
-                        if not vid_path.exists() or not vid_path.is_file():
-                            msg = f"video not found: {raw_path}"
-                            content_block = [{"type": "text", "text": msg}]
-                            summary = msg
-                        else:
-                            script = _HERE.parent / "packs" / "video" / "scripts" / "preview-sheet.py"
-                            out_tmp = Path(tempfile.gettempdir()) / f"parallax_preview_{session.id}_{int(time.time())}.jpg"
-                            try:
-                                result = subprocess.run(
-                                    [sys.executable, str(script),
-                                     "--input", str(vid_path),
-                                     "--frames", str(frames),
-                                     "--waveform", str(vid_path),
-                                     "--output", str(out_tmp)],
-                                    capture_output=True, text=True, timeout=60,
-                                )
-                            except Exception as e:
-                                msg = f"preview_video failed: {e}"
-                                content_block = [{"type": "text", "text": msg}]
-                                summary = msg
-                            else:
-                                if result.returncode != 0:
-                                    msg = (result.stderr or "preview_video error").strip()
-                                    content_block = [{"type": "text", "text": msg}]
-                                    summary = msg
-                                else:
-                                    try:
-                                        meta = json.loads(result.stdout.strip().splitlines()[-1])
-                                        pages = meta.get("pages") or [str(out_tmp)]
-                                        first = Path(pages[0])
-                                        raw = first.read_bytes()
-                                        b64 = base64.standard_b64encode(raw).decode("ascii")
-                                        note = f"preview of {raw_path} ({meta.get('frame_count', frames)} frames)"
-                                        if len(pages) > 1:
-                                            note += f" — page 1 of {len(pages)}"
-                                        content_block = [
-                                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                                            {"type": "text", "text": note},
-                                        ]
-                                        summary = f"preview: {first.name}"
-                                    except Exception as e:
-                                        msg = f"could not read preview output: {e}"
-                                        content_block = [{"type": "text", "text": msg}]
-                                        summary = msg
             elif name == "parallax_create":
                 brief = args.get("brief", "")
                 count = int(args.get("count") or 3)
@@ -1525,217 +1317,168 @@ def _execute_tool_calls(
     return results
 
 
-def _finalize_pending_tool_uses(session: Session, reason: str) -> None:
-    """Repair transcript if the tail is an assistant turn with tool_use blocks
-    lacking matching tool_result blocks. Synthesizes is_error results so the
-    next Anthropic call doesn't 400 on orphan tool_use ids. Idempotent."""
-    if not session.messages:
+def _chat_log_path(workspace: Path) -> Path:
+    return workspace / "chat.jsonl"
+
+
+def _append_chat_turn(workspace: Path, role: str, text: str) -> None:
+    if not text:
         return
-    last = session.messages[-1]
-    if last.get("role") != "assistant":
-        return
-    content = last.get("content") or []
-    if not isinstance(content, list):
-        return
-    pending_ids = [
-        b.get("id") for b in content
-        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
-    ]
-    if not pending_ids:
-        return
-    synthetic = [
-        {
-            "type": "tool_result",
-            "tool_use_id": tid,
-            "content": [{"type": "text", "text": f"tool not executed: {reason}"}],
-            "is_error": True,
-        }
-        for tid in pending_ids
-    ]
-    session.messages.append({"role": "user", "content": synthetic})
+    try:
+        path = _chat_log_path(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"role": role, "text": text, "ts": time.time()},
+            ensure_ascii=False,
+        ) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"chat.jsonl write failed: {e}", file=sys.stderr, flush=True)
+
+
+def _load_chat_history(workspace: Path) -> list[dict[str, Any]]:
+    path = _chat_log_path(workspace)
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    out.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"chat.jsonl read failed: {e}", file=sys.stderr, flush=True)
+    return out
 
 
 def run_agent_turn(session: Session, user_text: str) -> None:
     """Agent loop body — runs in a background thread per POST /api/message."""
-    if not TEST_MODE:
-        try:
-            client = _lazy_client()
-        except Exception as e:
-            session.broadcast("error", {"message": str(e)})
-            telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
-            session.broadcast("agent_done", {"ok": False})
-            return
-    else:
-        client = None  # unused in TEST_MODE; mock stream is called directly
+    try:
+        client = _lazy_client()
+    except Exception as e:
+        session.broadcast("error", {"message": str(e)})
+        telemetry.record_event(session.id, "error", {"where": "client_init", "message": str(e)})
+        session.broadcast("agent_done", {"ok": False})
+        return
 
-    # Defense-in-depth: if a prior turn ended with orphan tool_use blocks
-    # (pre-fix history, or a crash that bypassed the synthesizer), repair
-    # before appending the new user turn so we don't 400 on the next call.
-    _finalize_pending_tool_uses(session, reason="prior turn ended without tool_result")
-
-    # Append user turn.
     user_content: list[dict] = [{"type": "text", "text": user_text}]
     session.messages.append({"role": "user", "content": user_content})
     session.push_display("user_message", {"text": user_text})
     telemetry.record_event(session.id, "user_message", {"text": user_text})
+    _append_chat_turn(session.workspace, "user", user_text)
 
     hop_prompt = _load_hop_prompt()
 
     MAX_ITER = 12
-    try:
-        for _iter in range(MAX_ITER):
-            if session.cancel_event.is_set():
-                # Soft interrupt: inject the new user message and continue.
-                pending = getattr(session, "pending_interrupt_text", None)
-                if pending:
-                    session.messages.append(
-                        {"role": "user", "content": [{"type": "text", "text": pending}]}
-                    )
-                    session.push_display("user_message", {"text": pending, "interrupt": True})
-                    telemetry.record_event(
-                        session.id, "user_interrupt", {"text": pending}
-                    )
-                    session.pending_interrupt_text = None
-                    session.cancel_event.clear()
-                    continue
-                session.broadcast("agent_done", {"ok": False, "cancelled": True})
-                return
+    for _iter in range(MAX_ITER):
+        if session.cancel_event.is_set():
+            session.broadcast("agent_done", {"ok": False, "cancelled": True})
+            return
 
-            try:
-                _stream_ctx = (
-                    _mock_anthropic_stream(session.messages, TOOL_SCHEMAS)
-                    if TEST_MODE
-                    else client.messages.stream(  # type: ignore[union-attr]
-                        model=MODEL,
-                        max_tokens=MAX_TOKENS,
-                        system=hop_prompt,
-                        tools=TOOL_SCHEMAS,
-                        messages=session.messages,
-                    )
-                )
-                with _stream_ctx as stream:
-                    for event in stream:
-                        if session.cancel_event.is_set():
-                            break
-                        etype = getattr(event, "type", "")
-                        if etype == "content_block_delta":
-                            delta = getattr(event, "delta", None)
-                            if delta is not None and getattr(delta, "type", "") == "text_delta":
-                                session.broadcast(
-                                    "assistant_delta", {"text": delta.text}
-                                )
-                    final = stream.get_final_message()
-            except Exception as e:
-                tb = traceback.format_exc()
-                print(f"agent: stream error: {e}\n{tb}", file=sys.stderr, flush=True)
-                session.broadcast("error", {"message": f"stream error: {e}"})
-                telemetry.record_event(
-                    session.id, "error", {"where": "stream", "message": str(e)}
-                )
-                session.broadcast("agent_done", {"ok": False})
-                return
+        try:
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=hop_prompt,
+                tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
+                messages=session.messages,  # type: ignore[arg-type]
+            ) as stream:
+                for event in stream:
+                    if session.cancel_event.is_set():
+                        break
+                    etype = getattr(event, "type", "")
+                    if etype == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta is not None and getattr(delta, "type", "") == "text_delta":
+                            session.broadcast(
+                                "assistant_delta", {"text": delta.text}
+                            )
+                final = stream.get_final_message()
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"agent: stream error: {e}\n{tb}", file=sys.stderr, flush=True)
+            session.broadcast("error", {"message": f"stream error: {e}"})
+            telemetry.record_event(
+                session.id, "error", {"where": "stream", "message": str(e)}
+            )
+            session.broadcast("agent_done", {"ok": False})
+            return
 
-            # Unpack final message content into serializable blocks for history.
-            blocks: list[dict] = []
-            text_chunks: list[str] = []
-            tool_uses: list[dict] = []
-            for block in final.content:
-                btype = getattr(block, "type", "")
-                if btype == "text":
-                    text = getattr(block, "text", "") or ""
-                    blocks.append({"type": "text", "text": text})
-                    text_chunks.append(text)
-                elif btype == "tool_use":
-                    tu = {
-                        "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
-                    }
-                    blocks.append(tu)
-                    tool_uses.append(tu)
+        blocks: list[dict] = []
+        text_chunks: list[str] = []
+        tool_uses: list[dict] = []
+        for block in final.content:
+            btype = getattr(block, "type", "")
+            if btype == "text":
+                text = getattr(block, "text", "") or ""
+                blocks.append({"type": "text", "text": text})
+                text_chunks.append(text)
+            elif btype == "tool_use":
+                tu = {
+                    "type": "tool_use",
+                    "id": getattr(block, "id", ""),
+                    "name": getattr(block, "name", ""),
+                    "input": getattr(block, "input", {}),
+                }
+                blocks.append(tu)
+                tool_uses.append(tu)
 
-            if text_chunks:
-                joined = "".join(text_chunks)
-                session.push_display("assistant_text", {"text": joined})
-                telemetry.record_event(
-                    session.id, "assistant_text", {"text": joined}
-                )
+        if text_chunks:
+            joined = "".join(text_chunks)
+            session.push_display("assistant_text", {"text": joined})
+            telemetry.record_event(
+                session.id, "assistant_text", {"text": joined}
+            )
+            _append_chat_turn(session.workspace, "assistant", joined)
 
-            # Update tokens + cost in telemetry.
-            try:
-                usage = getattr(final, "usage", None)
-                if usage is not None:
-                    in_tok = getattr(usage, "input_tokens", 0) or 0
-                    out_tok = getattr(usage, "output_tokens", 0) or 0
-                    cost_delta = _model_cost_usd(MODEL, in_tok, out_tok)
-                    telemetry.touch_session(
-                        session.id,
-                        input_tokens_delta=in_tok,
-                        output_tokens_delta=out_tok,
-                        cost_delta_usd=cost_delta,
-                    )
-                    telemetry.record_event(
-                        session.id,
-                        "anthropic_usage",
-                        {
-                            "model": MODEL,
-                            "input_tokens": in_tok,
-                            "output_tokens": out_tok,
-                            "cost_usd": round(cost_delta, 6),
-                        },
-                    )
-            except Exception as e:
-                print(f"agent: usage update failed: {e}", file=sys.stderr, flush=True)
-
-            stop_reason = getattr(final, "stop_reason", None)
-            if stop_reason != "tool_use" or not tool_uses:
-                # No tools — commit assistant turn and exit.
-                session.messages.append({"role": "assistant", "content": blocks})
-                session.broadcast("agent_done", {"ok": True})
-                return
-
-            # Execute tools FIRST, then commit assistant + results atomically so
-            # the transcript can never have an orphan tool_use block.
-            try:
-                tool_results = _execute_tool_calls(session, tool_uses)
-            except Exception as e:
-                tb = traceback.format_exc()
-                print(
-                    f"agent: tool exec crashed: {e}\n{tb}",
-                    file=sys.stderr,
-                    flush=True,
+        try:
+            usage = getattr(final, "usage", None)
+            if usage is not None:
+                in_tok = getattr(usage, "input_tokens", 0) or 0
+                out_tok = getattr(usage, "output_tokens", 0) or 0
+                cost_delta = _model_cost_usd(MODEL, in_tok, out_tok)
+                telemetry.touch_session(
+                    session.id,
+                    input_tokens_delta=in_tok,
+                    output_tokens_delta=out_tok,
+                    cost_delta_usd=cost_delta,
                 )
                 telemetry.record_event(
-                    session.id, "error", {"where": "tool_exec", "message": str(e)}
-                )
-                tool_results = [
+                    session.id,
+                    "anthropic_usage",
                     {
-                        "type": "tool_result",
-                        "tool_use_id": tu["id"],
-                        "content": [
-                            {"type": "text", "text": f"tool exec crashed: {e}"}
-                        ],
-                        "is_error": True,
-                    }
-                    for tu in tool_uses
-                ]
+                        "model": MODEL,
+                        "input_tokens": in_tok,
+                        "output_tokens": out_tok,
+                        "cost_usd": round(cost_delta, 6),
+                    },
+                )
+        except Exception as e:
+            print(f"agent: usage update failed: {e}", file=sys.stderr, flush=True)
 
-            session.messages.append({"role": "assistant", "content": blocks})
-            session.messages.append({"role": "user", "content": tool_results})
+        session.messages.append({"role": "assistant", "content": blocks})
 
-        session.broadcast(
-            "agent_done", {"ok": False, "error": "max iterations exceeded"}
-        )
-    finally:
-        # Belt-and-suspenders: whatever path we exit on, the transcript must
-        # never have a trailing assistant-with-tool_use lacking tool_results.
-        _finalize_pending_tool_uses(session, reason="turn ended before tool execution")
+        stop_reason = getattr(final, "stop_reason", None)
+        if stop_reason != "tool_use" or not tool_uses:
+            session.broadcast("agent_done", {"ok": True})
+            return
+
+        tool_results = _execute_tool_calls(session, tool_uses)
+        session.messages.append({"role": "user", "content": tool_results})
+
+    session.broadcast(
+        "agent_done", {"ok": False, "error": "max iterations exceeded"}
+    )
 
 
 def start_agent_thread(session: Session, user_text: str) -> None:
     session.cancel_event.clear()
-    session.pending_interrupt_text = None
 
     def _run():
         try:
@@ -1805,713 +1548,687 @@ def list_gallery(workspace: Optional[Path] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+_PASSWORD = os.environ.get("PARALLAX_WEB_PASSWORD", "")
+
+
+def _check_auth(request: Request) -> bool:
+    if not _PASSWORD:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        _, password = decoded.split(":", 1)
+        return password == _PASSWORD
+    except Exception:
+        return False
+
+
+def _require_auth(request: Request) -> None:
+    if not _check_auth(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": 'Basic realm="Parallax"'},
+        )
+
+
+def _get_user(request: Request) -> str:
+    user_param = request.query_params.get("user", "").strip()
+    if user_param:
+        return user_param
+    return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+
+
+def _get_project(request: Request) -> str:
+    proj_param = request.query_params.get("project", "").strip()
+    if proj_param:
+        return proj_param
+    return "main"
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request bodies
 # ---------------------------------------------------------------------------
 
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def handle_error(self, request, client_address):
-        # Suppress connection resets — these are normal when the browser
-        # closes a tab or refreshes while an SSE stream is open.
-        import sys
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
-            return
-        super().handle_error(request, client_address)
+class MessageRequest(BaseModel):
+    text: str
+    session_id: Optional[str] = None
+    reference_images: Optional[List[str]] = None
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "parallax-web/0.1"
+class CancelRequest(BaseModel):
+    session_id: str
 
-    # Silence the default request-logger noise.
-    def log_message(self, format: str, *args: Any) -> None:
-        if os.environ.get("PARALLAX_WEB_VERBOSE"):
-            super().log_message(format, *args)
 
-    # ---- auth + user identity --------------------------------------------
+class OpenInFinderRequest(BaseModel):
+    path: Optional[str] = None
 
-    _PASSWORD = os.environ.get("PARALLAX_WEB_PASSWORD", "")
 
-    def _check_auth(self) -> bool:
-        """Return True if auth passes (or no password is configured)."""
-        if not self._PASSWORD:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Basic "):
-            return False
+class DeleteImageRequest(BaseModel):
+    path: str
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app + lifespan
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    telemetry.init_db()
+    if not PER_USER_WORKSPACES:
         try:
-            decoded = base64.b64decode(auth[6:]).decode("utf-8")
-            _, password = decoded.split(":", 1)
-            return password == self._PASSWORD
-        except Exception:
-            return False
-
-    def _require_auth(self) -> bool:
-        """Send 401 and return False if auth fails."""
-        if self._check_auth():
-            return True
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Parallax"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-        return False
-
-    def _get_request_user(self) -> str:
-        """
-        Resolve the requesting user in priority order:
-          1. 'user' query param in the current request URL  (live override)
-          2. 'parallax_user' cookie (set on first visit)
-          3. $USER env var (server process owner)
-        """
-        # Live query param wins so users can switch identities mid-session
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        user_param = qs.get("user", [""])[0].strip()
-        if user_param:
-            return user_param
-        # Then cookie
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            part = part.strip()
-            if part.startswith("parallax_user="):
-                val = part[len("parallax_user="):].strip()
-                if val:
-                    return val
-        return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
-
-    def _get_request_project(self) -> str:
-        """
-        Resolve the requesting project (workspace subdirectory) in priority order:
-          1. 'project' query param  (live override)
-          2. 'parallax_project' cookie
-          3. 'main' (default)
-        """
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        proj_param = qs.get("project", [""])[0].strip()
-        if proj_param:
-            return proj_param
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            part = part.strip()
-            if part.startswith("parallax_project="):
-                val = part[len("parallax_project="):].strip()
-                if val:
-                    return val
-        return "main"
-
-    def _maybe_set_user_cookie(self) -> list:
-        """
-        If the request has ?user= or ?project= params, return Set-Cookie
-        header values to persist them. Returns an empty list if no params present.
-        """
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        cookies = []
-        user_param = qs.get("user", [""])[0].strip()
-        if user_param:
-            safe = "".join(c for c in user_param if c.isalnum() or c in "-_")[:32]
-            if safe:
-                cookies.append(f"parallax_user={safe}; Path=/; SameSite=Strict; HttpOnly")
-        project_param = qs.get("project", [""])[0].strip()
-        if project_param:
-            safe = "".join(c for c in project_param if c.isalnum() or c in "-_")[:32]
-            if safe:
-                cookies.append(f"parallax_project={safe}; Path=/; SameSite=Strict; HttpOnly")
-        return cookies
-
-    # ---- helpers ---------------------------------------------------------
-
-    def _write_json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except Exception:
-            pass
-
-    def _write_error(self, status: int, message: str) -> None:
-        self._write_json(status, {"error": message})
-
-    def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or "0")
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else {}
+            _ensure_workspace(_workspace_for(None, "main"))
         except Exception as e:
-            print(f"http: bad json body: {e}", file=sys.stderr, flush=True)
-            return {}
+            print(f"parallax-web: default workspace scaffold failed: {e}", file=sys.stderr)
+    try:
+        registry.install_shutdown_hooks()
+        port = int(os.environ.get("_PARALLAX_PORT", "0"))
+        host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
+        registry.register(
+            cwd=str(PROJECT_DIR),
+            host=host,
+            port=port,
+            user=os.environ.get("USER", "unknown"),
+        )
+    except Exception as e:
+        print(f"parallax-web: registry register failed: {e}", file=sys.stderr)
+    yield
+    # Shutdown
+    try:
+        registry.deregister()
+    except Exception:
+        pass
 
-    # ---- routing ---------------------------------------------------------
 
-    def do_GET(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
+app = FastAPI(title="parallax-web", lifespan=lifespan)
 
-        if path == "/" or path == "":
-            # Serve index and set user/project cookies if either was passed
-            cookies = self._maybe_set_user_cookie()
-            if cookies:
-                static_path = STATIC_DIR / "index.html"
-                try:
-                    body = static_path.read_bytes()
-                except Exception as e:
-                    return self._write_error(500, str(e))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                for c in cookies:
-                    self.send_header("Set-Cookie", c)
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except Exception:
-                    pass
-                return
-            return self._serve_static("index.html")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        if path.startswith("/static/"):
-            rel = path[len("/static/"):]
-            return self._serve_static(rel)
+# Mount static files if the directory exists
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-        if path.startswith("/media/"):
-            rel = path[len("/media/"):]
-            return self._serve_project_file(rel)
 
-        if path == "/api/gallery":
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            return self._write_json(200, list_gallery(workspace=workspace))
+# ---------------------------------------------------------------------------
+# Routes — GET
+# ---------------------------------------------------------------------------
 
-        if path == "/api/sessions":
-            return self._handle_list_sessions()
 
-        if path == "/api/projects":
-            return self._handle_list_projects()
+@app.get("/")
+async def serve_index(request: Request):
+    _require_auth(request)
+    index = STATIC_DIR / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=404, detail="index.html not found")
+    return FileResponse(str(index), media_type="text/html", headers={"Cache-Control": "no-store"})
 
-        if path == "/api/usage":
-            return self._handle_usage()
 
-        if path.startswith("/api/session/") and path.endswith("/history"):
-            sid = path[len("/api/session/"):-len("/history")]
-            return self._handle_session_history(sid)
+@app.get("/costs")
+async def serve_costs_page(request: Request):
+    _require_auth(request)
+    page = STATIC_DIR / "costs.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="costs.html not found")
+    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
 
-        if path.startswith("/api/session/"):
-            sid = path[len("/api/session/"):]
-            s = SESSIONS.get(sid)
-            if s is None:
-                return self._write_json(
-                    200, {"session_id": sid, "log": telemetry.load_session_events(sid)}
-                )
-            return self._write_json(
-                200, {"session_id": sid, "log": s.display_log}
-            )
 
-        if path.startswith("/api/stream/"):
-            sid = path[len("/api/stream/"):]
-            return self._serve_sse(sid)
+@app.get("/manifest")
+async def serve_manifest_page(request: Request):
+    _require_auth(request)
+    page = STATIC_DIR / "manifest.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="manifest.html not found")
+    return FileResponse(str(page), media_type="text/html", headers={"Cache-Control": "no-store"})
 
-        self._write_error(404, f"not found: {path}")
 
-    def do_POST(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
+@app.get("/media/{rel_path:path}")
+async def serve_project_file(rel_path: str, request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    try:
+        target = _resolve_project_path(rel_path, workspace=workspace, read_fallback=True)
+    except PathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"not found: {rel_path}")
+    mime, _ = mimetypes.guess_type(str(target))
+    return FileResponse(
+        str(target),
+        media_type=mime or "application/octet-stream",
+        headers={"Cache-Control": "no-store"},
+    )
 
-        if path == "/api/message":
-            body = self._read_json_body()
-            text = (body.get("text") or "").strip()
-            if not text:
-                return self._write_error(400, "text is required")
-            sid = body.get("session_id")
-            user = self._get_request_user()
-            project = self._get_request_project()
-            session = get_or_create_session(
-                sid if isinstance(sid, str) else None,
-                user=user, project=project,
-            )
-            # Prepend selected reference images so the agent sees them naturally
-            ref_images = body.get("reference_images")
-            if isinstance(ref_images, list) and ref_images:
-                paths_str = ", ".join(str(p) for p in ref_images if p)
-                text = f"[Reference images selected: {paths_str}]\n\n{text}"
-            start_agent_thread(session, text)
-            return self._write_json(200, {"session_id": session.id, "project": session.project})
 
-        if path == "/api/projects":
-            return self._handle_create_project()
+@app.get("/api/gallery")
+async def api_gallery(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    return JSONResponse(list_gallery(workspace=workspace))
 
-        if path == "/api/cancel":
-            body = self._read_json_body()
-            sid = body.get("session_id")
-            if not isinstance(sid, str):
-                return self._write_error(400, "session_id required")
-            s = SESSIONS.get(sid)
-            if s is None:
-                return self._write_error(404, "no such session")
-            s.pending_interrupt_text = None
-            s.cancel_event.set()
-            proc = s.dispatch_proc
-            if proc is not None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            return self._write_json(200, {"ok": True})
 
-        if path == "/api/interrupt":
-            body = self._read_json_body()
-            sid = body.get("session_id")
-            text = body.get("text")
-            if not isinstance(sid, str):
-                return self._write_error(400, "session_id required")
-            if not isinstance(text, str) or not text.strip():
-                return self._write_error(400, "text required")
-            s = SESSIONS.get(sid)
-            if s is None:
-                return self._write_error(404, "no such session")
-            thread = s.agent_thread
-            if thread is None or not thread.is_alive():
-                # Agent not running — treat as a normal message send.
-                start_agent_thread(s, text)
-                return self._write_json(200, {"ok": True, "mode": "new_turn"})
-            s.pending_interrupt_text = text
-            s.cancel_event.set()
-            proc = s.dispatch_proc
-            if proc is not None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            s.broadcast("user_interrupt", {"text": text})
-            return self._write_json(200, {"ok": True, "mode": "interrupt"})
+@app.get("/api/sessions")
+async def api_list_sessions(request: Request):
+    _require_auth(request)
+    request_user = _get_user(request) if PER_USER_WORKSPACES else None
+    try:
+        sessions = telemetry.list_sessions(limit=50, user=request_user)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"sessions query failed: {e}")
 
-        if path == "/api/upload":
-            return self._handle_upload()
+    with SESSIONS_LOCK:
+        live_ids = {
+            sid for sid, s in SESSIONS.items()
+            if s.agent_thread and s.agent_thread.is_alive()
+        }
 
-        if path == "/api/open_in_finder":
-            body = self._read_json_body()
-            user_path = body.get("path") or ""
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            if user_path:
-                try:
-                    target = _resolve_project_path(user_path, workspace=workspace)
-                except PathError as e:
-                    return self._write_error(400, str(e))
-            else:
-                target = workspace
-            try:
-                subprocess.run(["open", str(target)], check=False)
-            except Exception as e:
-                return self._write_error(500, f"open failed: {e}")
-            return self._write_json(200, {"ok": True, "path": str(target)})
-
-        self._write_error(404, f"not found: {path}")
-
-    def do_DELETE(self) -> None:
-        if not self._require_auth():
-            return
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/api/image":
-            body = self._read_json_body()
-            rel = (body.get("path") or "").strip()
-            if not rel:
-                return self._write_error(400, "path is required")
-            workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-            try:
-                target = _resolve_project_path(rel, workspace=workspace)
-            except PathError as e:
-                return self._write_error(400, str(e))
-            if not target.is_file():
-                return self._write_error(404, "file not found")
-            try:
-                subprocess.run(
-                    ["osascript", "-e",
-                     f'tell application "Finder" to delete POSIX file "{target}"'],
-                    check=True, capture_output=True,
-                )
-            except Exception as e:
-                return self._write_error(500, f"trash failed: {e}")
-            return self._write_json(200, {"ok": True, "path": rel})
-
-        if path.startswith("/api/session/"):
-            sid = path[len("/api/session/"):]
-            if not sid:
-                return self._write_error(400, "session_id required")
-            # Cancel any live session first
-            with SESSIONS_LOCK:
-                live = SESSIONS.get(sid)
-            if live:
-                live.cancel_event.set()
-                if live.dispatch_proc:
-                    try:
-                        live.dispatch_proc.kill()
-                    except Exception:
-                        pass
-            removed = telemetry.delete_session(sid)
-            with SESSIONS_LOCK:
-                SESSIONS.pop(sid, None)
-            return self._write_json(200, {"ok": True, "removed": removed})
-
-        self._write_error(404, f"not found: {path}")
-
-    # ---- upload ----------------------------------------------------------
-
-    def _handle_upload(self) -> None:
-        """
-        POST /api/upload — multipart/form-data with a single 'file' field.
-        Writes to <user_workspace>/input/<filename>. Sanitizes filename.
-        """
-        ctype = self.headers.get("Content-Type", "")
-        if not ctype.startswith("multipart/form-data"):
-            return self._write_error(400, "Content-Type must be multipart/form-data")
-
-        # Extract boundary
+    sessions_out = []
+    for s in sessions:
+        preview = (s.get("first_user_message") or "")[:80]
+        sid = s.get("id")
+        project_dir = s.get("project_dir") or ""
         try:
-            _, params = ctype.split(";", 1)
-            boundary = None
-            for part in params.split(";"):
-                part = part.strip()
-                if part.startswith("boundary="):
-                    boundary = part[len("boundary="):].strip('"')
-                    break
-            if not boundary:
-                return self._write_error(400, "missing multipart boundary")
+            project_name = Path(project_dir).name if project_dir else "main"
         except Exception:
-            return self._write_error(400, "could not parse Content-Type")
-
-        try:
-            length = int(self.headers.get("Content-Length") or "0")
-        except ValueError:
-            return self._write_error(400, "invalid Content-Length")
-        if length <= 0 or length > 500 * 1024 * 1024:  # 500 MB cap
-            return self._write_error(400, "file too large or empty (max 500 MB)")
-
-        try:
-            body = self.rfile.read(length)
-        except Exception as e:
-            return self._write_error(500, f"read failed: {e}")
-
-        # Parse multipart manually — we only need the first file field
-        boundary_bytes = ("--" + boundary).encode("ascii")
-        parts = body.split(boundary_bytes)
-        filename = None
-        file_data = None
-        for part in parts:
-            if not part or part == b"--\r\n" or part == b"--":
-                continue
-            # Each part: \r\nheader\r\nheader\r\n\r\nbody\r\n
-            try:
-                header_blob, _, payload = part.lstrip(b"\r\n").partition(b"\r\n\r\n")
-                headers_text = header_blob.decode("latin-1", errors="ignore")
-                if "filename=" not in headers_text:
-                    continue
-                # Pull filename
-                for h in headers_text.split("\r\n"):
-                    if h.lower().startswith("content-disposition"):
-                        for token in h.split(";"):
-                            token = token.strip()
-                            if token.startswith("filename="):
-                                filename = token[len("filename="):].strip('"')
-                                break
-                        break
-                if filename:
-                    file_data = payload.rstrip(b"\r\n")
-                    break
-            except Exception:
-                continue
-
-        if not filename or file_data is None:
-            return self._write_error(400, "no file field in upload")
-
-        safe_name = _safe_filename(filename)
-        if not safe_name or safe_name in (".", ".."):
-            return self._write_error(400, "invalid filename")
-
-        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-        input_dir = workspace / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        target = input_dir / safe_name
-
-        try:
-            target.write_bytes(file_data)
-        except Exception as e:
-            return self._write_error(500, f"write failed: {e}")
-
-        rel_path = str(target.relative_to(workspace))
-        return self._write_json(200, {
-            "ok": True,
-            "path": rel_path,
-            "size": len(file_data),
+            project_name = "main"
+        sessions_out.append({
+            "id": sid,
+            "started_at": s.get("started_at"),
+            "last_activity_at": s.get("last_activity_at"),
+            "event_count": s.get("event_count", 0),
+            "preview": preview,
+            "project": project_name,
+            "user": s.get("user") or "",
+            "live": sid in live_ids,
         })
 
-    # ---- usage / cost ----------------------------------------------------
+    return JSONResponse({"sessions": sessions_out})
 
-    def _handle_usage(self) -> None:
-        """
-        GET /api/usage — aggregate cost/tokens for the requesting user.
-        Returns today's (rolling 24h) and lifetime spend by scanning the
-        JSONL log once per query.
-        """
-        user = self._get_request_user()
-        now = time.time()
-        day_start = now - 86400
 
-        try:
-            lifetime = telemetry.usage_for_user(user)
-            today = telemetry.usage_for_user(user, since_ts=day_start)
-        except Exception as e:
-            return self._write_error(500, f"usage query failed: {e}")
+@app.get("/api/projects")
+async def api_list_projects(request: Request):
+    _require_auth(request)
+    user = _get_user(request)
+    if PER_USER_WORKSPACES and user:
+        user_root = (_users_root() / _sanitize_name(user)).resolve()
+    else:
+        user_root = _workspace_root()
 
-        return self._write_json(200, {
-            "user": user,
-            "today": today,
-            "lifetime": lifetime,
+    projects = []
+    try:
+        if user_root.exists():
+            for entry in sorted(user_root.iterdir()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    projects.append({"name": entry.name, "path": str(entry)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to list projects: {e}")
+
+    return JSONResponse({"projects": projects, "user": user or ""})
+
+
+@app.get("/api/usage")
+async def api_usage(request: Request):
+    _require_auth(request)
+    user = _get_user(request)
+    now = time.time()
+    day_start = now - 86400
+    try:
+        lifetime = telemetry.usage_for_user(user)
+        today = telemetry.usage_for_user(user, since_ts=day_start)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"usage query failed: {e}")
+    return JSONResponse({"user": user, "today": today, "lifetime": lifetime})
+
+
+@app.get("/api/costs")
+async def api_costs(request: Request):
+    _require_auth(request)
+    user_param = request.query_params.get("user", "").strip() or None
+    try:
+        report = costs.build_report(user_param)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"costs build failed: {e}")
+    report["fal"] = _fal_whoami()
+    return JSONResponse(report)
+
+
+@app.get("/api/manifest")
+async def api_manifest(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    manifest_path = workspace / "manifest.yaml"
+    if not manifest_path.is_file():
+        return JSONResponse({
+            "exists": False,
+            "workspace": str(workspace),
+            "manifest": None,
+            "voiceover": None,
+            "scenes": [],
+        })
+    try:
+        import yaml as _yaml
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"manifest read failed: {e}")
+
+    scenes_out: list[dict] = []
+    for s in (raw.get("scenes") or []):
+        if not isinstance(s, dict):
+            continue
+        still_rel = s.get("still") or ""
+        still_url = f"/media/{still_rel}" if still_rel else None
+        scenes_out.append({
+            "number": s.get("number"),
+            "title": s.get("title"),
+            "duration": s.get("duration"),
+            "still": still_rel,
+            "still_url": still_url,
+            "motion": s.get("motion"),
+            "vo_text": s.get("vo_text") or "",
         })
 
-    # ---- projects (filesystem-backed) -----------------------------------
+    vo = raw.get("voiceover") or {}
+    vo_out = None
+    if isinstance(vo, dict) and vo:
+        audio_rel = vo.get("audio_file") or ""
+        vo_out = {
+            "audio_file": audio_rel,
+            "audio_url": f"/media/{audio_rel}" if audio_rel else None,
+            "vo_manifest": vo.get("vo_manifest"),
+            "duration_s": vo.get("duration_s"),
+            "script": vo.get("script"),
+            "transcribed_by": vo.get("transcribed_by"),
+        }
 
-    def _handle_list_projects(self) -> None:
-        """GET /api/projects — list subdirectories of the user's root workspace as projects."""
-        user = self._get_request_user()
-        if PER_USER_WORKSPACES and user:
-            user_root = (PROJECT_DIR / _sanitize_name(user)).resolve()
-        else:
-            user_root = PROJECT_DIR
+    return JSONResponse({
+        "exists": True,
+        "workspace": str(workspace),
+        "project": workspace.name,
+        "brief": raw.get("brief"),
+        "concept_id": raw.get("concept_id"),
+        "voice": raw.get("voice") or {},
+        "voiceover": vo_out,
+        "headline": raw.get("headline"),
+        "captions": raw.get("captions") or {},
+        "scenes": scenes_out,
+        "raw": raw,
+    })
 
-        projects = []
+
+@app.get("/api/servers")
+async def api_servers(request: Request):
+    _require_auth(request)
+    return JSONResponse({"servers": registry.list_servers()})
+
+
+@app.get("/api/chat")
+async def api_chat(request: Request):
+    _require_auth(request)
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    return JSONResponse({
+        "workspace": str(workspace),
+        "project": workspace.name,
+        "turns": _load_chat_history(workspace),
+    })
+
+
+@app.get("/api/session/{session_id}/history")
+async def api_session_history(session_id: str, request: Request):
+    _require_auth(request)
+    events = telemetry.load_session_events(session_id)
+    messages = []
+    for ev in events:
+        kind = ev.get("kind", "")
+        p = ev.get("payload", {})
         try:
-            if user_root.exists():
-                for entry in sorted(user_root.iterdir()):
-                    if entry.is_dir() and not entry.name.startswith("."):
-                        projects.append({"name": entry.name, "path": str(entry)})
-        except Exception as e:
-            return self._write_error(500, f"failed to list projects: {e}")
-
-        return self._write_json(200, {"projects": projects, "user": user or ""})
-
-    def _handle_create_project(self) -> None:
-        """POST /api/projects — create a new project folder."""
-        body = self._read_json_body()
-        name = _sanitize_name(body.get("name") or "")
-        if not name:
-            return self._write_error(400, "name is required")
-        user = self._get_request_user()
-        workspace = _workspace_for(user, name)
-        try:
-            _ensure_workspace(workspace)
-        except Exception as e:
-            return self._write_error(500, f"failed to create project: {e}")
-        return self._write_json(200, {"name": name, "path": str(workspace)})
-
-    # ---- session history -------------------------------------------------
-
-    def _handle_list_sessions(self) -> None:
-        """GET /api/sessions — recent sessions with preview text and live status."""
-        request_user = self._get_request_user() if PER_USER_WORKSPACES else None
-        try:
-            sessions = telemetry.list_sessions(limit=50, user=request_user)
-        except Exception as e:
-            return self._write_error(500, f"sessions query failed: {e}")
-
-        # Snapshot which sessions are currently live (agent thread alive)
-        with SESSIONS_LOCK:
-            live_ids = {
-                sid for sid, s in SESSIONS.items()
-                if s.agent_thread and s.agent_thread.is_alive()
-            }
-
-        sessions_out = []
-        for s in sessions:
-            preview = (s.get("first_user_message") or "")[:80]
-            sid = s.get("id")
-            # Extract just the project name from the full project_dir path
-            project_dir = s.get("project_dir") or ""
-            try:
-                project_name = Path(project_dir).name if project_dir else "main"
-            except Exception:
-                project_name = "main"
-            sessions_out.append({
-                "id": sid,
-                "started_at": s.get("started_at"),
-                "last_activity_at": s.get("last_activity_at"),
-                "event_count": s.get("event_count", 0),
-                "preview": preview,
-                "project": project_name,
-                "user": s.get("user") or "",
-                "live": sid in live_ids,
-            })
-
-        return self._write_json(200, {"sessions": sessions_out})
-
-    def _handle_session_history(self, session_id: str) -> None:
-        """GET /api/session/<id>/history — reconstructed message list."""
-        events = telemetry.load_session_events(session_id)
-        messages = []
-        for ev in events:
-            kind = ev.get("kind", "")
-            p = ev.get("payload", {})
-            try:
-                if kind == "user_message":
-                    messages.append({"role": "user", "text": p.get("text", "")})
-                elif kind == "assistant_text":
-                    messages.append({"role": "assistant", "text": p.get("text", "")})
-                elif kind == "tool_use":
-                    messages.append({
-                        "role": "tool_use",
-                        "name": p.get("name", ""),
-                        "args": p.get("input", {}),
-                        "tool_id": p.get("id", ""),
-                    })
-                elif kind == "tool_result":
-                    messages.append({
-                        "role": "tool_result",
-                        "tool_id": p.get("id", ""),
-                        "summary": p.get("summary", ""),
-                    })
-                elif kind == "dispatch_start":
-                    mode = p.get("mode", "")
-                    preview = p.get("brief_preview", "")
-                    messages.append({
-                        "role": "dispatch",
-                        "phase": "starting",
-                        "text": f"dispatching ({mode}): {preview}",
-                    })
-                elif kind == "dispatch_complete":
-                    cancelled = p.get("cancelled")
-                    if cancelled:
-                        text = "dispatch cancelled"
+            if kind == "user_message":
+                messages.append({"role": "user", "text": p.get("text", "")})
+            elif kind == "assistant_text":
+                messages.append({"role": "assistant", "text": p.get("text", "")})
+            elif kind == "tool_use":
+                messages.append({
+                    "role": "tool_use",
+                    "name": p.get("name", ""),
+                    "args": p.get("input", {}),
+                    "tool_id": p.get("id", ""),
+                })
+            elif kind == "tool_result":
+                messages.append({
+                    "role": "tool_result",
+                    "tool_id": p.get("id", ""),
+                    "summary": p.get("summary", ""),
+                })
+            elif kind == "dispatch_start":
+                mode = p.get("mode", "")
+                preview = p.get("brief_preview", "")
+                messages.append({
+                    "role": "dispatch",
+                    "phase": "starting",
+                    "text": f"dispatching ({mode}): {preview}",
+                })
+            elif kind == "dispatch_complete":
+                cancelled = p.get("cancelled")
+                if cancelled:
+                    text = "dispatch cancelled"
+                else:
+                    rc = p.get("rc")
+                    out = p.get("output_path", "")
+                    err = p.get("error", "")
+                    if rc == 0:
+                        text = f"render complete: {out}" if out else "render complete"
                     else:
-                        rc = p.get("rc")
-                        out = p.get("output_path", "")
-                        err = p.get("error", "")
-                        if rc == 0:
-                            text = f"render complete: {out}" if out else "render complete"
-                        else:
-                            text = f"dispatch failed rc={rc}: {err}" if err else f"dispatch failed rc={rc}"
-                    messages.append({"role": "dispatch", "phase": "done", "text": text})
-                elif kind == "dispatch_error":
-                    messages.append({
-                        "role": "dispatch",
-                        "phase": "error",
-                        "text": p.get("error", "dispatch error"),
-                    })
-                elif kind == "error":
-                    messages.append({"role": "error", "text": p.get("message", str(p))})
-                # skip other event kinds (dispatch_event raw lines, etc.)
-            except Exception as e:
-                print(
-                    f"history: failed to convert event kind={kind}: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-        return self._write_json(200, {"session_id": session_id, "messages": messages})
-
-    # ---- static + media --------------------------------------------------
-
-    def _serve_static(self, rel: str) -> None:
-        safe = (STATIC_DIR / rel).resolve()
-        try:
-            safe.relative_to(STATIC_DIR)
-        except ValueError:
-            return self._write_error(400, "bad path")
-        if not safe.is_file():
-            return self._write_error(404, f"static not found: {rel}")
-        mime, _ = mimetypes.guess_type(str(safe))
-        data = safe.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(data)
-        except Exception:
-            pass
-
-    def _serve_project_file(self, rel: str) -> None:
-        workspace = _workspace_for(self._get_request_user(), self._get_request_project())
-        # URL-decode the path — browsers percent-escape spaces and non-ASCII
-        # chars, but Path resolution needs the raw filename.
-        rel = unquote(rel)
-        try:
-            target = _resolve_project_path(rel, workspace=workspace)
-        except PathError as e:
-            return self._write_error(400, str(e))
-        if not target.is_file():
-            return self._write_error(404, f"not found: {rel}")
-        mime, _ = mimetypes.guess_type(str(target))
-        try:
-            data = target.read_bytes()
+                        text = f"dispatch failed rc={rc}: {err}" if err else f"dispatch failed rc={rc}"
+                messages.append({"role": "dispatch", "phase": "done", "text": text})
+            elif kind == "dispatch_error":
+                messages.append({
+                    "role": "dispatch",
+                    "phase": "error",
+                    "text": p.get("error", "dispatch error"),
+                })
+            elif kind == "error":
+                messages.append({"role": "error", "text": p.get("message", str(p))})
         except Exception as e:
-            return self._write_error(500, f"read failed: {e}")
-        self.send_response(200)
-        self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(data)
-        except Exception:
-            pass
+            print(
+                f"history: failed to convert event kind={kind}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return JSONResponse({"session_id": session_id, "messages": messages})
 
-    # ---- SSE -------------------------------------------------------------
 
-    def _serve_sse(self, session_id: str) -> None:
-        session = get_or_create_session(session_id)
-        q = session.subscribe()
+@app.get("/api/session/{session_id}")
+async def api_session(session_id: str, request: Request):
+    _require_auth(request)
+    s = SESSIONS.get(session_id)
+    if s is None:
+        return JSONResponse({"session_id": session_id, "log": telemetry.load_session_events(session_id)})
+    return JSONResponse({"session_id": session_id, "log": s.display_log})
+
+
+@app.get("/api/stream/{session_id}")
+async def api_stream(session_id: str, request: Request):
+    _require_auth(request)
+    session = get_or_create_session(session_id)
+    q = session.subscribe()
+
+    async def event_generator():
+        # Initial hello
+        yield {
+            "event": "hello",
+            "data": json.dumps({"session_id": session_id}),
+        }
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            # initial hello
-            self._sse_write("hello", {"session_id": session_id})
             while True:
+                if await request.is_disconnected():
+                    break
                 try:
-                    evt = q.get(timeout=15.0)
+                    # Poll with a short timeout so we can check disconnect
+                    evt = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: q.get(timeout=15.0)
+                    )
                 except queue.Empty:
-                    # keep-alive
-                    try:
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        return
+                    # Keep-alive ping
+                    yield {"event": "ping", "data": "{}"}
                     continue
                 kind = evt.get("kind", "message")
                 data = evt.get("data", {})
-                self._sse_write(kind, data)
-        except Exception as e:
-            print(f"sse: stream ended: {e}", file=sys.stderr, flush=True)
+                yield {
+                    "event": kind,
+                    "data": json.dumps(data, default=str),
+                }
         finally:
             session.unsubscribe(q)
 
-    def _sse_write(self, kind: str, data: Any) -> None:
+    return EventSourceResponse(event_generator())
+
+
+# ---------------------------------------------------------------------------
+# Routes — POST
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/message")
+async def api_message(body: MessageRequest, request: Request):
+    _require_auth(request)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    sid = body.session_id
+    user = _get_user(request)
+    project = _get_project(request)
+    session = get_or_create_session(
+        sid if isinstance(sid, str) else None,
+        user=user, project=project,
+    )
+    ref_images = body.reference_images
+    if isinstance(ref_images, list):
+        session.selected_refs = [str(p) for p in ref_images if p]
+    if session.selected_refs:
+        paths_str = ", ".join(session.selected_refs)
+        text = f"[Reference images selected: {paths_str}]\n\n{text}"
+    if re.search(r"\bTEST\s+MODE\b", text, re.IGNORECASE):
+        session.test_mode = True
+        print(f"session {session.id}: TEST MODE enabled", file=sys.stderr, flush=True)
+    start_agent_thread(session, text)
+    return JSONResponse({"session_id": session.id, "project": session.project})
+
+
+@app.post("/api/projects")
+async def api_create_project(body: CreateProjectRequest, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(body.name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    user = _get_user(request)
+    try:
+        workspace = _workspace_for(user, name, scaffold=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to create project: {e}")
+    return JSONResponse({"name": name, "path": str(workspace)})
+
+
+@app.post("/api/cancel")
+async def api_cancel(body: CancelRequest, request: Request):
+    _require_auth(request)
+    sid = body.session_id
+    s = SESSIONS.get(sid)
+    if s is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    s.cancel_event.set()
+    proc = s.dispatch_proc
+    if proc is not None:
         try:
-            payload = json.dumps(data, default=str)
-            msg = f"event: {kind}\ndata: {payload}\n\n".encode("utf-8")
-            self.wfile.write(msg)
-            self.wfile.flush()
+            proc.kill()
         except Exception:
-            raise
+            pass
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/upload")
+async def api_upload(request: Request):
+    _require_auth(request)
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        raise HTTPException(status_code=400, detail="Content-Type must be multipart/form-data")
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"form parse failed: {e}")
+
+    _upload_raw = form.get("file")
+    if _upload_raw is None or isinstance(_upload_raw, str):
+        raise HTTPException(status_code=400, detail="no file field in upload")
+    upload_file = _upload_raw
+
+    try:
+        file_data = await upload_file.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"read failed: {e}")
+
+    if not file_data:
+        raise HTTPException(status_code=400, detail="file too large or empty (max 50 MB)")
+    if len(file_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large (max 50 MB)")
+
+    filename = upload_file.filename or ""
+    filename = os.path.basename(filename)
+    safe_chars = []
+    prev_underscore = False
+    for c in filename:
+        if (c.isascii() and c.isalnum()) or c in "._-":
+            safe_chars.append(c)
+            prev_underscore = False
+        else:
+            if not prev_underscore:
+                safe_chars.append("_")
+                prev_underscore = True
+    safe_name = "".join(safe_chars).strip("_")[:200]
+    if not safe_name or safe_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+
+    workspace = _workspace_for(
+        _get_user(request), _get_project(request), scaffold=True,
+    )
+    input_dir = workspace / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    target = input_dir / safe_name
+
+    try:
+        target.write_bytes(file_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+
+    rel_path = str(target.relative_to(workspace))
+    return JSONResponse({"ok": True, "path": rel_path, "size": len(file_data)})
+
+
+@app.post("/api/open_in_finder")
+async def api_open_in_finder(body: OpenInFinderRequest, request: Request):
+    _require_auth(request)
+    user_path = (body.path or "").strip()
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    if user_path:
+        try:
+            target = _resolve_project_path(user_path, workspace=workspace)
+        except PathError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        target = workspace
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"path does not exist: {target}")
+    try:
+        result = subprocess.run(
+            ["open", str(target)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"open failed: {e}")
+    if result.returncode != 0:
+        err = (result.stderr or "").strip() or f"open exit {result.returncode}"
+        raise HTTPException(status_code=500, detail=f"open failed: {err}")
+    return JSONResponse({"ok": True, "path": str(target)})
+
+
+# ---------------------------------------------------------------------------
+# Routes — DELETE
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/api/image")
+async def api_delete_image(body: DeleteImageRequest, request: Request):
+    _require_auth(request)
+    rel = (body.path or "").strip()
+    if not rel:
+        raise HTTPException(status_code=400, detail="path is required")
+    workspace = _workspace_for(_get_user(request), _get_project(request))
+    try:
+        target = _resolve_project_path(rel, workspace=workspace)
+    except PathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "Finder" to delete POSIX file "{target}"'],
+            check=True, capture_output=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"trash failed: {e}")
+    return JSONResponse({"ok": True, "path": rel})
+
+
+@app.delete("/api/session/{session_id}")
+async def api_delete_session(session_id: str, request: Request):
+    _require_auth(request)
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    with SESSIONS_LOCK:
+        live = SESSIONS.get(session_id)
+    if live:
+        live.cancel_event.set()
+        if live.dispatch_proc:
+            try:
+                live.dispatch_proc.kill()
+            except Exception:
+                pass
+    removed = telemetry.delete_session(session_id)
+    with SESSIONS_LOCK:
+        SESSIONS.pop(session_id, None)
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+@app.delete("/api/projects/{name}")
+async def api_delete_project(name: str, request: Request):
+    _require_auth(request)
+    name = _sanitize_name(name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="project name is required")
+    if name == "main":
+        raise HTTPException(status_code=400, detail="cannot delete the default 'main' project")
+    current = _get_project(request) or "main"
+    if name == current:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot delete the active project '{name}'. Switch to another project first.",
+        )
+    user = _get_user(request)
+    if PER_USER_WORKSPACES and user:
+        workspace = (_users_root() / _sanitize_name(user) / name).resolve()
+        scope = _users_root() / _sanitize_name(user)
+    else:
+        workspace = (_workspace_root() / name).resolve()
+        scope = _workspace_root()
+    try:
+        workspace.relative_to(scope.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid project path")
+    if not workspace.is_dir():
+        raise HTTPException(status_code=404, detail=f"project '{name}' not found")
+    try:
+        shutil.rmtree(workspace)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to delete: {e}")
+    return JSONResponse({"ok": True, "deleted": name})
 
 
 # ---------------------------------------------------------------------------
@@ -2534,9 +2251,6 @@ def find_free_port() -> int:
 
 def preflight() -> None:
     """Validate required environment before spawning the server."""
-    if TEST_MODE:
-        print("parallax-web: TEST_MODE enabled — API key not required, mock stream active", flush=True)
-        return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "parallax-web: ANTHROPIC_API_KEY is not set. "
@@ -2559,7 +2273,6 @@ def preflight() -> None:
 
 def main() -> int:
     preflight()
-    telemetry.init_db()
 
     port = find_free_port()
     host = os.environ.get("PARALLAX_WEB_HOST", "127.0.0.1")
@@ -2569,23 +2282,26 @@ def main() -> int:
     print(f"parallax-web: model    = {MODEL}")
     print(f"parallax-web: url      = {url}")
     if os.environ.get("PARALLAX_WEB_PASSWORD"):
-        print(f"parallax-web: auth     = enabled (Basic Auth)")
+        print("parallax-web: auth     = enabled (Basic Auth)")
     else:
-        print(f"parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
+        print("parallax-web: auth     = DISABLED — set PARALLAX_WEB_PASSWORD to protect")
 
-    server = ThreadedHTTPServer((bind_host, port), Handler)
+    # Pass port to lifespan via env so the registry gets the real port
+    os.environ["_PARALLAX_PORT"] = str(port)
+
     if os.environ.get("PARALLAX_WEB_NO_BROWSER") != "1":
         try:
             webbrowser.open(url)
         except Exception as e:
             print(f"parallax-web: webbrowser.open failed: {e}", file=sys.stderr)
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nparallax-web: shutting down")
-    finally:
-        server.server_close()
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=bind_host,
+        port=port,
+        log_level="warning",
+    )
     return 0
 
 

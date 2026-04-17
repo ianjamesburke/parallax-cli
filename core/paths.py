@@ -2,9 +2,13 @@
 Path resolution for Parallax logs, state, and project output.
 
 Logs live in the project directory where Parallax is invoked:
-  .parallax/logs/runs/{run_id}/
-  .parallax/logs/budgets/{concept_id}.json
-  .parallax/logs/trust.json
+  logs/runs/{run_id}/
+  logs/budgets/{concept_id}.json
+  logs/trust.json
+
+In beta the legacy `.parallax/` hidden folder was flattened: per-project
+state lives at the workspace root directly and run logs live under
+`logs/`. See core/project_layout.py for the canonical layout.
 
 Project output goes to the configured output directory:
   ~/Movies/Parallax/{concept_id}/  (default)
@@ -46,11 +50,11 @@ def get_config(key: str, default=None):
 # ── Log paths ───────────────────────────────────────────────────────────────
 
 _env_root = os.environ.get("PARALLAX_LOG_DIR")
-LOG_ROOT = Path(_env_root) if _env_root else Path.cwd() / ".parallax"
+LOG_ROOT = Path(_env_root) if _env_root else Path.cwd() / "logs"
 
-RUNS_DIR = LOG_ROOT / "logs" / "runs"
-BUDGETS_DIR = LOG_ROOT / "logs" / "budgets"
-TRUST_FILE = LOG_ROOT / "logs" / "trust.json"
+RUNS_DIR = LOG_ROOT / "runs"
+BUDGETS_DIR = LOG_ROOT / "budgets"
+TRUST_FILE = LOG_ROOT / "trust.json"
 
 
 def ensure_dirs():
@@ -74,7 +78,7 @@ def output_root() -> Path:
 
     Resolution order:
       1. PARALLAX_OUTPUT_ROOT env var (used by the `parallax` CLI to pin output
-         to cwd/.parallax/ for project-local runs)
+         to cwd/logs/ for project-local runs)
       2. paths.output from config/parallax.yaml
       3. ~/Movies/Parallax default
     """
