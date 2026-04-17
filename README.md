@@ -1,94 +1,148 @@
 # Parallax CLI
 
-AI video agent pipeline. Analyzes footage, makes edit decisions, and renders output using an LLM agent network. Includes a web interface (`parallax chat`) for directing the pipeline through a browser.
+**Parallax is an agent-operable video production CLI and web UI** for AI-assisted short-form video. A Head-of-Production agent talks to you in plain English, dispatches specialized tools (stills, voiceover, Ken Burns, captions, AI video), and drives a manifest-first pipeline that renders deterministic 9:16 / 16:9 / 1:1 output.
 
-## Requirements
+Version: **0.0.1** — early, honest, ships.
 
-- Python 3.11+
-- `ffmpeg` — `brew install ffmpeg`
-- [`just`](https://github.com/casey/just) — `brew install just`
+## What it can do today
+
+- **Generate images** via Google Gemini Imagen (default) or fal.ai Flux (`parallax fal image low/medium/high` → Flux schnell / dev / pro).
+- **Generate video from text or an image** via fal.ai — three tiers:
+  - **low:** LTX-2.3 (~$0.02/clip) — text-to-video + image-to-video
+  - **medium:** Wan-t2v (~$0.20/clip)
+  - **high:** Kling 1.6 (~$0.056/sec) — supports start + end frame anchoring
+- **Voice** via ElevenLabs. `parallax voice list` enumerates voices; `parallax voice clone --sample audio.wav` clones from a sample. Voice id is persisted into the manifest on every render.
+- **Voiceover + word-timed captions** via ElevenLabs + WhisperX alignment.
+- **Captions + headlines** rendered as transparent PNGs via PIL (no fragile ffmpeg `drawtext`). Three bundled styles: `outline_white_on_black`, `outline_black_on_white`, `block_background`. Inter SemiBold, Anton, DM Sans ship in `assets/fonts/` (all OFL).
+- **Compose** from a `manifest.yaml`: scenes, captions, headline, VO, resolution — everything the agent configures via the manifest takes effect in the output.
+- **Mixed-aspect assembly:** horizontal clips get pillarboxed into vertical output (or crop-fill with `fit: cover`). Vertical sources stay full-frame.
+- **Upload your own audio** (mp3/wav/m4a/aac/ogg/flac) via the web UI — reference it as `voiceover.audio_file` in the manifest and compose muxes it in.
+- **Async video thumbnails** in the web UI (cached per workspace).
+- **Web chat UI** (`parallax web`) with inline image previews, video posters, mid-flight interrupt, and per-session chat + media bin.
+- **Agent-operable** — every subcommand supports `--json` (NDJSON events) and respects `TEST_MODE` for offline runs.
+
+## What it does NOT do yet
+
+- No real-time preview scrubbing in the UI.
+- No end-to-end test on the HoP agent's tool orchestration — the individual tools are verified, the agent's routing is not.
+- No audio-native video (Veo 3 tier) — scoped as a future `high-audio` tier.
+- No multi-user collaborative editing.
 
 ## Install
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/ianjamesburke/parallax-cli/main/scripts/install.sh | bash
-```
-
-Installs Homebrew, Python 3.11+, `just`, and `ffmpeg` if missing, clones the repo, and wires up the CLI. Idempotent — safe to re-run.
-
-**If you already have the repo cloned:**
+Requires Python 3.11+, [uv](https://astral.sh/uv), and `ffmpeg`.
 
 ```sh
-cd parallax-cli
-just install
+# from the repo root
+uv tool install --editable .
 ```
 
-`just install` does two things:
-1. Symlinks `bin/parallax` into `~/.local/bin/`
-2. Creates `web/.venv` and installs all web server dependencies
-
-## API Keys
-
-Add these to your shell rc (`~/.zshrc` or `~/.zsh_secrets`):
+Then:
 
 ```sh
-export ANTHROPIC_API_KEY="sk-ant-..."      # required — chat agent
-export AI_VIDEO_GEMINI_KEY="AIza..."       # required — image generation
-export ELEVENLABS_API_KEY="sk_..."         # required — voiceover
+parallax --help
 ```
 
-Get keys: [Anthropic](https://console.anthropic.com/) · [Google AI Studio](https://aistudio.google.com/app/apikey) · [ElevenLabs](https://elevenlabs.io/)
+## API keys
 
-## Launch the Web Interface
+Put these in `~/.zsh_secrets` (or equivalent):
 
 ```sh
-cd ~/my-project
-parallax chat
+export ANTHROPIC_API_KEY="sk-ant-..."   # HoP agent
+export AI_VIDEO_GEMINI_KEY="AIza..."    # Gemini Imagen (image gen default)
+export FAL_KEY="..."                    # fal.ai (video gen + alt image tiers)
+export ELEVENLABS_API_KEY="sk_..."      # voiceover + voice cloning
 ```
 
-Opens a browser at `http://127.0.0.1:<port>/`. Talk to the Head of Production agent to generate images, build a manifest, and render videos.
+Anything you don't set disables the corresponding tool — the rest still works.
 
-To share with others, set a password and expose via [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
+## Config
+
+Optional `.parallax/config.toml` at your project root overrides tier → model mappings:
+
+```toml
+[fal.video.t2v]
+low = "fal-ai/ltx-2.3/text-to-video"
+medium = "fal-ai/wan-t2v"
+high = "fal-ai/kling-video/v1.6/standard/text-to-video"
+
+[fal.video.i2v]
+low = "fal-ai/ltx-2.3/image-to-video"
+medium = "fal-ai/wan-i2v"
+high = "fal-ai/kling-video/v1.6/standard/image-to-video"
+
+[fal.image]
+low = "fal-ai/flux/schnell"
+medium = "fal-ai/flux/dev"
+high = "fal-ai/flux-pro/v1.1"
+```
+
+Precedence: `--model` flag > `PARALLAX_FAL_*` env > `config.toml` > built-in defaults. `parallax config show` prints the effective config with source attribution.
+
+## Quickstart
 
 ```sh
-PARALLAX_WEB_PASSWORD=yourpassword parallax chat
-cloudflared tunnel run --url http://127.0.0.1:<port> parallax
+# 1. Generate a vertical image (Flux schnell, ~$0.003)
+parallax fal image low --prompt "neon sign reading 'shipping'" --aspect 9:16 --output hero.jpg
+
+# 2. Animate it into a 6s clip (LTX-2.3 image-to-video, ~$0.02)
+parallax fal video low --image hero.jpg --prompt "the sign flickers on" --aspect 9:16 --output clip.mp4
+
+# 3. Or drive the whole thing from a browser
+parallax web
 ```
 
-## CLI Commands
+## CLI surface
+
+```
+parallax web                                         # launch the Head-of-Production web UI
+parallax fal image <low|medium|high>                 # generate image (Flux)
+parallax fal video <low|medium|high> [--image PATH]  # generate video (LTX/Wan/Kling)
+parallax fal models                                  # show tier → model map + source
+parallax voice list                                  # list ElevenLabs voices
+parallax voice clone --name X --sample audio.wav     # clone a voice
+parallax voiceover --text "..." --voice <id>         # generate VO + word timings
+parallax ingest                                      # index video files in input/
+parallax compose                                     # render from manifest.yaml
+parallax config show                                 # effective config dump
+```
+
+All subcommands accept `--json` for NDJSON output. Run with `TEST_MODE=1` for offline pipeline verification.
+
+## Manifest
+
+Every render is driven by a `manifest.yaml`. The invariant: `parallax compose` always reproduces the output from the manifest alone. Example:
+
+```yaml
+config:
+  resolution: 1080x1920
+scenes:
+  - type: video
+    source: input/clip.mp4
+    start_s: 30
+    end_s: 45
+    fit: cover      # or contain (default)
+voiceover:
+  audio_file: audio/voiceover.mp3
+  voice_id: SAz9YHcvj6GT2YYXdXww
+captions:
+  enabled: true
+  style: outline_white_on_black
+headline:
+  text: WEEK IN REVIEW
+  style: block_background
+```
+
+Unknown fields are rejected loudly. Common aliases (`trim_start` → `start_s`) are normalized with a warning.
+
+## Test mode
 
 ```sh
-parallax run "cut a 15s teaser from these clips"   # run pipeline in cwd
-parallax chat                                       # launch web interface
-parallax status                                    # show manifest stats for cwd
-parallax project new my-shoot                      # scaffold a new project
-parallax projects                                  # list known projects
+TEST_MODE=true parallax compose
 ```
 
-## Environment Variables
+Mocks LLM + image/video/voiceover calls. No API spend, no keys required.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | **required** | Anthropic API credentials |
-| `AI_VIDEO_GEMINI_KEY` | **required** | Gemini image generation |
-| `ELEVENLABS_API_KEY` | **required** | ElevenLabs voiceover |
-| `PARALLAX_WEB_PASSWORD` | — | Enables basic auth + per-user workspaces |
-| `PARALLAX_WEB_MODEL` | `claude-sonnet-4-6` | Model override |
-| `PARALLAX_WEB_PORT` | auto | Force a specific port |
-| `PARALLAX_WEB_NO_BROWSER` | `0` | Set to `1` to skip auto-open |
-| `PARALLAX_PROJECT_DIR` | cwd | Override the project root |
+## License
 
-## Test Mode
-
-```sh
-TEST_MODE=true parallax run "test prompt"
-```
-
-Uses placeholders, makes zero external API calls.
-
-## Tests
-
-```sh
-just test        # full suite
-just test-cli    # CLI smoke tests only
-```
+See LICENSE.
