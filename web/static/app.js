@@ -24,31 +24,6 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
-// ----- workspace-scoped URL helper ----------------------------------------
-
-// Every project-scoped API route MUST carry ?user=/?project= forwarded
-// from the current browser URL. Without it the server falls through to
-// the default "main" workspace — that's the class of bug that had the
-// Finder button opening main when the tab was sitting in Womp, uploads
-// landing in the wrong project, etc.
-//
-// ALWAYS appends `?project=` — even if the tab URL has no project param,
-// we send an explicit `?project=main`. Otherwise the server's cookie
-// fallback chain can keep returning a stale `parallax_project` cookie
-// from a previous load, which the frontend can't clear because it's
-// HttpOnly. Explicit beats implicit.
-//
-// Use this for every fetch whose backend handler calls _workspace_for().
-// Global routes (/api/servers, /api/costs, /api/cancel) don't need it.
-function apiUrl(path) {
-  const cur = new URLSearchParams(window.location.search);
-  const qs = new URLSearchParams();
-  qs.set("project", cur.get("project") || "main");
-  const user = cur.get("user");
-  if (user) qs.set("user", user);
-  return path + (path.includes("?") ? "&" : "?") + qs.toString();
-}
-
 // ----- status dot ----------------------------------------------------------
 
 const STATUS_LABELS = {
@@ -85,7 +60,6 @@ function scrollToBottom() {
 }
 
 function appendUserMsg(text, opts) {
-  hideWelcome();
   const el = document.createElement("div");
   el.className = "msg user" + (opts && opts.interrupt ? " interrupt" : "");
   el.textContent = text;
@@ -150,49 +124,17 @@ function appendToolResult(ev) {
   scrollToBottom();
 }
 
-// Event-kind noise filter: by default, only terminal phases (done / error)
-// land in the chat as a strip. Everything in between (starting, run_started,
-// request_intended, cost_estimated, still_generated, etc.) updates the
-// status bar at the top but doesn't spam the chat. Toggle verbose mode via
-// localStorage.parallax_debug = "1" in devtools when you actually want to
-// see every event.
-function _debugDispatchEnabled() {
-  try {
-    return localStorage.getItem("parallax_debug") === "1";
-  } catch (_) { return false; }
-}
-
-// Phases we'll always surface as a chat strip — the rest are treated as
-// status-only updates.
-const DISPATCH_CHAT_PHASES = new Set(["done", "error", "starting"]);
-
 function appendDispatchEvent(ev) {
-  const phase = ev.phase || "";
-  const isTerminal = phase === "done" || phase === "error";
-
-  // Always keep the status side-effects — the top status bar should still
-  // reflect that something is dispatching.
-  if (isTerminal) {
-    state.dispatchActive = false;
-    refreshGallery();
-  } else {
-    state.dispatchActive = true;
-    setStatus("dispatching");
-  }
-
-  // Decide whether to render the strip into the chat.
-  const shouldRender = _debugDispatchEnabled() || DISPATCH_CHAT_PHASES.has(phase);
-  if (!shouldRender) return;
-
-  hideWelcome();
   const el = document.createElement("div");
   el.className = "dispatch-strip";
-  if (phase === "done") el.classList.add("done");
-  if (phase === "error") el.classList.add("error");
+  if (ev.phase === "done") el.classList.add("done");
+  if (ev.phase === "error") el.classList.add("error");
 
+  // Clean label: no [parallax] prefix, and a single leading dot character
+  // for the active state, a check for done, X for error.
   let marker = "·";
-  if (phase === "done") marker = "✓";
-  if (phase === "error") marker = "!";
+  if (ev.phase === "done") marker = "✓";
+  if (ev.phase === "error") marker = "!";
 
   const markerEl = document.createElement("span");
   markerEl.className = "dispatch-marker";
@@ -201,11 +143,18 @@ function appendDispatchEvent(ev) {
 
   const textEl = document.createElement("span");
   textEl.className = "dispatch-text";
-  textEl.textContent = ev.text || phase;
+  textEl.textContent = ev.text || ev.phase || "";
   el.appendChild(textEl);
 
   messagesEl().appendChild(el);
   scrollToBottom();
+  if (ev.phase === "done" || ev.phase === "error") {
+    state.dispatchActive = false;
+    refreshGallery();
+  } else {
+    state.dispatchActive = true;
+    setStatus("dispatching");
+  }
 }
 
 function appendError(message) {
@@ -282,12 +231,8 @@ function openStream(sessionId) {
 
   es.addEventListener("agent_done", (e) => {
     finalizeAssistantMsg();
-    // Hard clear every "something is running" flag. Previously we'd leave
-    // the thinking bar on whenever dispatchActive was still true from a
-    // stale prior run — that's the bug the user caught.
+    if (!state.dispatchActive) setStatus("");
     state.thinking = false;
-    state.dispatchActive = false;
-    setStatus("");
     updateButtons();
     refreshGallery();
     refreshUsage();
@@ -348,7 +293,7 @@ async function sendMessage(text) {
   }
 
   try {
-    const r = await fetch(apiUrl("/api/message"), {
+    const r = await fetch("/api/message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: state.sessionId, text, reference_images: refImages }),
@@ -397,7 +342,7 @@ function updateButtons() {
 
 async function refreshGallery() {
   try {
-    const r = await fetch(apiUrl("/api/gallery"));
+    const r = await fetch("/api/gallery");
     if (!r.ok) return;
     const data = await r.json();
     renderGallery(data);
@@ -475,7 +420,7 @@ function renderGallery(data) {
         del.addEventListener("click", async (e) => {
           e.stopPropagation();
           try {
-            const r = await fetch(apiUrl("/api/image"), {
+            const r = await fetch("/api/image", {
               method: "DELETE",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ path: s.path }),
@@ -589,7 +534,7 @@ function renderGallery(data) {
       vDel.addEventListener("click", async (e) => {
         e.stopPropagation();
         try {
-          const r = await fetch(apiUrl("/api/image"), {
+          const r = await fetch("/api/image", {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ path: v.path }),
@@ -630,31 +575,39 @@ function updateRefBar() {
   }
 }
 
-// ----- welcome card --------------------------------------------------------
+// ----- Google Drive link ---------------------------------------------------
 
-const WELCOME_HTML = `
-  <div class="welcome" id="welcome">
-    <div class="welcome-title">Welcome to Parallax</div>
-    <div class="welcome-sub">A short-form video studio driven by natural language.</div>
-    <ul class="welcome-list">
-      <li><b>Brief the Head of Production.</b> Describe what you want — a 3-scene Ken Burns ad, a character study, a mood piece — and it handles stills, voiceover, pacing, and final render.</li>
-      <li><b>Upload reference images</b> via the gallery on the right. They're selected as references by default, so the next generation uses them image-to-image via Gemini.</li>
-      <li><b>Type "TEST MODE" anywhere in your brief</b> to run the full pipeline without spending API credits — placeholder stills + macOS voice.</li>
-      <li><b>Projects</b> live under <code>parallax/&lt;project&gt;/</code>. Create one via the <b>+</b> in the sidebar; files at the launch-dir root are shared across every project.</li>
-    </ul>
-  </div>`;
+const DRIVE_KEY = "parallax_drive_url";
 
-function hideWelcome() {
-  const w = $("welcome");
-  if (w) w.remove();
-}
+function initDriveBtn() {
+  const link = $("drive-btn");
+  const setBtn = $("drive-set-btn");
 
-function showWelcomeIfEmpty() {
-  const m = messagesEl();
-  // Only show if there's no prior content and no welcome already there.
-  if (m.children.length > 0 && $("welcome")) return;
-  if (m.children.length > 0) return;
-  m.insertAdjacentHTML("afterbegin", WELCOME_HTML);
+  function applyDriveUrl(url) {
+    if (url) {
+      link.href = url;
+      link.style.display = "";
+      setBtn.style.display = "none";
+    } else {
+      link.style.display = "none";
+      setBtn.style.display = "";
+    }
+  }
+
+  applyDriveUrl(localStorage.getItem(DRIVE_KEY) || "");
+
+  setBtn.addEventListener("click", () => {
+    const current = localStorage.getItem(DRIVE_KEY) || "";
+    const raw = window.prompt("Paste your Google Drive folder URL:", current);
+    if (raw === null) return; // cancelled
+    const url = raw.trim();
+    if (url) {
+      localStorage.setItem(DRIVE_KEY, url);
+    } else {
+      localStorage.removeItem(DRIVE_KEY);
+    }
+    applyDriveUrl(url);
+  });
 }
 
 // ----- lightbox ------------------------------------------------------------
@@ -670,52 +623,28 @@ function closeLightbox() {
 
 // ----- sidebar -------------------------------------------------------------
 
-// Sidebar is a pure projection of what's on disk at PROJECT_DIR/parallax/.
-// No session merging, no telemetry lookups, no hidden cache — the server's
-// /api/projects endpoint reads the filesystem every time, and we poll it
-// on a short interval so a delete in Finder disappears almost immediately.
+// Projects come from the filesystem (Drive folders on disk).
+// Sessions are nested under the active project.
 const sidebarState = {
-  projects: [],  // [{name, path}] straight from /api/projects
+  projects: [],       // [{name, path}] from /api/projects
+  sessions: [],       // from /api/sessions
+  activeProject: null, // currently selected project name
 };
 
 async function refreshSidebar() {
   try {
-    // /api/projects is global in single-user mode but user-scoped when
-    // PER_USER_WORKSPACES is on, so forward ?user= too.
-    const r = await fetch(apiUrl("/api/projects"));
-    if (!r.ok) return;
-    const data = await r.json();
-    sidebarState.projects = data.projects || [];
-
-    // Stale-URL guard: if ?project=X points at something that no longer
-    // exists on disk (deleted in Finder, wiped across a server restart,
-    // ghost from a previous run), snap back to main and reload the chat.
-    // Without this the tab gets stuck aiming at a dead workspace and
-    // every project-scoped fetch errors out until the user manually
-    // edits the URL.
-    const params = new URLSearchParams(window.location.search);
-    const currentProject = params.get("project");
-    if (currentProject && currentProject !== "main") {
-      const exists = sidebarState.projects.some((p) => p.name === currentProject);
-      if (!exists) {
-        console.warn(`project "${currentProject}" missing — snapping to main`);
-        const url = new URL(window.location.href);
-        url.searchParams.delete("project");
-        window.history.replaceState({}, "", url);
-        state.sessionId = null;
-        state.thinking = false;
-        state.dispatchActive = false;
-        if (state.eventSource) {
-          try { state.eventSource.close(); } catch (_) {}
-          state.eventSource = null;
-        }
-        setStatus("");
-        updateButtons();
-        refreshProjectBadge();
-        await loadProjectChat();
-      }
+    const [projRes, sessRes] = await Promise.all([
+      fetch("/api/projects"),
+      fetch("/api/sessions"),
+    ]);
+    if (projRes.ok) {
+      const data = await projRes.json();
+      sidebarState.projects = data.projects || [];
     }
-
+    if (sessRes.ok) {
+      const data = await sessRes.json();
+      sidebarState.sessions = data.sessions || [];
+    }
     renderSidebar();
   } catch (e) {
     console.error("sidebar fetch failed", e);
@@ -724,129 +653,114 @@ async function refreshSidebar() {
 
 function renderSidebar() {
   const list = $("sidebar-list");
-  const { projects } = sidebarState;
+  const { projects, sessions, activeProject } = sidebarState;
 
-  if (projects.length === 0) {
+  if (projects.length === 0 && sessions.length === 0) {
     list.innerHTML = '<div class="sidebar-empty">No projects yet. Hit + to create one.</div>';
     return;
   }
 
+  // Build session lookup by project name
+  const sessionsByProject = {};
+  for (const s of sessions) {
+    const proj = s.project || "main";
+    if (!sessionsByProject[proj]) sessionsByProject[proj] = [];
+    sessionsByProject[proj].push(s);
+  }
+
+  // Merge: projects from disk + any orphan session projects not on disk.
+  // Work on a local copy — never mutate sidebarState.projects here.
+  const merged = [...projects];
+  const projectNames = new Set(merged.map((p) => p.name));
+  for (const proj of Object.keys(sessionsByProject)) {
+    if (!projectNames.has(proj)) {
+      merged.push({ name: proj, path: null });
+      projectNames.add(proj);
+    }
+  }
+
   list.innerHTML = "";
-  const currentProject = new URL(window.location.href).searchParams.get("project") || "main";
+  for (const proj of merged) {
+    const projSessions = sessionsByProject[proj.name] || [];
+    const isActive = proj.name === activeProject;
 
-  for (const proj of projects) {
-    const isActive = proj.name === currentProject;
+    const group = document.createElement("div");
+    group.className = "sidebar-group" + (isActive ? " open" : "");
 
-    // Flat project row — no nested sessions. One chat per project, loaded
-    // from <workspace>/chat.jsonl on click.
-    const row = document.createElement("div");
-    row.className = "sidebar-project-row" + (isActive ? " active" : "");
-
-    const labelText = document.createElement("span");
-    labelText.className = "sidebar-project-name";
-    labelText.textContent = proj.name;
-    row.appendChild(labelText);
-
-    // Delete button — refuses to delete the active project or `main`.
-    if (proj.name !== "main") {
-      const del = document.createElement("button");
-      del.className = "sidebar-project-del";
-      del.title = "Delete project";
-      del.textContent = "×";
-      del.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        if (proj.name === currentProject) {
-          appendError(
-            `can't delete the active project "${proj.name}". Switch to another project first.`
-          );
-          return;
-        }
-        if (!window.confirm(
-          `Delete project "${proj.name}"?\n\n` +
-          `This removes parallax/${proj.name}/ and every still, voiceover, ` +
-          `draft, output, log, and chat transcript inside it. ` +
-          `Raw media at the master dir is not touched.`
-        )) return;
-        try {
-          const r = await fetch(
-            apiUrl(`/api/projects/${encodeURIComponent(proj.name)}`),
-            { method: "DELETE" },
-          );
-          if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            appendError(`failed to delete project: ${err.error || r.statusText}`);
-            return;
-          }
-          refreshSidebar();
-        } catch (err) {
-          appendError(`failed to delete project: ${err}`);
-        }
-      });
-      row.appendChild(del);
-    }
-
-    // Click the row → switch project, update URL, reload chat.
-    row.addEventListener("click", async () => {
-      if (proj.name === currentProject) return;
-      const url = new URL(window.location.href);
-      if (proj.name === "main") {
-        url.searchParams.delete("project");
+    // Project label row — click to expand/collapse
+    const label = document.createElement("div");
+    label.className = "sidebar-group-label" + (isActive ? " active" : "");
+    label.textContent = proj.name;
+    label.addEventListener("click", () => {
+      if (sidebarState.activeProject === proj.name) {
+        sidebarState.activeProject = null;
       } else {
-        url.searchParams.set("project", proj.name);
+        sidebarState.activeProject = proj.name;
+        // Switch URL to this project so next message lands here
+        const url = new URL(window.location.href);
+        if (proj.name === "main") {
+          url.searchParams.delete("project");
+        } else {
+          url.searchParams.set("project", proj.name);
+        }
+        window.history.pushState({}, "", url);
+        refreshProjectBadge();
       }
-      window.history.pushState({}, "", url);
-      refreshProjectBadge();
-      // Drop the in-memory session ID so the next message opens a fresh
-      // server-side session that hydrates from the new project's chat.jsonl.
-      state.sessionId = null;
-      state.thinking = false;
-      state.dispatchActive = false;
-      if (state.eventSource) {
-        try { state.eventSource.close(); } catch (_) {}
-        state.eventSource = null;
-      }
-      setStatus("");
-      updateButtons();
-      await loadProjectChat();
-      refreshSidebar();
-      refreshGallery();
+      renderSidebar();
     });
+    group.appendChild(label);
 
-    list.appendChild(row);
-  }
-}
+    // Session list — only visible when project is expanded
+    if (isActive) {
+      if (projSessions.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "sidebar-item sidebar-item-empty";
+        empty.textContent = "No sessions yet.";
+        group.appendChild(empty);
+      }
+      for (const s of projSessions) {
+        const item = document.createElement("div");
+        item.className = "sidebar-item" + (s.id === state.sessionId ? " active" : "");
+        item.dataset.sid = s.id;
 
-async function loadProjectChat() {
-  // Fetch the current workspace's chat.jsonl and replay it. Called on
-  // page load and on every sidebar project switch.
-  state.thinking = false;
-  state.dispatchActive = false;
-  setStatus("");
-  updateButtons();
-  messagesEl().innerHTML = "";
-  state.currentAssistantEl = null;
+        const dot = document.createElement("span");
+        dot.className = "sidebar-item-dot" + (s.live ? " live" : "");
+        item.appendChild(dot);
 
-  let data = { turns: [] };
-  try {
-    const r = await fetch(apiUrl("/api/chat"));
-    if (r.ok) data = await r.json();
-  } catch (e) {
-    console.error("loadProjectChat failed", e);
-  }
+        const text = document.createElement("span");
+        text.className = "sidebar-item-text";
+        text.textContent = s.preview || "(empty)";
+        item.appendChild(text);
 
-  const turns = data.turns || [];
-  if (turns.length === 0) {
-    // Fresh / empty project — show the welcome card.
-    showWelcomeIfEmpty();
-    return;
-  }
-  for (const t of turns) {
-    if (t.role === "user") {
-      appendUserMsg(t.text || "");
-    } else if (t.role === "assistant") {
-      appendAssistantDelta(t.text || "");
-      finalizeAssistantMsg();
+        const del = document.createElement("button");
+        del.className = "sidebar-item-del";
+        del.title = "Delete session";
+        del.textContent = "×";
+        del.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await fetch(`/api/session/${s.id}`, { method: "DELETE" });
+            if (state.sessionId === s.id) {
+              state.sessionId = null;
+              state.thinking = false;
+              state.dispatchActive = false;
+              setStatus("");
+              updateButtons();
+              messagesEl().innerHTML = "";
+            }
+            refreshSidebar();
+          } catch (err) {
+            console.error("delete session failed", err);
+          }
+        });
+        item.appendChild(del);
+
+        item.addEventListener("click", () => loadSessionHistory(s.id));
+        group.appendChild(item);
+      }
     }
+
+    list.appendChild(group);
   }
 }
 
@@ -930,16 +844,6 @@ function refreshProjectBadge() {
       `run completely in parallel.`
     );
   }
-
-  // Forward ?user= / ?project= to the header links so opening /manifest
-  // or /costs from the chat lands in the same workspace the user is in.
-  for (const id of ["manifest-link", "costs-link"]) {
-    const el = document.getElementById(id);
-    if (el) {
-      const base = el.getAttribute("href").split("?")[0];
-      el.href = apiUrl(base);
-    }
-  }
 }
 
 // ----- file uploads --------------------------------------------------------
@@ -948,22 +852,17 @@ async function uploadFile(file) {
   const form = new FormData();
   form.append("file", file, file.name);
   try {
-    const r = await fetch(apiUrl("/api/upload"), { method: "POST", body: form });
+    const r = await fetch("/api/upload", { method: "POST", body: form });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ error: r.statusText }));
       appendError(`upload failed: ${err.error || r.statusText}`);
       return;
     }
     const data = await r.json();
-    // Auto-select the upload as a reference image. The user can still
-    // deselect it from the gallery — this just removes the dead click step.
-    if (data.path) {
-      state.refImages.add(data.path);
-      renderRefBar();
-    }
+    // Surface as a system-style message in the chat
     appendDispatchEvent({
       phase: "done",
-      text: `uploaded ${data.path} (${(data.size / 1024).toFixed(1)} KB) — selected as reference`,
+      text: `uploaded ${data.path} (${(data.size / 1024).toFixed(1)} KB)`,
     });
     refreshGallery();
   } catch (e) {
@@ -1061,23 +960,15 @@ function initComposer() {
 }
 
 async function startNewSession() {
-  // + button creates a brand new project folder on disk and switches into
-  // it. The new project starts empty so the welcome card is visible on
-  // first load.
+  // Ask for a project name — this creates a real folder on disk (Drive-backed)
   const raw = window.prompt("Project name:", "");
   if (raw === null) return; // user cancelled
 
   const name = raw.trim().replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "") || "main";
 
-  // URL query the server wants for ?user=/?project=.
-  const curParams = new URLSearchParams(window.location.search);
-  const qs = new URLSearchParams({ project: name });
-  const curUser = curParams.get("user");
-  if (curUser) qs.set("user", curUser);
-
-  // Create the folder on disk.
+  // Create the folder on disk via the server
   try {
-    const r = await fetch("/api/projects?" + qs.toString(), {
+    const r = await fetch("/api/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -1092,7 +983,7 @@ async function startNewSession() {
     return;
   }
 
-  // Update the URL so subsequent messages land in this project.
+  // Update the URL so sessions land in this project
   const url = new URL(window.location.href);
   if (name === "main") {
     url.searchParams.delete("project");
@@ -1102,7 +993,10 @@ async function startNewSession() {
   window.history.pushState({}, "", url);
   refreshProjectBadge();
 
-  // Clear the chat panel and drop the session ID — next send creates a fresh one.
+  // Expand this project in the sidebar
+  sidebarState.activeProject = name;
+
+  // Clear the chat panel and drop the session ID — next send creates a fresh one
   state.sessionId = null;
   state.thinking = false;
   state.dispatchActive = false;
@@ -1113,104 +1007,24 @@ async function startNewSession() {
   setStatus("");
   updateButtons();
   messagesEl().innerHTML = "";
-  // Fresh project → show the welcome card in the new chat.
-  showWelcomeIfEmpty();
   $("composer-input").focus();
 
   // Refresh sidebar so the new folder appears
   refreshSidebar();
-  refreshGallery();
 }
 
-async function openProjectInFinder() {
-  try {
-    const r = await fetch(apiUrl("/api/open_in_finder"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    if (r.ok) return;
-    // 404 means the current ?project= points at a missing workspace.
-    // Snap to main and try again once — otherwise the Finder click is
-    // a dead-end for anyone who lands in a stale URL.
-    if (r.status === 404) {
-      const url = new URL(window.location.href);
-      if (url.searchParams.get("project") && url.searchParams.get("project") !== "main") {
-        url.searchParams.delete("project");
-        window.history.replaceState({}, "", url);
-        refreshProjectBadge();
-        refreshSidebar();
-        await loadProjectChat();
-        const retry = await fetch(apiUrl("/api/open_in_finder"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        });
-        if (retry.ok) return;
-      }
-    }
-    const err = await r.json().catch(() => ({}));
-    appendError(`finder open failed: ${err.error || r.statusText}`);
-  } catch (e) {
-    appendError(`finder open failed: ${e}`);
-  }
-}
-
-// ----- stale URL guard -----------------------------------------------------
-
-// Before any user interaction, verify that the tab's ?project= actually
-// exists on disk. If not, rewrite the URL to main. This runs BEFORE
-// loadProjectChat() / refreshGallery() / the Finder button is wired, so
-// a stale param from a previous server run can't cause a 404 storm.
-async function snapStaleProjectToMain() {
-  const params = new URLSearchParams(window.location.search);
-  const currentProject = params.get("project");
-  if (!currentProject || currentProject === "main") return;
-  try {
-    const r = await fetch(apiUrl("/api/projects"));
-    if (!r.ok) return;
-    const data = await r.json();
-    const projects = data.projects || [];
-    const exists = projects.some((p) => p.name === currentProject);
-    if (!exists) {
-      console.warn(`project "${currentProject}" missing — snapping to main`);
-      const url = new URL(window.location.href);
-      url.searchParams.delete("project");
-      window.history.replaceState({}, "", url);
-    }
-  } catch (e) {
-    console.error("stale project check failed", e);
-  }
-}
-
-async function init() {
+function init() {
   initComposer();
   initDropZone();
-  // Wire the Finder button early but the click handler is gated on the
-  // stale-URL snap-back below — any click before the page finishes
-  // initializing is harmless because openProjectInFinder always reads
-  // window.location fresh via apiUrl().
-  const finderBtn = document.getElementById("finder-btn");
-  if (finderBtn) finderBtn.addEventListener("click", openProjectInFinder);
-
-  // Snap BEFORE loading chat / gallery so everything points at a valid
-  // workspace on first render.
-  await snapStaleProjectToMain();
-
+  initDriveBtn();
   refreshProjectBadge();
   refreshGallery();
   refreshSidebar();
   refreshUsage();
-  // Load this project's on-disk chat transcript on page load so reload
-  // keeps the conversation. Empty transcript → welcome card.
-  loadProjectChat();
-
   setInterval(() => {
     if (!state.thinking && !state.dispatchActive) refreshGallery();
   }, 2000);
-  // Short poll so Finder deletions + creates are reflected almost
-  // immediately. 2s is cheap — /api/projects is a bare iterdir.
-  setInterval(refreshSidebar, 2000);
+  setInterval(refreshSidebar, 5000);
   setInterval(refreshUsage, 30000);
 }
 
