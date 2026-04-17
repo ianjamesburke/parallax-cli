@@ -156,7 +156,7 @@ def cmd_fal_video(args) -> int:
         if not image_path.exists():
             print(f"[parallax fal] ERROR: --image file not found: {image_path}", file=sys.stderr)
             return 2
-        end_image_path = Path(end_frame_flag) if end_frame_flag else None
+        end_image_path = Path(str(end_frame_flag)) if end_frame_flag is not None else None
         if end_image_path and not end_image_path.exists():
             print(f"[parallax fal] ERROR: --end-frame file not found: {end_image_path}", file=sys.stderr)
             return 2

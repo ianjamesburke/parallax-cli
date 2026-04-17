@@ -60,7 +60,7 @@ def _upload_image(image_path: Path) -> str:
         raise RuntimeError("[parallax fal] fal-client not installed. Run: uv add fal-client")
 
     try:
-        url = fal_client.upload_file(str(image_path))
+        url = fal_client.upload_file(Path(image_path))
         return url
     except Exception as e:
         raise RuntimeError(
