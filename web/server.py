@@ -1301,7 +1301,7 @@ def tool_parallax_ingest(
             ingest_path = str(resolved)
         except PathError as e:
             return f"invalid path: {e}"
-    cmd = [bin_path, "ingest", ingest_path, "--yes"]
+    cmd = [bin_path, "ingest", ingest_path]
     if no_vision:
         cmd.append("--no-vision")
     label = f"ingest: indexing {path}"
@@ -2193,7 +2193,7 @@ def _execute_tool_calls(
                     except Exception as img_err:
                         print(f"parallax_create: could not embed still {still_abs}: {img_err}",
                               file=sys.stderr, flush=True)
-                summary = result_text[:200]
+                summary = result_text[:2000]
                 # Convert absolute paths → workspace-relative for the UI media endpoint.
                 images_rel: list[str] = []
                 for still_abs in result_paths:
@@ -2205,7 +2205,7 @@ def _execute_tool_calls(
             elif name == "parallax_compose":
                 text = tool_parallax_compose(session)
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "parallax_voiceover":
                 text = tool_parallax_voiceover(
                     session,
@@ -2214,15 +2214,15 @@ def _execute_tool_calls(
                     script=args.get("script"),
                 )
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "parallax_trim_silence":
                 text = tool_parallax_trim_silence(session)
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "parallax_align":
                 text = tool_parallax_align(session)
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "parallax_ingest":
                 text = tool_parallax_ingest(
                     session,
@@ -2230,7 +2230,7 @@ def _execute_tool_calls(
                     no_vision=bool(args.get("no_vision", False)),
                 )
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "parallax_transcribe":
                 text = tool_parallax_transcribe(
                     session,
@@ -2239,7 +2239,7 @@ def _execute_tool_calls(
                     language=args.get("language"),
                 )
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "edit_manifest":
                 op = args.get("op")
                 if not op:
@@ -2259,7 +2259,7 @@ def _execute_tool_calls(
                     else:
                         text = result.get("output") or f"manifest {op} ok"
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "list_footage":
                 out = tool_list_footage()
                 content_block = [{"type": "text", "text": json.dumps(out, indent=2)}]
@@ -2332,7 +2332,7 @@ def _execute_tool_calls(
                                 f"fal video {fal_tier}: {fal_prompt[:60]}",
                             )
                 content_block = [{"type": "text", "text": text}]
-                summary = text[:200]
+                summary = text[:2000]
             elif name == "move_to_shared":
                 paths_arg = args.get("paths", [])
                 if not isinstance(paths_arg, list):
@@ -2366,6 +2366,24 @@ def _execute_tool_calls(
         elif name == "make_storyboard" and _storyboard_rel_path:
             _tool_images = [_storyboard_rel_path]
 
+        # Detect tool failures so the model can't misread a failed call as success.
+        # Heuristics: _stream_parallax_subprocess returns "parallax exited rc=N" on failure;
+        # tool_edit_manifest returns text starting with "manifest edit failed:";
+        # subprocess-not-found returns "parallax CLI binary not found".
+        _first_text = (
+            content_block[0]["text"] if content_block and content_block[0].get("type") == "text" else ""
+        )
+        _is_error = (
+            "parallax exited rc=" in _first_text
+            or _first_text.startswith("manifest edit failed:")
+            or _first_text.startswith("parallax CLI binary not found")
+            or _first_text.startswith("failed to spawn parallax")
+            or _first_text.startswith("invalid path:")
+            or _first_text.startswith("tool " + name + " crashed")
+        )
+        if _is_error and not summary.startswith("ERROR"):
+            summary = f"ERROR: {summary}"
+
         _tr_payload: dict = {"id": tool_id, "name": name, "summary": summary}
         if _tool_images:
             _tr_payload["images"] = _tool_images
@@ -2382,13 +2400,14 @@ def _execute_tool_calls(
             {"role": "tool_result", "name": name, "summary": summary},
         )
 
-        results.append(
-            {
-                "type": "tool_result",
-                "tool_use_id": tool_id,
-                "content": content_block,
-            }
-        )
+        _tool_result: dict = {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": content_block,
+        }
+        if _is_error:
+            _tool_result["is_error"] = True
+        results.append(_tool_result)
     return results
 
 
