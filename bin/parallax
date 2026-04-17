@@ -1629,6 +1629,7 @@ def cmd_compose(args) -> int:
     setup_run_logging(run_id)
     log = logging.getLogger("parallax.compose")
     started_at = time.time()
+    log.info("cmd_compose start run_id=%s cwd=%s", run_id, cwd)
     emitter.emit("run_started", brief="compose", mode="compose", project_dir=str(cwd))
 
     manifest_path = cwd / "manifest.yaml"
@@ -1748,6 +1749,10 @@ def cmd_compose(args) -> int:
                 "motion": motion,
             })
 
+    log.info(
+        "cmd_compose manifest loaded scenes=%d concept_id=%s resolution=%s",
+        len(resolved_scenes), concept_id, resolution,
+    )
     print(f"[parallax] composing {len(resolved_scenes)} scene(s) from manifest")
     print(f"[parallax] concept:  {concept_id}")
     print(f"[parallax] resolution: {resolution}")
@@ -1774,6 +1779,10 @@ def cmd_compose(args) -> int:
             clip_path = Path(tmpdir) / f"clip_{scene['index']:02d}.mp4"
             try:
                 if scene["type"] == "still":
+                    log.info(
+                        "cmd_compose scene %d still=%s motion=%s duration=%.1f",
+                        scene["index"], scene["still_rel"], scene["motion"], scene["duration"],
+                    )
                     print(
                         f"[parallax] scene {scene['index']} (still): {scene['still'].name} "
                         f"({scene['motion']}, {scene['duration']}s)...",
@@ -1798,6 +1807,11 @@ def cmd_compose(args) -> int:
                         trim_label = f" ({scene['start_s']}–{scene['end_s']})"
                     else:
                         trim_label = ""
+                    log.info(
+                        "cmd_compose scene %d video=%s start_s=%s end_s=%s",
+                        scene["index"], scene["source_rel"],
+                        scene.get("start_s"), scene.get("end_s"),
+                    )
                     print(
                         f"[parallax] scene {scene['index']} (video): {scene['source'].name}"
                         f"{trim_label}...",
@@ -1830,6 +1844,7 @@ def cmd_compose(args) -> int:
                                     where="cmd_compose.video_scene", log=log)
                 clip_paths.append(str(clip_path))
                 emitter.emit("still_generated", path=str(clip_path), scene=scene["index"])
+                log.info("cmd_compose scene %d done clip=%s", scene["index"], clip_path.name)
                 print("done")
             except Exception as e:
                 return fail(str(e),
@@ -1842,6 +1857,7 @@ def cmd_compose(args) -> int:
         concat_list = Path(tmpdir) / "concat.txt"
         concat_list.write_text("\n".join(f"file '{p}'" for p in clip_paths))
 
+        log.info("cmd_compose assembly start clips=%d output=%s", len(clip_paths), output_path.name)
         print(f"\n[parallax] assembling → {output_path.name}...", end=" ", flush=True)
         emitter.emit("assembly_started", clip_count=len(clip_paths), output_path=str(output_path))
         try:
@@ -1866,6 +1882,7 @@ def cmd_compose(args) -> int:
         vo_rel = vo_info.get("audio_file") if isinstance(vo_info, dict) else None
         vo_audio_path = (cwd / vo_rel).resolve() if vo_rel else None
         if vo_audio_path and vo_audio_path.exists():
+            log.info("cmd_compose muxing audio=%s", vo_rel)
             print(f"[parallax] muxing audio: {vo_rel}...", end=" ", flush=True)
             try:
                 result = _sp.run(
@@ -2122,6 +2139,7 @@ def cmd_compose(args) -> int:
     print(f"[parallax] final: ./output/{output_path.name}")
 
     duration_s = time.time() - started_at
+    log.info("cmd_compose complete output=%s duration_s=%.2f", output_path.name, duration_s)
     emitter.emit("run_complete", output_path=str(output_path), duration_s=round(duration_s, 2))
     return 0
 
