@@ -3483,9 +3483,17 @@ async def api_upload(request: Request):
     workspace = _workspace_for(
         _get_user(request), _get_project(request), scaffold=True,
     )
-    input_dir = workspace / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    target = input_dir / safe_name
+
+    # Route audio files to audio/ subfolder so they're ready for manifest
+    # voiceover.audio_file references without extra user steps.
+    _audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+    _file_ext = os.path.splitext(safe_name)[1].lower()
+    if _file_ext in _audio_exts:
+        upload_dir = workspace / "audio"
+    else:
+        upload_dir = workspace / "input"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    target = upload_dir / safe_name
 
     try:
         target.write_bytes(file_data)
