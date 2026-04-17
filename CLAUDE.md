@@ -14,12 +14,21 @@ Parallax is the definitive CLI + web UI for AI-assisted short-form video product
 - Scene-creation checklist in `web/hop_prompt.md` (survey → manifest → `set-scenes` → create → confirm).
 - Safe-filename invariant enforced at upload + `tool_list_dir`.
 
-**Active thread:** master-agent loop running. Shipped: Block A (video uploads in media bin — upload cap 50 MB → 500 MB; gallery already scanned `input/`), Block B (web-layer `TEST_MODE=1` — mock Anthropic stream + env propagation to all CLI subprocesses), Block C (`parallax chat --test` flag — skips key check + anthropic probe, exports `TEST_MODE=true` to the spawned server). Next scoped block TBD.
+**Repo state:** one branch (`main`), one worktree. Beta branch + worktree deleted, all dev work consolidated. Origin not pushed.
 
-**Known gaps / near-term:**
-- `parallax veo` (real fal.ai video gen) is still a stub — deferred, documented in DEV_LOG 2026-04-13.
-- Project sidebar scoping (what "project" means, delete semantics) deferred.
-- Pre-existing pyright noise in `web/server.py` around Anthropic SDK types (lines 74/75, 1612/1613, 1651) — not functional bugs.
+**Last shipped this session:**
+- Blocks A/B/C: upload cap 50→500 MB, web-layer TEST_MODE mock stream, `parallax chat --test` flag.
+- Consolidated beta's FastAPI migration, V2 CLI surface, `--engine say`, uv build, and uncommitted UI work (three-column tabs layout: `app.html` + `timeline.js`) onto main.
+- Fixed `python-multipart` missing dep (uploads returning 400).
+
+**Next up (new context window):** scope video generation tools — real fal.ai integration for `parallax veo` (documented in DEV_LOG 2026-04-13 as HIGH PRIORITY).
+
+**Deferred threads:**
+- End-to-end test harness from live `chat.jsonl` logs (scoped but not built this session — user turns only as input, free-form markdown rubric, Haiku LLM judge, `test/cases/<slug>/` layout).
+- Project sidebar scoping (what "project" means, delete semantics).
+- Pre-existing pyright noise around Anthropic SDK types — not functional.
+
+**Known open GitHub issue (pre-existing, not from this session):** `feat: footage indexing system — ingest, master index, segment reads, shared assets` (enhancement, 2026-04-16).
 
 
 

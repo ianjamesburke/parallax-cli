@@ -2,6 +2,34 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [CHANGED] Branch consolidation: beta → main, single-worktree state
+
+Wiped the multi-branch/multi-worktree setup. End state: one branch (`main`), one worktree, origin untouched.
+
+**What was consolidated onto main:**
+- Beta's FastAPI migration (replaced stdlib `http.server`, added sse-starlette, Pydantic request bodies, OpenAPI at `/docs`).
+- Beta's V2 CLI surface (`generate still|voice|video`, `script write|rewrite`, `ingest`, `web`).
+- Beta's `--engine say` macOS voice engine + Mode 2 e2e test.
+- Beta's uv migration (replacing `web/.venv` + pip).
+- **Beta worktree's uncommitted UI work** (never made it to a commit on beta branch): three-column tabs layout (`web/static/app.html` + `timeline.js`), reworked `app.css`/`app.js`, `web/server_log.py`, `web/head_of_production_prompt.md` (renamed from `hop_prompt.md`), ~1000 lines of server.py additions (project_root/ sentinel, `_display_path` helper, launch-context builder).
+- Today's Blocks A/B/C re-applied on top (see below).
+
+**Why this was messy:** the merge went through 3 iterations of "restore UI" before finding the right source. Main's pre-merge UI ≠ beta HEAD's UI ≠ beta worktree's uncommitted UI. The one the user remembered ("left chat / middle media bin / right video preview with tabs") lived only in beta worktree's uncommitted files — `app.html` and `timeline.js` were untracked. Lesson: on a branch consolidation, always diff against each worktree's working tree, not just HEADs.
+
+**Breaks if:** `git branch` shows anything other than `main`; `git worktree list` shows anything other than the main checkout; `parallax chat --test` opens anything other than the three-column tabs UI.
+
+## 2026-04-16 — [FIX] python-multipart missing — all uploads returning 400
+
+Every `POST /api/upload` returned `{"detail":"form parse failed: The python-multipart library must be installed to use form parsing."}`. Starlette's form() parser requires `python-multipart`; the beta FastAPI migration added `fastapi` + `uvicorn` + `sse-starlette` to `pyproject.toml` but missed this transitive. Added `python-multipart>=0.0.9` to `[project] dependencies`.
+
+**Breaks if:** file uploads to `/api/upload` return 400 with a form-parse error; or `uv sync` stops installing `python-multipart==0.0.26+`.
+
+## 2026-04-16 — [CHANGED] parallax chat --test flag
+
+New `--test` flag on `parallax chat` (bin/parallax). Skips the `ANTHROPIC_API_KEY` check, skips the `import anthropic` probe, exports `TEST_MODE=true` to the spawned server. Also rewrote the interpreter selection logic: prefer repo-root `.venv/bin/python3` (uv-managed), fall back to legacy `web/.venv`, finally system `python3`.
+
+**Breaks if:** `parallax chat --test` asks for ANTHROPIC_API_KEY; or the spawned server doesn't have `TEST_MODE=true` in its env; or the shim at `~/.local/bin/parallax` doesn't find main's `.venv`.
+
 ## 2026-04-16 — [CHANGED] Video uploads in media bin + web-layer TEST_MODE
 
 Two master-agent blocks shipped back-to-back.
