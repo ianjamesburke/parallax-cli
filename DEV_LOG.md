@@ -2,6 +2,23 @@
 # This log tracks non-obvious decisions, bugs, and deferred work for the agent network.
 # Entries are newest-first. Tags: [FIX] [CHANGED] [DECISION] [GOTCHA] [FUTURE]
 
+## 2026-04-16 — [FIX] Four cascade bugs: update nag, tool-result truncation, is_error, ingest --yes
+
+Root cause: the vibes1 session had `tool_parallax_ingest` passing `--yes` (not a valid flag for `parallax ingest`), causing argparse `rc=2`. The stderr was then truncated to 200 chars — which happened to be dominated by the update nag — so the agent never saw the argparse error and misread the failure as success.
+
+**Bug 1 — Update nag in subprocess tool results:** `_check_for_update_once()` in `bin/parallax` now exits early when `PARALLAX_QUIET=1`. The web server already sets `PARALLAX_QUIET=1` in `_clean_subprocess_env()` (line 1088) for all subprocesses — this is now honoured. The isatty check was considered but skipped: the update nag is intentionally on stderr (not stdout), and all subprocesses run non-TTY anyway, so `PARALLAX_QUIET` is the right gate — explicit, already wired.
+
+**Bug 2 — Tool-result truncation hiding errors:** All `text[:200]` and `result_text[:200]` summary truncations in the tool dispatch loop bumped to `[:2000]`. Error summaries are now prefixed with `ERROR:` so the model can't misread them as partial success.
+
+**Bug 3 — No is_error signal on failure:** Tool dispatch loop now detects failures from known error-string patterns (`parallax exited rc=`, `manifest edit failed:`, `parallax CLI binary not found`, etc.) and sets `is_error: True` on the Anthropic tool_result content block. This is the SDK-native failure signal — the model treats `is_error: true` as a hard failure regardless of text content.
+
+**Bug 4 — `tool_parallax_ingest` passed `--yes` to CLI:** `parallax ingest` has no `--yes` flag (only `parallax create` / `parallax run` subcommands have it). The invalid flag caused argparse to exit `rc=2` and print usage instead of running. Removed from `web/server.py`.
+
+**Breaks if:**
+- `PARALLAX_QUIET=1 parallax manifest show 2>&1 | grep "update available"` returns a match (Bug 1 not suppressed).
+- A failed `tool_parallax_ingest` (e.g. file not found) produces a `tool_result` in `chat.jsonl` whose summary doesn't start with `ERROR:` (Bug 2/3 regression).
+- `parallax ingest <valid-path>` exits `rc=2` with argparse usage (Bug 4 still present).
+
 ## 2026-04-16 — [FIX] Six-bug session: inline image previews, motion routing, compose logging, fal types
 
 **P1/P4 — parallax_create and make_storyboard tool results never showed inline previews.** Root cause: `_stream_parallax_subprocess` returned a plain string; the tool_result broadcast had no image payload; `appendToolResult` in the UI only rendered text. Fix: `_stream_parallax_subprocess` now accepts an optional `_collected` dict and accumulates `still_generated` event paths into it. `tool_parallax_create` returns a dict `{summary, still_paths}`. The executor embeds each still as a base64 image block for the model AND computes workspace-relative paths for the UI. The `tool_result` broadcast now carries `images: [rel_path, ...]`. `appendToolResult` in `app.js` renders an image strip below the summary. `make_storyboard` does the same for its output PNG. CSS strip styles added.

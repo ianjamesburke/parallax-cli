@@ -2547,8 +2547,12 @@ def _check_for_update_once() -> None:
     Run at most once per 24 hours. Compares local HEAD with origin/main HEAD
     via git ls-remote. Prints a single-line notice if behind, then exits.
     Completely silent on any failure — never blocks the main command.
+    Suppressed when PARALLAX_QUIET=1 (set by web server for all subprocess calls).
     """
     import subprocess as sp
+
+    if os.environ.get("PARALLAX_QUIET") == "1":
+        return
 
     try:
         import json as _j
