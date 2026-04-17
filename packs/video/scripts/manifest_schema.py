@@ -27,6 +27,25 @@ except ImportError:
 
 SCENE_TYPES = ["normal", "ken_burns", "still", "text_overlay", "video", "effect_overlay"]
 
+# Canonical set of known scene fields — any field not in this set is rejected after alias normalization.
+KNOWN_SCENE_FIELDS = {
+    "index", "type", "vo_text", "voiceover_text", "starting_frame", "action",
+    "still", "still_path", "video_clip", "source",
+    "start_s", "end_s", "duration", "estimated_duration_s",
+    "motion", "rotate", "filter", "base_scene",
+    "overlay_text", "text_overlay",
+    "fit",
+}
+
+# Alias map: intuitive names → canonical names.
+# Applied at load time with a warning. Both sides of trim are captured.
+SCENE_FIELD_ALIASES: dict[str, str] = {
+    "trim_start": "start_s",
+    "trim_end":   "end_s",
+    "start":      "start_s",
+    "end":        "end_s",
+}
+
 PROJECT_FORMATS = [
     "stills-ad",         # Script only → generate stills + Ken Burns, no VO required
     "character-ad",      # Script + character ref → generate VO, stills, assemble
@@ -103,6 +122,69 @@ FORMAT_REQUIRED_RESOURCES = {
 
 
 # ---------------------------------------------------------------------------
+# Scene alias normalization + unknown-field rejection
+# ---------------------------------------------------------------------------
+
+def _normalize_scene(scene: dict, scene_label: str = "") -> dict:
+    """
+    Apply SCENE_FIELD_ALIASES, warn on each alias hit, then reject unknown fields.
+    Returns a new scene dict with canonical keys only.
+    Raises ValueError on unknown fields after alias resolution.
+    """
+    normalized: dict = {}
+    unknown: list[str] = []
+
+    for key, val in scene.items():
+        canonical = SCENE_FIELD_ALIASES.get(key)
+        if canonical:
+            prefix = f"[{scene_label}] " if scene_label else ""
+            print(
+                f"WARNING: {prefix}scene field '{key}' is a non-canonical alias — "
+                f"use '{canonical}' instead. Accepted this time.",
+                file=sys.stderr,
+            )
+            # Don't overwrite if the canonical key was also provided explicitly.
+            if canonical not in normalized:
+                normalized[canonical] = val
+        elif key in KNOWN_SCENE_FIELDS:
+            normalized[key] = val
+        else:
+            unknown.append(key)
+
+    if unknown:
+        known_sorted = ", ".join(sorted(KNOWN_SCENE_FIELDS))
+        raise ValueError(
+            f"unknown scene field(s) {unknown!r} in scene {scene_label!r}. "
+            f"Known fields: {known_sorted}"
+        )
+
+    return normalized
+
+
+def normalize_scenes_in_manifest(manifest: dict) -> dict:
+    """
+    Walk manifest.scenes (if present), normalize each scene's fields.
+    Returns the manifest with aliased fields resolved in-place.
+    Raises ValueError on any unknown field.
+    """
+    scenes = manifest.get("scenes")
+    if not isinstance(scenes, list):
+        return manifest
+
+    new_scenes = []
+    for i, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            new_scenes.append(scene)
+            continue
+        label = str(scene.get("index", i + 1))
+        new_scenes.append(_normalize_scene(scene, scene_label=label))
+
+    manifest = dict(manifest)
+    manifest["scenes"] = new_scenes
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # YAML helpers — preserve None as null, use clean indentation
 # ---------------------------------------------------------------------------
 
@@ -137,6 +219,12 @@ def load_manifest(path: str) -> dict:
         manifest = _migrate_json(raw)
     else:
         manifest = yaml.safe_load(text)
+
+    try:
+        manifest = normalize_scenes_in_manifest(manifest)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     errors = validate_manifest(manifest, path=str(p))
     if errors:
