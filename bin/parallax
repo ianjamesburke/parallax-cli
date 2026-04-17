@@ -1724,6 +1724,12 @@ def cmd_compose(args) -> int:
             # Compute effective duration: prefer explicit, else end_s-start_s, else full clip
             if duration is None and start_s is not None and end_s is not None:
                 duration = end_s - start_s
+            fit = scene.get("fit", "contain")
+            if fit not in ("contain", "cover"):
+                return fail(
+                    f"scene {i}: fit must be 'contain' or 'cover', got {fit!r}",
+                    where="cmd_compose.validate", exit_code=3,
+                )
             resolved_scenes.append({
                 "index": i,
                 "type": "video",
@@ -1732,6 +1738,7 @@ def cmd_compose(args) -> int:
                 "start_s": start_s,
                 "end_s": end_s,
                 "duration": duration,
+                "fit": fit,
             })
         else:
             # still scene
@@ -1845,11 +1852,20 @@ def cmd_compose(args) -> int:
                         cmd += ["-t", str(scene["end_s"] - scene["start_s"])]
                     elif scene.get("duration") is not None:
                         cmd += ["-t", str(scene["duration"])]
-                    # Scale to fit, pad to exact res, force 30fps + libx264 + aac for concat compat
-                    vf = (
-                        f"scale={res_w}:{res_h}:force_original_aspect_ratio=decrease,"
-                        f"pad={res_w}:{res_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
-                    )
+                    # Scale to fit, pad to exact res, force 30fps + libx264 for concat compat.
+                    # fit: cover — scale up so shorter dim fills output, crop center.
+                    # fit: contain (default) — scale to fit, pad black bars.
+                    scene_fit = scene.get("fit", "contain")
+                    if scene_fit == "cover":
+                        vf = (
+                            f"scale={res_w}:{res_h}:force_original_aspect_ratio=increase,"
+                            f"crop={res_w}:{res_h},setsar=1,fps=30"
+                        )
+                    else:
+                        vf = (
+                            f"scale={res_w}:{res_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={res_w}:{res_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+                        )
                     cmd += [
                         "-vf", vf,
                         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
